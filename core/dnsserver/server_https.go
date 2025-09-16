@@ -2,12 +2,17 @@ package dnsserver
 
 import (
 	"context"
+	"crypto/rsa"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	stdlog "log"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/coredns/caddy"
@@ -18,6 +23,7 @@ import (
 	"github.com/coredns/coredns/plugin/pkg/response"
 	"github.com/coredns/coredns/plugin/pkg/reuseport"
 	"github.com/coredns/coredns/plugin/pkg/transport"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 // ServerHTTPS represents an instance of a DNS-over-HTTPS server.
@@ -41,6 +47,49 @@ func (l *loggerAdapter) Write(p []byte) (n int, err error) {
 // HTTPRequestKey is the context key for the HTTP request when processing DNS-over-HTTPS.
 // Plugins can access the original HTTP request to retrieve headers, client IP, and metadata.
 type HTTPRequestKey struct{}
+
+// CoreDNSClaims represents the JWT claims structure used by CoreDNS
+type CoreDNSClaims struct {
+	ClientID     string   `json:"client_id"`
+	Permissions  []string `json:"permissions"`
+	AllowedZones []string `json:"allowed_zones,omitempty"`
+	jwt.RegisteredClaims
+}
+
+// loadPublicKey loads the RSA public key from file
+func loadPublicKey(filename string) (*rsa.PublicKey, error) {
+	keyData, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read public key file: %w", err)
+	}
+
+	block, _ := pem.Decode(keyData)
+	if block == nil {
+		return nil, fmt.Errorf("failed to parse PEM block")
+	}
+
+	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse public key: %w", err)
+	}
+
+	rsaPub, ok := pub.(*rsa.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("not an RSA public key")
+	}
+
+	return rsaPub, nil
+}
+
+// hasPermission checks if the given permission exists in the permissions slice
+func hasPermission(permissions []string, required string) bool {
+	for _, perm := range permissions {
+		if perm == required {
+			return true
+		}
+	}
+	return false
+}
 
 // NewServerHTTPS returns a new CoreDNS HTTPS server and compiles all plugins in to it.
 func NewServerHTTPS(addr string, group []*Config) (*ServerHTTPS, error) {
@@ -150,6 +199,66 @@ func (s *ServerHTTPS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.countResponse(http.StatusNotFound)
 		return
 	}
+
+	// Check if the request has authorization header
+	auth := r.Header.Get("Authorization")
+	if auth == "" {
+		clog.Info("No Authorization header found")
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		s.countResponse(http.StatusUnauthorized)
+		return
+	}
+
+	if !strings.HasPrefix(auth, "Bearer ") {
+		clog.Error("Invalid Authorization header format")
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		s.countResponse(http.StatusUnauthorized)
+		return
+	}
+
+	tokenString := auth[len("Bearer "):]
+
+	// Load public key for JWT verification
+	publicKey, err := loadPublicKey("public.pem")
+	if err != nil {
+		clog.Errorf("Failed to load public key: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		s.countResponse(http.StatusInternalServerError)
+		return
+	}
+
+	// Parse and verify JWT token
+	token, err := jwt.ParseWithClaims(tokenString, &CoreDNSClaims{}, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		return publicKey, nil
+	})
+
+	if err != nil {
+		clog.Errorf("Error parsing token: %v", err)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		s.countResponse(http.StatusUnauthorized)
+		return
+	}
+
+	claims, ok := token.Claims.(*CoreDNSClaims)
+	if !ok || !token.Valid {
+		clog.Error("Invalid token")
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		s.countResponse(http.StatusUnauthorized)
+		return
+	}
+
+	// Check if client has "query" permission
+	if !hasPermission(claims.Permissions, "query") {
+		clog.Errorf("Client %s does not have 'query' permission", claims.ClientID)
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		s.countResponse(http.StatusForbidden)
+		return
+	}
+
+	clog.Infof("Authorized client: %s with permissions: %v", claims.ClientID, claims.Permissions)
 
 	msg, err := doh.RequestToMsg(r)
 	if err != nil {
