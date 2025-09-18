@@ -13,16 +13,34 @@ func init() { plugin.Register("jwt_edns", setup) }
 // for parsing any extra options the jwt_edns plugin may have. The first token this function sees is "jwt_edns".
 func setup(c *caddy.Controller) error {
 	c.Next() // Ignore "jwt_edns" and give us the next token.
-	if c.NextArg() {
-		// If there was another token, return an error, because we don't have any configuration.
-		// Any errors returned from this setup function should be wrapped with plugin.Error, so we
-		// can present a slightly nicer error message to the user.
-		return plugin.Error("jwt_edns", c.ArgErr())
+
+	var algorithm string = "eddsa" // default algorithm
+
+	// Parse configuration arguments
+	for c.NextBlock() {
+		switch c.Val() {
+		case "algorithm":
+			if !c.NextArg() {
+				return plugin.Error("jwt_edns", c.ArgErr())
+			}
+			algorithm = c.Val()
+			if algorithm != "rsa" && algorithm != "ecdsa" && algorithm != "eddsa" {
+				return plugin.Error("jwt_edns", c.Errf("unsupported algorithm: %s", algorithm))
+			}
+		default:
+			return plugin.Error("jwt_edns", c.Errf("unknown property '%s'", c.Val()))
+		}
+	}
+
+	// Load public key during setup with specified algorithm
+	publicKey, err := loadPublicKeyFromEnvWithAlgorithm(algorithm)
+	if err != nil {
+		return plugin.Error("jwt_edns", err)
 	}
 
 	// Add the Plugin to CoreDNS, so Servers can use it in their plugin chain.
 	dnsserver.GetConfig(c).AddPlugin(func(next plugin.Handler) plugin.Handler {
-		return JwtEdns{Next: next}
+		return &JwtEdns{Next: next, publicKey: publicKey}
 	})
 
 	// All OK, return a nil error.
