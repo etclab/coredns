@@ -176,6 +176,8 @@ const (
 // ServeDNS implements the plugin.Handler interface. This method gets called when jwt_edns is used
 // in a Server.
 func (j *JwtEdns) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+	log.Debug("JWT EDNS plugin processing DNS request")
+
 	// Step 0: Check if public key is available - refuse all requests if not
 	if j.publicKey == nil {
 		log.Error("JWT validation required but no public key configured")

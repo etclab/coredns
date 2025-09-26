@@ -38,6 +38,8 @@ func setup(c *caddy.Controller) error {
 		return plugin.Error("jwt_edns", err)
 	}
 
+	log.Infof("JWT EDNS plugin loaded with %s algorithm public key", algorithm)
+
 	// Add the Plugin to CoreDNS, so Servers can use it in their plugin chain.
 	dnsserver.GetConfig(c).AddPlugin(func(next plugin.Handler) plugin.Handler {
 		return &JwtEdns{Next: next, publicKey: publicKey}
