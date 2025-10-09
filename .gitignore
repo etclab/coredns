@@ -5,3 +5,7 @@ Corefile
 build/
 release/
 vendor/
+*.pem
+*openssl*
+*.key
+*.crt

@@ -1,6 +1,8 @@
 # Development Notes for Calypso
 
-## Custom jwt_edns Plugin
+## Custom Plugins
+
+### jwt_edns Plugin
 
 The `jwt_edns` plugin enforces JWT authorization via EDNS OPT records (option code 65001). Clients must include valid JWT tokens in DNS queries to access protected DNS services.
 
@@ -86,4 +88,51 @@ https://.:4430 {
   ```shell
   ./q A google.com --jwt="<token>" --opt google.com @https://localhost:4430/dns-query --verbose
   ```
+
+---
+
+### etcd_crypto Plugin
+
+The `etcd_crypto` plugin extends the standard etcd plugin to serve encrypted DNS records from etcd. It supports multiple encryption schemes for Zero Trust DNS research.
+
+**Supported Encryption Types**:
+- RSA-PKCS1v15 (type marker `0x01`)
+- WKD-IBE/akn07 (type marker `0x02`)
+- Calypso (type marker `0x03`)
+- Plaintext (backward compatible, no marker)
+
+**Setup**:
+1. **Register plugin**: Add `etcd_crypto:etcd_crypto` to `plugin.cfg` (after `etcd:etcd`)
+2. **Build CoreDNS**:
+   ```shell
+   go generate
+   go build .
+   ```
+
+**Corefile Configuration**:
+```
+.:1053 {
+    etcd_crypto {
+        endpoint http://localhost:2379
+        path /skydns
+        rsa_key_file /path/to/private.pem
+    }
+    log
+}
+```
+
+**Testing with etcd-client**:
+
+Register encrypted record:
+```shell
+cd /path/to/etcd-client
+CERT_FILE=./public.pem ./etcd-client -register secure.test.com=172.16.0.10
+```
+
+Query via CoreDNS:
+```shell
+./q A secure.test.com @localhost:1053 --verbose
+```
+
+See `plugin/etcd_crypto/README.md` for complete configuration details.
 

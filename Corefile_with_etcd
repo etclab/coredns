@@ -1,0 +1,40 @@
+# Standard DNS over UDP
+.:1053 {
+    etcd {
+        path /skydns
+        endpoint http://localhost:2379
+    }
+    log
+}
+
+# DNS over TLS (DoT)
+tls://.:853 {
+    etcd {
+        path /skydns
+        endpoint http://localhost:2379
+    }
+    tls cert.pem key.pem
+    log
+}
+
+# DNS over TLS (DoT)
+tls://.:8530 {
+    jwt_edns { algorithm rsa }
+    etcd {
+        path /skydns
+        endpoint http://localhost:2379
+    }
+    tls cert.pem key.pem
+    log
+}
+
+# DNS over HTTPS (DoH)
+https://.:443 {
+    etcd {
+        path /skydns
+        endpoint http://localhost:2379
+    }
+    tls cert.pem key.pem
+    log
+}
+
