@@ -20,7 +20,10 @@ const (
 //   - 0x02: WKD-IBE (akn07)
 //   - 0x03: Calypso
 //   - No marker: Plaintext JSON (passthrough)
-func detectAndDecrypt(value []byte, config *CryptoConfig) ([]byte, error) {
+//
+// For Calypso decryption, etcdKey and pathPrefix are used to extract the concrete
+// domain name for signature verification.
+func detectAndDecrypt(value []byte, config *CryptoConfig, etcdKey string, pathPrefix string) ([]byte, error) {
 	if len(value) == 0 {
 		return nil, errors.New("empty value")
 	}
@@ -42,8 +45,16 @@ func detectAndDecrypt(value []byte, config *CryptoConfig) ([]byte, error) {
 		return decryptWKDIBE(value[1:], config.WKDIBEKey)
 
 	case TypeMarkerCalypso:
-		// Calypso encrypted record 
-		return nil, fmt.Errorf("Calypso decryption to be implemented")
+		// Calypso encrypted record - strip marker and decrypt
+		if config == nil || config.CalypsoKey == nil {
+			return nil, fmt.Errorf("Calypso key not configured, cannot decrypt type 0x03 record")
+		}
+		// Extract concrete domain from etcd key for signature verification
+		domain, err := etcdKeyToDomain(etcdKey, pathPrefix)
+		if err != nil {
+			return nil, fmt.Errorf("failed to extract domain from etcd key: %w", err)
+		}
+		return decryptCalypso(value[1:], config.CalypsoKey, domain)
 
 	default:
 		// No recognized type marker - assume plaintext JSON

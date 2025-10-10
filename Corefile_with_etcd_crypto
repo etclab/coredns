@@ -1,0 +1,44 @@
+# Standard DNS over UDP
+.:1053 {
+    etcd_crypto {
+        rsa_key_file private.pem
+        wkdibe_params_file params.bin
+        wkdibe_key_file alice.key
+        calypso_params_file params.bin
+        calypso_key_file alice-reader.key
+        path /skydns
+        endpoint http://localhost:2379
+    }
+    log
+}
+
+# DNS over TLS (DoT)
+tls://.:853 {
+    etcd_crypto {
+        rsa_key_file private.pem
+        wkdibe_params_file params.bin
+        wkdibe_key_file alice.key
+        calypso_params_file params.bin
+        calypso_key_file alice-reader.key
+        path /skydns
+        endpoint http://localhost:2379
+    }
+    tls cert.pem key.pem
+    log
+}
+
+# DNS over HTTPS (DoH)
+https://.:443 {
+    etcd_crypto {
+        rsa_key_file private.pem
+        wkdibe_params_file params.bin
+        wkdibe_key_file alice.key
+        calypso_params_file params.bin
+        calypso_key_file alice-reader.key
+        path /skydns
+        endpoint http://localhost:2379
+    }
+    tls cert.pem key.pem
+    log
+}
+

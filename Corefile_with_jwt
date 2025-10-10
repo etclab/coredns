@@ -1,0 +1,35 @@
+# Standard DNS over UDP
+.:1053 {
+    forward . 1.1.1.1
+    log
+}
+
+# DNS over TLS (DoT)
+tls://.:853 {
+    forward . tls://1.1.1.1
+    tls cert.pem key.pem
+    log
+}
+
+# DNS over TLS with JWT EDNS
+tls://.:8530 {
+	jwt_edns { algorithm eddsa }
+    forward . tls://1.1.1.1
+	tls cert.pem key.pem
+	log
+}
+
+# DNS over HTTPS (DoH)
+https://.:443 {
+    forward . 1.1.1.1
+    tls cert.pem key.pem
+    log
+}
+
+# DNS over HTTPS with JWT EDNS
+https://.:4430 {
+    jwt_edns { algorithm eddsa }
+    forward . 1.1.1.1
+    tls cert.pem key.pem
+    log
+}

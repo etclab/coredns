@@ -30,8 +30,6 @@ func setup(c *caddy.Controller) error {
 		return plugin.Error("etcd_crypto", err)
 	}
 
-	fmt.Println("etcd_crypto plugin loaded with algorithm public key")
-
 	c.OnShutdown(e.OnShutdown)
 
 	dnsserver.GetConfig(c).AddPlugin(func(next plugin.Handler) plugin.Handler {
@@ -50,14 +48,16 @@ func etcdParse(c *caddy.Controller) (*Etcd, error) {
 		MaxLeaseTTL: defaultLeaseMaxTTL,
 	}
 	var (
-		tlsConfig        *tls.Config
-		err              error
-		endpoints        = []string{defaultEndpoint}
-		username         string
-		password         string
-		rsaKeyFile       string
-		wkdibeParamsFile string
-		wkdibeKeyFile    string
+		tlsConfig         *tls.Config
+		err               error
+		endpoints         = []string{defaultEndpoint}
+		username          string
+		password          string
+		rsaKeyFile        string
+		wkdibeParamsFile  string
+		wkdibeKeyFile     string
+		calypsoParamsFile string
+		calypsoKeyFile    string
 	)
 
 	etc.Upstream = upstream.New()
@@ -148,6 +148,22 @@ func etcdParse(c *caddy.Controller) (*Etcd, error) {
 				if !filepath.IsAbs(wkdibeKeyFile) && config.Root != "" {
 					wkdibeKeyFile = filepath.Join(config.Root, wkdibeKeyFile)
 				}
+			case "calypso_params_file":
+				if !c.NextArg() {
+					return &Etcd{}, c.ArgErr()
+				}
+				calypsoParamsFile = c.Val()
+				if !filepath.IsAbs(calypsoParamsFile) && config.Root != "" {
+					calypsoParamsFile = filepath.Join(config.Root, calypsoParamsFile)
+				}
+			case "calypso_key_file":
+				if !c.NextArg() {
+					return &Etcd{}, c.ArgErr()
+				}
+				calypsoKeyFile = c.Val()
+				if !filepath.IsAbs(calypsoKeyFile) && config.Root != "" {
+					calypsoKeyFile = filepath.Join(config.Root, calypsoKeyFile)
+				}
 			default:
 				if c.Val() != "}" {
 					return &Etcd{}, c.Errf("unknown property '%s'", c.Val())
@@ -187,6 +203,19 @@ func etcdParse(c *caddy.Controller) (*Etcd, error) {
 			keysConfigured = true
 		} else if wkdibeParamsFile != "" || wkdibeKeyFile != "" {
 			return &Etcd{}, c.Errf("both wkdibe_params_file and wkdibe_key_file must be specified together")
+		}
+
+		// Load Calypso keys if specified
+		if calypsoParamsFile != "" && calypsoKeyFile != "" {
+			calypsoKey, err := loadCalypsoKey(calypsoParamsFile, calypsoKeyFile)
+			if err != nil {
+				return &Etcd{}, c.Errf("failed to load Calypso key: %v", err)
+			}
+			cryptoConfig.CalypsoKey = calypsoKey
+			fmt.Printf("etcd_crypto: Calypso key loaded from %s\n", calypsoKeyFile)
+			keysConfigured = true
+		} else if calypsoParamsFile != "" || calypsoKeyFile != "" {
+			return &Etcd{}, c.Errf("both calypso_params_file and calypso_key_file must be specified together")
 		}
 
 		if keysConfigured {
@@ -317,5 +346,35 @@ func loadWKDIBEKey(paramsFile, keyFile string) (*WKDIBEKey, error) {
 	return &WKDIBEKey{
 		PublicParams: pp,
 		PrivateKey:   sk,
+	}, nil
+}
+
+// loadCalypsoKey loads Calypso public parameters and private key from binary files.
+func loadCalypsoKey(paramsFile, keyFile string) (*CalypsoKey, error) {
+	// Load public parameters (reusing WKD-IBE params deserialization)
+	paramsData, err := os.ReadFile(paramsFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read params file: %w", err)
+	}
+
+	pp, err := deserializeWKDIBEPublicParams(paramsData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to deserialize public params: %w", err)
+	}
+
+	// Load private key (Calypso uses gob encoding)
+	keyData, err := os.ReadFile(keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read key file: %w", err)
+	}
+
+	privateKey, err := deserializeCalypsoPrivateKey(keyData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to deserialize private key: %w", err)
+	}
+
+	return &CalypsoKey{
+		PublicParams: pp,
+		PrivateKey:   privateKey,
 	}, nil
 }

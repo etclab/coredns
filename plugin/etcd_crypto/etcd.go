@@ -33,9 +33,9 @@ var errKeyNotFound = errors.New("key not found")
 
 // CryptoConfig holds cryptographic keys for decryption.
 type CryptoConfig struct {
-	RSAKey     *rsa.PrivateKey
-	WKDIBEKey  *WKDIBEKey // WKD-IBE public params + private key
-	// Future: Calypso keys
+	RSAKey      *rsa.PrivateKey
+	WKDIBEKey   *WKDIBEKey   // WKD-IBE public params + private key
+	CalypsoKey  *CalypsoKey  // Calypso public params + private key
 }
 
 // Etcd is a plugin that talks to an etcd cluster and handles encrypted records.
@@ -150,7 +150,7 @@ Nodes:
 
 		// Decrypt the value if it's encrypted (detects type marker)
 		fmt.Printf("[DEBUG] etcd key=%s, value_len=%d, first_byte=0x%02x\n", n.Key, len(n.Value), n.Value[0])
-		decryptedValue, err := detectAndDecrypt(n.Value, e.Crypto)
+		decryptedValue, err := detectAndDecrypt(n.Value, e.Crypto, string(n.Key), e.PathPrefix)
 		if err != nil {
 			fmt.Printf("[ERROR] Decryption failed for %s: %v\n", n.Key, err)
 			return nil, fmt.Errorf("%s: decryption failed: %s", n.Key, err.Error())
