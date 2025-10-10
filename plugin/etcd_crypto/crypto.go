@@ -35,8 +35,11 @@ func detectAndDecrypt(value []byte, config *CryptoConfig) ([]byte, error) {
 		return decryptRSA(value[1:], config.RSAKey)
 
 	case TypeMarkerWKDIBE:
-		// WKD-IBE encrypted record 
-		return nil, fmt.Errorf("WKD-IBE decryption to be implemented")
+		// WKD-IBE encrypted record - strip marker and decrypt
+		if config == nil || config.WKDIBEKey == nil {
+			return nil, fmt.Errorf("WKD-IBE key not configured, cannot decrypt type 0x02 record")
+		}
+		return decryptWKDIBE(value[1:], config.WKDIBEKey)
 
 	case TypeMarkerCalypso:
 		// Calypso encrypted record 

@@ -50,12 +50,14 @@ func etcdParse(c *caddy.Controller) (*Etcd, error) {
 		MaxLeaseTTL: defaultLeaseMaxTTL,
 	}
 	var (
-		tlsConfig  *tls.Config
-		err        error
-		endpoints  = []string{defaultEndpoint}
-		username   string
-		password   string
-		rsaKeyFile string
+		tlsConfig        *tls.Config
+		err              error
+		endpoints        = []string{defaultEndpoint}
+		username         string
+		password         string
+		rsaKeyFile       string
+		wkdibeParamsFile string
+		wkdibeKeyFile    string
 	)
 
 	etc.Upstream = upstream.New()
@@ -130,6 +132,22 @@ func etcdParse(c *caddy.Controller) (*Etcd, error) {
 				if !filepath.IsAbs(rsaKeyFile) && config.Root != "" {
 					rsaKeyFile = filepath.Join(config.Root, rsaKeyFile)
 				}
+			case "wkdibe_params_file":
+				if !c.NextArg() {
+					return &Etcd{}, c.ArgErr()
+				}
+				wkdibeParamsFile = c.Val()
+				if !filepath.IsAbs(wkdibeParamsFile) && config.Root != "" {
+					wkdibeParamsFile = filepath.Join(config.Root, wkdibeParamsFile)
+				}
+			case "wkdibe_key_file":
+				if !c.NextArg() {
+					return &Etcd{}, c.ArgErr()
+				}
+				wkdibeKeyFile = c.Val()
+				if !filepath.IsAbs(wkdibeKeyFile) && config.Root != "" {
+					wkdibeKeyFile = filepath.Join(config.Root, wkdibeKeyFile)
+				}
 			default:
 				if c.Val() != "}" {
 					return &Etcd{}, c.Errf("unknown property '%s'", c.Val())
@@ -143,18 +161,38 @@ func etcdParse(c *caddy.Controller) (*Etcd, error) {
 		etc.Client = client
 		etc.endpoints = endpoints
 
+		// Load cryptographic keys if specified
+		cryptoConfig := &CryptoConfig{}
+		keysConfigured := false
+
 		// Load RSA private key if specified
 		if rsaKeyFile != "" {
 			rsaKey, err := loadRSAPrivateKey(rsaKeyFile)
 			if err != nil {
 				return &Etcd{}, c.Errf("failed to load RSA key from %s: %v", rsaKeyFile, err)
 			}
-			etc.Crypto = &CryptoConfig{
-				RSAKey: rsaKey,
-			}
+			cryptoConfig.RSAKey = rsaKey
 			fmt.Printf("etcd_crypto: RSA key loaded from %s\n", rsaKeyFile)
+			keysConfigured = true
+		}
+
+		// Load WKD-IBE keys if specified
+		if wkdibeParamsFile != "" && wkdibeKeyFile != "" {
+			wkdibeKey, err := loadWKDIBEKey(wkdibeParamsFile, wkdibeKeyFile)
+			if err != nil {
+				return &Etcd{}, c.Errf("failed to load WKD-IBE key: %v", err)
+			}
+			cryptoConfig.WKDIBEKey = wkdibeKey
+			fmt.Printf("etcd_crypto: WKD-IBE key loaded from %s\n", wkdibeKeyFile)
+			keysConfigured = true
+		} else if wkdibeParamsFile != "" || wkdibeKeyFile != "" {
+			return &Etcd{}, c.Errf("both wkdibe_params_file and wkdibe_key_file must be specified together")
+		}
+
+		if keysConfigured {
+			etc.Crypto = cryptoConfig
 		} else {
-			fmt.Println("etcd_crypto: No RSA key configured (plaintext only)")
+			fmt.Println("etcd_crypto: No encryption keys configured (plaintext only)")
 		}
 
 		return &etc, nil
@@ -248,4 +286,36 @@ func loadRSAPrivateKey(keyFile string) (*rsa.PrivateKey, error) {
 	}
 
 	return nil, fmt.Errorf("unsupported key type: %s", block.Type)
+}
+
+// loadWKDIBEKey loads WKD-IBE public parameters and private key from binary files.
+func loadWKDIBEKey(paramsFile, keyFile string) (*WKDIBEKey, error) {
+	// Load public parameters
+	paramsData, err := os.ReadFile(paramsFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read params file: %w", err)
+	}
+
+	// Deserialize using the helper function from wkdibe.go
+	// Note: This requires the akn07 library imports
+	pp, err := deserializeWKDIBEPublicParams(paramsData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to deserialize public params: %w", err)
+	}
+
+	// Load private key
+	keyData, err := os.ReadFile(keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read key file: %w", err)
+	}
+
+	sk, err := deserializeWKDIBEPrivateKey(keyData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to deserialize private key: %w", err)
+	}
+
+	return &WKDIBEKey{
+		PublicParams: pp,
+		PrivateKey:   sk,
+	}, nil
 }

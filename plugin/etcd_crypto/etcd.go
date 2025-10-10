@@ -33,8 +33,9 @@ var errKeyNotFound = errors.New("key not found")
 
 // CryptoConfig holds cryptographic keys for decryption.
 type CryptoConfig struct {
-	RSAKey *rsa.PrivateKey
-	// Future: WKD-IBE and Calypso keys
+	RSAKey     *rsa.PrivateKey
+	WKDIBEKey  *WKDIBEKey // WKD-IBE public params + private key
+	// Future: Calypso keys
 }
 
 // Etcd is a plugin that talks to an etcd cluster and handles encrypted records.
