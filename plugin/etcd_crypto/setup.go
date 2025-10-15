@@ -212,7 +212,8 @@ func etcdParse(c *caddy.Controller) (*Etcd, error) {
 				return &Etcd{}, c.Errf("failed to load Calypso key: %v", err)
 			}
 			cryptoConfig.CalypsoKey = calypsoKey
-			fmt.Printf("etcd_crypto: Calypso key loaded from %s\n", calypsoKeyFile)
+			maxDepth := calypsoKey.PublicParams.MaxDepth
+			fmt.Printf("etcd_crypto: Calypso key loaded from %s (maxDepth=%d, search tag mode enabled)\n", calypsoKeyFile, maxDepth)
 			keysConfigured = true
 		} else if calypsoParamsFile != "" || calypsoKeyFile != "" {
 			return &Etcd{}, c.Errf("both calypso_params_file and calypso_key_file must be specified together")

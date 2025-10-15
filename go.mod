@@ -18,6 +18,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.39.4
 	github.com/coredns/caddy v1.1.2-0.20241029205200-8de985351a98
 	github.com/dnstap/golang-dnstap v0.4.0
+	github.com/etclab/calypso v0.0.0-00010101000000-000000000000
 	github.com/etclab/ncircl v0.0.0-20251007164514-eab40c7266d7
 	github.com/expr-lang/expr v1.17.6
 	github.com/farsightsec/golang-framestream v0.3.0
@@ -194,3 +195,5 @@ require (
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.0 // indirect
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
+
+replace github.com/etclab/calypso => /Users/pniroula/Projects/calypso/calypso

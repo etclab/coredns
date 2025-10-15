@@ -70,6 +70,10 @@ https://.:4430 {
 
 - **Plain DNS over TLS**: Requires adding ca.pem to system store:
   ```shell
+  # For Ubuntu/Debian based
+  sudo cp ca.pem /usr/local/share/ca-certificates/ca.crt
+  sudo update-ca-certificates
+  # For MacOS
   sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ca.pem
   ./q A google.com @tls://localhost:8530 --verbose
   ```
@@ -91,18 +95,25 @@ https://.:4430 {
 
 ---
 
-### etcd_crypto Plugin
+### etcd_calypso Plugin
 
-The `etcd_crypto` plugin extends the standard etcd plugin to serve encrypted DNS records from etcd. It supports multiple encryption schemes for Zero Trust DNS research.
+The `etcd_calypso` plugin implements **Zero Trust DNS** for Calypso encrypted records. CoreDNS performs **no decryption** - it only routes queries to search tag-based storage paths and returns encrypted data as-is to clients.
 
-**Supported Encryption Types**:
-- RSA-PKCS1v15 (type marker `0x01`)
-- WKD-IBE/akn07 (type marker `0x02`)
-- Calypso (type marker `0x03`)
-- Plaintext (backward compatible, no marker)
+**Key Architecture Principles**:
+- **Zero Trust**: CoreDNS has no decryption keys, only performs SHA-256 hashing for path routing
+- **Client-side decryption**: Encrypted TXT records are decrypted by authorized clients only
+- **EDNS signaling**: Client sends EDNS option 65002 to trigger Calypso search tag routing
+- **Reconnaissance prevention**: Records stored at `/skydns-calypso/[hash]` instead of hierarchical DNS paths
+
+**How It Works**:
+1. Client query includes EDNS option 65002 → CoreDNS detects Calypso request
+2. CoreDNS computes search tag: `SHA256(domain pattern) → 64-char hex hash`
+3. Lookup at `/skydns-calypso/[hash]` instead of `/skydns/com/example/domain`
+4. Returns encrypted TXT record (marker `0x03`) to client without decryption
+5. Client decrypts using Calypso reader key
 
 **Setup**:
-1. **Register plugin**: Add `etcd_crypto:etcd_crypto` to `plugin.cfg` (after `etcd:etcd`)
+1. **Register plugin**: Add `etcd_calypso:etcd_calypso` to `plugin.cfg` (after `etcd:etcd`)
 2. **Build CoreDNS**:
    ```shell
    go generate
@@ -112,27 +123,41 @@ The `etcd_crypto` plugin extends the standard etcd plugin to serve encrypted DNS
 **Corefile Configuration**:
 ```
 .:1053 {
-    etcd_crypto {
+    etcd_calypso {
         endpoint http://localhost:2379
         path /skydns
-        rsa_key_file /path/to/private.pem
+        calypso_path_prefix skydns-calypso  # Optional: default is "skydns-calypso"
+        calypso_max_depth 5                 # Optional: default is 5
     }
     log
 }
 ```
 
+**Client Requirements**:
+- DNS client must send EDNS option 65002 to signal Calypso handling
+- Example with `q` tool: `CALYPSO_PARAMS_FILE=params.bin CALYPSO_KEY_FILE=reader.key ./q TXT verify.example.com @localhost:1053 `
+- Calypso reader key for client-side decryption
+
 **Testing with etcd-client**:
 
-Register encrypted record:
+Register Calypso encrypted record:
 ```shell
 cd /path/to/etcd-client
-CERT_FILE=./public.pem ./etcd-client -register secure.test.com=172.16.0.10
+CRYPTO_TYPE=calypso \
+CALYPSO_PARAMS_FILE=params.bin \
+CALYPSO_WRITER_KEY=alice-writer.key \
+./etcd-client -register verify.example.com=10.0.0.6
 ```
 
-Query via CoreDNS:
+Query via CoreDNS (client with EDNS option 65002):
 ```shell
-./q A secure.test.com @localhost:1053 --verbose
+CALYPSO_PARAMS_FILE=params.bin CALYPSO_KEY_FILE=alice-reader.key ./q TXT verify.example.com @localhost:1053 --verbose
 ```
 
-See `plugin/etcd_crypto/README.md` for complete configuration details.
+**Search Tag Computation** (matches etcd-client exactly):
+- Domain normalized: lowercase, trailing dot removed
+- Pattern: reversed domain labels padded to maxDepth
+- Concrete components joined with `\x00` separator
+- Full SHA-256 hash (64 hex characters)
+
 

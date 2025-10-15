@@ -23,7 +23,7 @@ import (
 	_ "github.com/coredns/coredns/plugin/erratic"
 	_ "github.com/coredns/coredns/plugin/errors"
 	_ "github.com/coredns/coredns/plugin/etcd"
-	_ "github.com/coredns/coredns/plugin/etcd_crypto"
+	_ "github.com/coredns/coredns/plugin/etcd_calypso"
 	_ "github.com/coredns/coredns/plugin/file"
 	_ "github.com/coredns/coredns/plugin/forward"
 	_ "github.com/coredns/coredns/plugin/geoip"

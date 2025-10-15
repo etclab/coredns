@@ -21,9 +21,9 @@ const (
 //   - 0x03: Calypso
 //   - No marker: Plaintext JSON (passthrough)
 //
-// For Calypso decryption, etcdKey and pathPrefix are used to extract the concrete
-// domain name for signature verification.
-func detectAndDecrypt(value []byte, config *CryptoConfig, etcdKey string, pathPrefix string) ([]byte, error) {
+// For Calypso decryption with search tag storage, the domain for signature verification
+// is obtained from CalypsoKey.PrivateKey.DomainName (not from etcd key path).
+func detectAndDecrypt(value []byte, config *CryptoConfig) ([]byte, error) {
 	if len(value) == 0 {
 		return nil, errors.New("empty value")
 	}
@@ -49,11 +49,10 @@ func detectAndDecrypt(value []byte, config *CryptoConfig, etcdKey string, pathPr
 		if config == nil || config.CalypsoKey == nil {
 			return nil, fmt.Errorf("Calypso key not configured, cannot decrypt type 0x03 record")
 		}
-		// Extract concrete domain from etcd key for signature verification
-		domain, err := etcdKeyToDomain(etcdKey, pathPrefix)
-		if err != nil {
-			return nil, fmt.Errorf("failed to extract domain from etcd key: %w", err)
-		}
+		// CRITICAL: Use key's embedded domain for signature verification
+		// With search tag storage, etcd key is a hash - can't extract domain from it.
+		// The key's DomainName ensures it can only decrypt messages encrypted for that domain.
+		domain := config.CalypsoKey.PrivateKey.DomainName
 		return decryptCalypso(value[1:], config.CalypsoKey, domain)
 
 	default:

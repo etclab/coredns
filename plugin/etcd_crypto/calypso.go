@@ -2,14 +2,17 @@ package etcd_crypto
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/gob"
+	"encoding/hex"
 	"fmt"
 	"strings"
 
 	bls "github.com/cloudflare/circl/ecc/bls12381"
 	"github.com/etclab/calypso"
 	"github.com/etclab/ncircl/hibe/akn07"
+	"github.com/miekg/dns"
 )
 
 // CalypsoKey holds Calypso public parameters and private key for decryption
@@ -156,6 +159,8 @@ func deserializeCalypsoMessage(data []byte) (*calypso.Message, error) {
 
 // etcdKeyToDomain converts an etcd key path to a domain name.
 // Example: "/skydns/com/example/www" -> "www.example.com"
+// NOTE: Currently unused - kept for potential debugging/logging use.
+// With search tag storage, domain comes from CalypsoKey.PrivateKey.DomainName instead.
 func etcdKeyToDomain(etcdKey string, pathPrefix string) (string, error) {
 	// Remove path prefix (e.g., "/skydns")
 	if !strings.HasPrefix(etcdKey, pathPrefix) {
@@ -209,4 +214,67 @@ func decryptCalypso(ciphertext []byte, calypsoKey *CalypsoKey, domain string) ([
 	}
 
 	return plaintext, nil
+}
+
+// domainToPattern converts a DNS domain to a WKD-IBE/Calypso pattern
+// Example: "alice.example.com" with maxDepth=5 → ["com", "example", "alice", "", ""]
+func domainToPattern(domain string, maxDepth int) ([]string, error) {
+	if maxDepth < 2 {
+		return nil, fmt.Errorf("maxDepth must be at least 2")
+	}
+
+	// Remove trailing dot if present
+	domain = strings.TrimSuffix(domain, ".")
+
+	parts := dns.SplitDomainName(domain)
+	if len(parts) > maxDepth-1 {
+		return nil, fmt.Errorf("domain exceeds maxDepth capacity")
+	}
+
+	pattern := make([]string, maxDepth)
+
+	// Reverse domain parts (alice.example.com → com, example, alice)
+	for i := 0; i < len(parts); i++ {
+		reversedIdx := len(parts) - 1 - i
+		part := parts[reversedIdx]
+
+		if part == "" {
+			return nil, fmt.Errorf("invalid pattern: empty labels not allowed")
+		}
+		pattern[i] = part
+	}
+
+	// Remaining slots are padding (empty strings for unused positions)
+	return pattern, nil
+}
+
+// computeSearchTag derives SHA256 hash of domain pattern for privacy-preserving etcd storage
+// Example: "alice.example.com" → ["com", "example", "alice"] → SHA256 → hex string
+// Only concrete pattern values are hashed (empty padding slots excluded)
+func computeSearchTag(domain string, maxDepth int) (string, error) {
+	// Convert domain to pattern
+	pattern, err := domainToPattern(domain, maxDepth)
+	if err != nil {
+		return "", fmt.Errorf("failed to convert domain to pattern: %w", err)
+	}
+
+	// Extract only concrete (non-empty) pattern components
+	var concrete []string
+	for _, part := range pattern {
+		if part != "" {
+			concrete = append(concrete, part)
+		}
+	}
+
+	if len(concrete) == 0 {
+		return "", fmt.Errorf("pattern has no concrete components")
+	}
+
+	// Hash the concrete pattern components
+	// Join with null byte separator to prevent collision (e.g., ["a","bc"] vs ["ab","c"])
+	patternStr := strings.Join(concrete, "\x00")
+	hash := sha256.Sum256([]byte(patternStr))
+
+	// Return hex-encoded hash
+	return hex.EncodeToString(hash[:]), nil
 }
