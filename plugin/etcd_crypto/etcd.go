@@ -1,9 +1,8 @@
-// Package etcd_crypto provides an etcd version 3 backend plugin with support for encrypted records.
+// Package etcd_crypto provides an etcd version 3 backend plugin with AES encryption support.
 package etcd_crypto
 
 import (
 	"context"
-	"crypto/rsa"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,14 +30,7 @@ const (
 
 var errKeyNotFound = errors.New("key not found")
 
-// CryptoConfig holds cryptographic keys for decryption.
-type CryptoConfig struct {
-	RSAKey     *rsa.PrivateKey
-	WKDIBEKey  *WKDIBEKey  // WKD-IBE public params + private key
-	CalypsoKey *CalypsoKey // Calypso public params + private key
-}
-
-// Etcd is a plugin that talks to an etcd cluster and handles encrypted records.
+// Etcd is a plugin that talks to an etcd cluster and handles AES-encrypted records.
 type Etcd struct {
 	Next        plugin.Handler
 	Fall        fall.F
@@ -48,7 +40,7 @@ type Etcd struct {
 	Client      *etcdcv3.Client
 	MinLeaseTTL uint32 // minimum TTL for lease-based records
 	MaxLeaseTTL uint32 // maximum TTL for lease-based records
-	Crypto      *CryptoConfig // cryptographic configuration
+	AESKey      []byte // AES encryption key (256-bit)
 
 	endpoints []string // Stored here as well, to aid in testing.
 }
@@ -84,24 +76,8 @@ func (e *Etcd) IsNameError(err error) bool {
 func (e *Etcd) Records(ctx context.Context, state request.Request, exact bool) ([]msg.Service, error) {
 	name := state.Name()
 
-	var path string
-	var star bool
-
-	// Check if Calypso is configured - use search tag-based lookup
-	if e.Crypto != nil && e.Crypto.CalypsoKey != nil && e.Crypto.CalypsoKey.PublicParams != nil {
-		// Compute search tag from queried domain using MaxDepth from PublicParams
-		maxDepth := e.Crypto.CalypsoKey.PublicParams.MaxDepth
-		searchTag, err := computeSearchTag(name, maxDepth)
-		if err != nil {
-			return nil, fmt.Errorf("failed to compute search tag for %s: %w", name, err)
-		}
-		// Use search tag-based path: /skydns-calypso/[hash]
-		path = "/skydns-calypso/" + searchTag
-		star = false // No wildcard support for Calypso search tags
-	} else {
-		// Standard domain-based path lookup
-		path, star = msg.PathWithWildcard(name, e.PathPrefix)
-	}
+	// Standard domain-based path lookup
+	path, star := msg.PathWithWildcard(name, e.PathPrefix)
 
 	r, err := e.get(ctx, path, !exact)
 	if err != nil {
@@ -166,14 +142,11 @@ Nodes:
 			}
 		}
 
-		// Decrypt the value if it's encrypted (detects type marker)
-		fmt.Printf("[DEBUG] etcd key=%s, value_len=%d, first_byte=0x%02x\n", n.Key, len(n.Value), n.Value[0])
-		decryptedValue, err := detectAndDecrypt(n.Value, e.Crypto)
+		// Decrypt the value (auto-detects JSON wrapper format with type marker)
+		decryptedValue, err := detectAndDecrypt(n.Value, e.AESKey)
 		if err != nil {
-			fmt.Printf("[ERROR] Decryption failed for %s: %v\n", n.Key, err)
 			return nil, fmt.Errorf("%s: decryption failed: %s", n.Key, err.Error())
 		}
-		fmt.Printf("[DEBUG] Decryption succeeded, decrypted_len=%d\n", len(decryptedValue))
 
 		serv := new(msg.Service)
 		if err := json.Unmarshal(decryptedValue, serv); err != nil {

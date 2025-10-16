@@ -1,10 +1,8 @@
 package etcd_crypto
 
 import (
-	"crypto/rsa"
 	"crypto/tls"
-	"crypto/x509"
-	"encoding/pem"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -48,16 +46,13 @@ func etcdParse(c *caddy.Controller) (*Etcd, error) {
 		MaxLeaseTTL: defaultLeaseMaxTTL,
 	}
 	var (
-		tlsConfig         *tls.Config
-		err               error
-		endpoints         = []string{defaultEndpoint}
-		username          string
-		password          string
-		rsaKeyFile        string
-		wkdibeParamsFile  string
-		wkdibeKeyFile     string
-		calypsoParamsFile string
-		calypsoKeyFile    string
+		tlsConfig  *tls.Config
+		err        error
+		endpoints  = []string{defaultEndpoint}
+		username   string
+		password   string
+		aesKeyFile string
+		aesKeyHex  string
 	)
 
 	etc.Upstream = upstream.New()
@@ -124,46 +119,19 @@ func etcdParse(c *caddy.Controller) (*Etcd, error) {
 					return &Etcd{}, c.Errf("invalid max-lease-ttl value: %v", err)
 				}
 				etc.MaxLeaseTTL = maxLeaseTTL
-			case "rsa_key_file":
+			case "aes_key_file":
 				if !c.NextArg() {
 					return &Etcd{}, c.ArgErr()
 				}
-				rsaKeyFile = c.Val()
-				if !filepath.IsAbs(rsaKeyFile) && config.Root != "" {
-					rsaKeyFile = filepath.Join(config.Root, rsaKeyFile)
+				aesKeyFile = c.Val()
+				if !filepath.IsAbs(aesKeyFile) && config.Root != "" {
+					aesKeyFile = filepath.Join(config.Root, aesKeyFile)
 				}
-			case "wkdibe_params_file":
+			case "aes_key_hex":
 				if !c.NextArg() {
 					return &Etcd{}, c.ArgErr()
 				}
-				wkdibeParamsFile = c.Val()
-				if !filepath.IsAbs(wkdibeParamsFile) && config.Root != "" {
-					wkdibeParamsFile = filepath.Join(config.Root, wkdibeParamsFile)
-				}
-			case "wkdibe_key_file":
-				if !c.NextArg() {
-					return &Etcd{}, c.ArgErr()
-				}
-				wkdibeKeyFile = c.Val()
-				if !filepath.IsAbs(wkdibeKeyFile) && config.Root != "" {
-					wkdibeKeyFile = filepath.Join(config.Root, wkdibeKeyFile)
-				}
-			case "calypso_params_file":
-				if !c.NextArg() {
-					return &Etcd{}, c.ArgErr()
-				}
-				calypsoParamsFile = c.Val()
-				if !filepath.IsAbs(calypsoParamsFile) && config.Root != "" {
-					calypsoParamsFile = filepath.Join(config.Root, calypsoParamsFile)
-				}
-			case "calypso_key_file":
-				if !c.NextArg() {
-					return &Etcd{}, c.ArgErr()
-				}
-				calypsoKeyFile = c.Val()
-				if !filepath.IsAbs(calypsoKeyFile) && config.Root != "" {
-					calypsoKeyFile = filepath.Join(config.Root, calypsoKeyFile)
-				}
+				aesKeyHex = c.Val()
 			default:
 				if c.Val() != "}" {
 					return &Etcd{}, c.Errf("unknown property '%s'", c.Val())
@@ -177,52 +145,27 @@ func etcdParse(c *caddy.Controller) (*Etcd, error) {
 		etc.Client = client
 		etc.endpoints = endpoints
 
-		// Load cryptographic keys if specified
-		cryptoConfig := &CryptoConfig{}
-		keysConfigured := false
-
-		// Load RSA private key if specified
-		if rsaKeyFile != "" {
-			rsaKey, err := loadRSAPrivateKey(rsaKeyFile)
-			if err != nil {
-				return &Etcd{}, c.Errf("failed to load RSA key from %s: %v", rsaKeyFile, err)
-			}
-			cryptoConfig.RSAKey = rsaKey
-			fmt.Printf("etcd_crypto: RSA key loaded from %s\n", rsaKeyFile)
-			keysConfigured = true
+		// Load AES key (optional - for encrypted records only)
+		if aesKeyFile != "" && aesKeyHex != "" {
+			return &Etcd{}, c.Errf("cannot specify both aes_key_file and aes_key_hex")
 		}
 
-		// Load WKD-IBE keys if specified
-		if wkdibeParamsFile != "" && wkdibeKeyFile != "" {
-			wkdibeKey, err := loadWKDIBEKey(wkdibeParamsFile, wkdibeKeyFile)
+		if aesKeyFile != "" {
+			aesKey, err := loadAESKeyFromFile(aesKeyFile)
 			if err != nil {
-				return &Etcd{}, c.Errf("failed to load WKD-IBE key: %v", err)
+				return &Etcd{}, c.Errf("failed to load AES key from %s: %v", aesKeyFile, err)
 			}
-			cryptoConfig.WKDIBEKey = wkdibeKey
-			fmt.Printf("etcd_crypto: WKD-IBE key loaded from %s\n", wkdibeKeyFile)
-			keysConfigured = true
-		} else if wkdibeParamsFile != "" || wkdibeKeyFile != "" {
-			return &Etcd{}, c.Errf("both wkdibe_params_file and wkdibe_key_file must be specified together")
-		}
-
-		// Load Calypso keys if specified
-		if calypsoParamsFile != "" && calypsoKeyFile != "" {
-			calypsoKey, err := loadCalypsoKey(calypsoParamsFile, calypsoKeyFile)
+			etc.AESKey = aesKey
+			fmt.Printf("etcd_crypto: AES-256 key loaded from %s\n", aesKeyFile)
+		} else if aesKeyHex != "" {
+			aesKey, err := loadAESKeyFromHex(aesKeyHex)
 			if err != nil {
-				return &Etcd{}, c.Errf("failed to load Calypso key: %v", err)
+				return &Etcd{}, c.Errf("failed to parse AES key hex: %v", err)
 			}
-			cryptoConfig.CalypsoKey = calypsoKey
-			maxDepth := calypsoKey.PublicParams.MaxDepth
-			fmt.Printf("etcd_crypto: Calypso key loaded from %s (maxDepth=%d, search tag mode enabled)\n", calypsoKeyFile, maxDepth)
-			keysConfigured = true
-		} else if calypsoParamsFile != "" || calypsoKeyFile != "" {
-			return &Etcd{}, c.Errf("both calypso_params_file and calypso_key_file must be specified together")
-		}
-
-		if keysConfigured {
-			etc.Crypto = cryptoConfig
+			etc.AESKey = aesKey
+			fmt.Printf("etcd_crypto: AES-256 key loaded from hex string\n")
 		} else {
-			fmt.Println("etcd_crypto: No encryption keys configured (plaintext only)")
+			fmt.Println("etcd_crypto: No AES key configured (plaintext only mode)")
 		}
 
 		return &etc, nil
@@ -281,101 +224,35 @@ func parseTTL(s string) (uint32, error) {
 	return uint32(seconds), nil
 }
 
-// loadRSAPrivateKey loads an RSA private key from a PEM file.
-func loadRSAPrivateKey(keyFile string) (*rsa.PrivateKey, error) {
+// loadAESKeyFromFile loads a 32-byte AES-256 key from a binary file
+func loadAESKeyFromFile(keyFile string) ([]byte, error) {
 	keyData, err := os.ReadFile(keyFile)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read key file: %w", err)
 	}
 
-	block, _ := pem.Decode(keyData)
-	if block == nil {
-		return nil, fmt.Errorf("failed to parse PEM block containing the key")
+	if len(keyData) != 32 {
+		return nil, fmt.Errorf("AES key must be exactly 32 bytes (256 bits), got %d bytes", len(keyData))
 	}
 
-	// Try PKCS#1 format first
-	if block.Type == "RSA PRIVATE KEY" {
-		privateKey, err := x509.ParsePKCS1PrivateKey(block.Bytes)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse RSA private key (PKCS#1): %w", err)
-		}
-		return privateKey, nil
-	}
-
-	// Try PKCS#8 format
-	if block.Type == "PRIVATE KEY" {
-		key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse private key (PKCS#8): %w", err)
-		}
-		rsaKey, ok := key.(*rsa.PrivateKey)
-		if !ok {
-			return nil, fmt.Errorf("key is not an RSA private key")
-		}
-		return rsaKey, nil
-	}
-
-	return nil, fmt.Errorf("unsupported key type: %s", block.Type)
+	return keyData, nil
 }
 
-// loadWKDIBEKey loads WKD-IBE public parameters and private key from binary files.
-func loadWKDIBEKey(paramsFile, keyFile string) (*WKDIBEKey, error) {
-	// Load public parameters
-	paramsData, err := os.ReadFile(paramsFile)
+// loadAESKeyFromHex loads a 32-byte AES-256 key from a hex string
+func loadAESKeyFromHex(hexKey string) ([]byte, error) {
+	// Remove any whitespace or common separators
+	hexKey = strings.ReplaceAll(hexKey, " ", "")
+	hexKey = strings.ReplaceAll(hexKey, ":", "")
+	hexKey = strings.ReplaceAll(hexKey, "-", "")
+
+	keyData, err := hex.DecodeString(hexKey)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read params file: %w", err)
+		return nil, fmt.Errorf("invalid hex string: %w", err)
 	}
 
-	// Deserialize using the helper function from wkdibe.go
-	// Note: This requires the akn07 library imports
-	pp, err := deserializeWKDIBEPublicParams(paramsData)
-	if err != nil {
-		return nil, fmt.Errorf("failed to deserialize public params: %w", err)
+	if len(keyData) != 32 {
+		return nil, fmt.Errorf("AES key must be exactly 32 bytes (256 bits), got %d bytes", len(keyData))
 	}
 
-	// Load private key
-	keyData, err := os.ReadFile(keyFile)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read key file: %w", err)
-	}
-
-	sk, err := deserializeWKDIBEPrivateKey(keyData)
-	if err != nil {
-		return nil, fmt.Errorf("failed to deserialize private key: %w", err)
-	}
-
-	return &WKDIBEKey{
-		PublicParams: pp,
-		PrivateKey:   sk,
-	}, nil
-}
-
-// loadCalypsoKey loads Calypso public parameters and private key from binary files.
-func loadCalypsoKey(paramsFile, keyFile string) (*CalypsoKey, error) {
-	// Load public parameters (reusing WKD-IBE params deserialization)
-	paramsData, err := os.ReadFile(paramsFile)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read params file: %w", err)
-	}
-
-	pp, err := deserializeWKDIBEPublicParams(paramsData)
-	if err != nil {
-		return nil, fmt.Errorf("failed to deserialize public params: %w", err)
-	}
-
-	// Load private key (Calypso uses gob encoding)
-	keyData, err := os.ReadFile(keyFile)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read key file: %w", err)
-	}
-
-	privateKey, err := deserializeCalypsoPrivateKey(keyData)
-	if err != nil {
-		return nil, fmt.Errorf("failed to deserialize private key: %w", err)
-	}
-
-	return &CalypsoKey{
-		PublicParams: pp,
-		PrivateKey:   privateKey,
-	}, nil
+	return keyData, nil
 }

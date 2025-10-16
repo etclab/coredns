@@ -95,6 +95,52 @@ https://.:4430 {
 
 ---
 
+### etcd_crypto Plugin
+
+The `etcd_crypto` plugin provides **AES-256-GCM encrypted DNS records** with server-side decryption. CoreDNS decrypts records on-demand during query resolution using a provisioned AES key.
+
+**Key Features**:
+- **AES-256-GCM**: Authenticated encryption (type marker `01`)
+- **Server-side decryption**: CoreDNS has the key and decrypts before responding
+- **JSON wrapper format**: Consistent `{"text": "01:BASE64", "ttl": 300}` structure
+- **Backward compatible**: Supports plaintext records alongside encrypted ones
+
+**Setup**:
+1. **Register plugin**: Add `etcd_crypto:etcd_crypto` to `plugin.cfg` (after `etcd:etcd`)
+2. **Build CoreDNS**:
+   ```shell
+   go generate
+   go build .
+   ```
+3. **Generate AES key**: `openssl rand -out aes.key 32`
+
+**Corefile Configuration**:
+```
+.:1053 {
+    etcd_crypto {
+        endpoint http://localhost:2379
+        path /skydns
+        aes_key_file aes.key
+    }
+    log
+}
+```
+
+**Testing with etcd-client**:
+
+Register encrypted record:
+```shell
+CRYPTO_TYPE=aes AES_KEY_FILE=aes.key \
+./etcd-client -register api.example.com=10.0.0.1
+```
+
+Query (standard DNS - no special client requirements):
+```shell
+dig @localhost -p 1053 api.example.com
+```
+
+---
+
 ### etcd_calypso Plugin
 
 The `etcd_calypso` plugin implements **Zero Trust DNS** for Calypso encrypted records. CoreDNS performs **no decryption** - it only routes queries to search tag-based storage paths and returns encrypted data as-is to clients.

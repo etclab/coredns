@@ -10,6 +10,17 @@
 [![CII Best Practices](https://bestpractices.coreinfrastructure.org/projects/1250/badge)](https://bestpractices.coreinfrastructure.org/projects/1250)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/coredns/coredns/badge)](https://scorecard.dev/viewer/?uri=github.com/coredns/coredns)
 
+---
+
+## 🔬 Custom Plugins & Research Extensions
+
+**See [calypso-readme.md](./calypso-readme.md)** for documentation on custom plugins:
+- `jwt_edns` - JWT authorization via EDNS
+- `etcd_crypto` - AES-256-GCM encrypted DNS records
+- `etcd_calypso` - Zero-trust DNS with client-side decryption
+
+---
+
 CoreDNS is a DNS server/forwarder, written in Go, that chains [plugins](https://coredns.io/plugins).
 Each plugin performs a (DNS) function.
 
