@@ -17,10 +17,16 @@ The `jwt_edns` plugin enforces JWT authorization via EDNS OPT records (option co
    go build .
    ```
 4. **Generate certificates**: Run `./gen_certs.sh` to create TLS certificates for encrypted DNS transports
-5. **Set public key environment variable**: The JWT signing algorithm requires its corresponding public key:
-   - Keep public key in same folder: `export JWT_PUBLIC_KEY_PATH=public.pem`
-   - Or specify custom path: `export JWT_PUBLIC_KEY_PATH=/path/to/your/public.pem`
-6. **Start CoreDNS**: Run `./coredns` after setting the environment variable
+5. **Generate JWT key pair**:
+   ```shell
+   # Using jwt-tools
+   ./jwt-tools generate-keys  # Creates private.pem and public.pem (EdDSA default)
+   ```
+6. **Generate JWT token**:
+   ```shell
+   ./jwt-tools generate-token --client-id "dns-client-1" --permissions "query" --allowed-zones "example.com" --expiry "30d"
+   ```
+7. **Start CoreDNS**: Run `./coredns` (key_file configured in Corefile)
 
 **Corefile Configuration**:
 ```
@@ -39,7 +45,10 @@ tls://.:853 {
 
 # DNS over TLS with JWT EDNS
 tls://.:8530 {
-    jwt_edns { algorithm eddsa }
+    jwt_edns {
+        algorithm eddsa
+        key_file public.pem
+    }
     forward . tls://1.1.1.1
     tls cert.pem key.pem
     log
@@ -54,7 +63,10 @@ https://.:443 {
 
 # DNS over HTTPS with JWT EDNS
 https://.:4430 {
-    jwt_edns { algorithm eddsa }
+    jwt_edns {
+        algorithm eddsa
+        key_file public.pem
+    }
     forward . 1.1.1.1
     tls cert.pem key.pem
     log

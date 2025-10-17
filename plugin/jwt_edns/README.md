@@ -9,12 +9,36 @@
 The jwt_edns plugin enforces strict JWT authorization for DNS queries by extracting JWT tokens from EDNS OPT records. This plugin validates JWT tokens embedded in DNS requests using private EDNS option code 65001 and implements authenticated DNS resolution with zone-based access control.
 
 **Security Model:**
-- **Public key required at startup** - Plugin fails to initialize if `JWT_PUBLIC_KEY_PATH` environment variable is not set
+- **Public key required at startup** - Plugin fails to initialize if `key_file` directive is not configured
 - **All requests require JWT tokens** - No requests are allowed without valid JWT in EDNS option 65001
 - **EDNS0 support mandatory** - Refuses requests without EDNS0 support
 - **Asymmetric cryptography** - Supports RSA, ECDSA, and EdDSA signature algorithms
 
 The plugin validates JWT tokens with custom claims including client identification, permissions, and optional zone restrictions. Invalid tokens or missing authorization return `dns.RcodeRefused`.
+
+## Enforcements
+
+The plugin applies the following enforcements in order (all violations result in `REFUSED` response):
+
+### Hard Requirements
+1. **EDNS0 Support** - Request must include EDNS0 extension
+2. **JWT Token Presence** - JWT must be present in EDNS option code 65001
+3. **Valid JWT Signature** - Token must verify with configured public key
+4. **Signing Algorithm Match** - Token algorithm must match configured key type (RSA/ECDSA/EdDSA)
+5. **Token Validity** - Standard JWT validation (expiration, not-before, etc.)
+
+### Claims Validation
+6. **`client_id` Required** - Must be present and non-empty
+7. **`query` Permission Required** - Must be present in `permissions` array
+8. **Zone Authorization** - If `allowed_zones` claim is specified, requested zone must match (supports suffix matching for subdomains)
+
+### Example Rejection Scenarios
+- No EDNS0 → `REFUSED`
+- No JWT token in EDNS options → `REFUSED`
+- Invalid/expired JWT signature → `REFUSED`
+- Missing "query" permission → `REFUSED`
+- Querying `evil.com` when `allowed_zones: ["example.com"]` → `REFUSED`
+- Querying `sub.example.com` when `allowed_zones: ["example.com"]` → `ALLOWED` (suffix match)
 
 ## Compilation
 
@@ -46,14 +70,16 @@ make
 ## Syntax
 
 ~~~ txt
-jwt_edns
+jwt_edns {
+    algorithm ALGORITHM
+    key_file PATH
+}
 ~~~
 
+- **`algorithm`** - Optional. Signing algorithm: `rsa`, `ecdsa`, or `eddsa` (default: `eddsa`)
+- **`key_file`** - Required. Path to PEM-encoded public key file for JWT validation
+
 ## Configuration
-
-### Environment Variables
-
-- `JWT_PUBLIC_KEY_PATH` - **Required**. Path to PEM-encoded public key file for JWT validation.
 
 ### JWT Claims Structure
 
@@ -105,22 +131,28 @@ This plugin reports readiness to the ready plugin. It will be immediately ready.
 
 ## Examples
 
-### Basic Configuration
+### Basic Configuration with EdDSA (default)
 
 Enable JWT authorization via EDNS and forward queries to an upstream resolver:
 
 ~~~ corefile
 . {
-  jwt_edns
+  jwt_edns {
+    algorithm eddsa
+    key_file /etc/coredns/public.pem
+  }
   forward . 9.9.9.9
 }
 ~~~
 
-### With Logging
+### With RSA Algorithm
 
 ~~~ corefile
 . {
-  jwt_edns
+  jwt_edns {
+    algorithm rsa
+    key_file /etc/coredns/public.pem
+  }
   log
   forward . 8.8.8.8
 }
@@ -128,26 +160,33 @@ Enable JWT authorization via EDNS and forward queries to an upstream resolver:
 
 ### Setup
 
-1. **Generate key pair**:
+1. **Generate key pair using jwt-tools**:
    ```bash
+   # Navigate to jwt-tools directory
+   cd ~/Projects/calypso/ztrust-dns/jwt-tools
 
-   # ECDSA key pair (recommended for smaller tokens):
-   openssl ecparam -genkey -name prime256v1 -noout -out private.pem
-   openssl ec -in private.pem -pubout -out public.pem
+   # Generate EdDSA key pair (default, recommended)
+   ./jwt-tools generate-keys
 
-   # Generate private key
-   openssl genrsa -out private.pem 2048
+   # Or generate with specific algorithm
+   ./jwt-tools generate-keys --algorithm ES256  # ECDSA
+   ./jwt-tools generate-keys --algorithm RS256  # RSA
 
-   # Extract public key
-   openssl rsa -in private.pem -pubout -out public.pem
+   # This creates private.pem and public.pem
    ```
 
-2. **Set environment variable**:
+2. **Generate JWT token**:
    ```bash
-   export JWT_PUBLIC_KEY_PATH=/path/to/public.pem
+   # Generate token for a client
+   ./jwt-tools generate-token --client-id "dns-client-1" --permissions "query" --allowed-zones "example.com" --expiry "30d"
+
+   # With specific algorithm
+   ./jwt-tools generate-token --algorithm ES256 --client-id "client-1" --permissions "query" --expiry "30d"
    ```
 
-3. **Start CoreDNS**:
+3. **Configure Corefile** with the public key path in the `key_file` directive
+
+4. **Start CoreDNS**:
    ```bash
    ./coredns -conf Corefile
    ```

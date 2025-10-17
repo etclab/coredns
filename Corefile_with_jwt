@@ -13,7 +13,10 @@ tls://.:853 {
 
 # DNS over TLS with JWT EDNS
 tls://.:8530 {
-	jwt_edns { algorithm eddsa }
+	jwt_edns {
+		algorithm eddsa
+		key_file jwt_public.pem
+	}
     forward . tls://1.1.1.1
 	tls cert.pem key.pem
 	log
@@ -28,7 +31,10 @@ https://.:443 {
 
 # DNS over HTTPS with JWT EDNS
 https://.:4430 {
-    jwt_edns { algorithm eddsa }
+    jwt_edns {
+		algorithm eddsa
+		key_file jwt_public.pem
+	}
     forward . 1.1.1.1
     tls cert.pem key.pem
     log

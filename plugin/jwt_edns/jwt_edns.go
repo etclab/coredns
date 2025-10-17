@@ -24,13 +24,8 @@ import (
 
 var log = clog.NewWithPlugin("jwt_edns")
 
-// loadPublicKeyFromEnvWithAlgorithm loads the public key with a specific algorithm
-func loadPublicKeyFromEnvWithAlgorithm(algorithm string) (interface{}, error) {
-	keyPath := os.Getenv("JWT_PUBLIC_KEY_PATH")
-	if keyPath == "" {
-		return nil, fmt.Errorf("JWT_PUBLIC_KEY_PATH environment variable not set")
-	}
-
+// loadPublicKeyFromFile loads the public key from a file with a specific algorithm
+func loadPublicKeyFromFile(keyPath string, algorithm string) (interface{}, error) {
 	keyData, err := os.ReadFile(keyPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read public key file: %w", err)
