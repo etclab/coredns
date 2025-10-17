@@ -23,7 +23,7 @@ coredns: $(CHECKS)
 ego: $(CHECKS)
 	CGO_ENABLED=$(CGO_ENABLED) $(SYSTEM) GOTOOLCHAIN=auto ego-go build $(BUILDOPTS) \
 	-ldflags="-s -w -X github.com/coredns/coredns/coremain.GitCommit=$(GITCOMMIT)" -o $(BINARY)-ego
-	ego sign dev/enclave/enclave.json
+	ego sign dev/e/enclave.json
 
 ego-run: 
 	sudo ego run $(BINARY)-ego -dns.port=1053
