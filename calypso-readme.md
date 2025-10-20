@@ -1,5 +1,19 @@
 # Development Notes for Calypso
 
+## Overview
+
+**EDNS Option Codes**:
+- `65001` - JWT authentication token
+- `65002` - WKDIBE encrypted record request
+- `65003` - Calypso encrypted record request (includes searchtag payload)
+
+**Encryption Type Markers** (in `TYPE:BASE64` format):
+- `01:` - AES-256-GCM (server-side decryption in etcd_crypto)
+- `02:` - WKDIBE (client-side decryption)
+- `03:` - Calypso (client-side decryption)
+
+---
+
 ## Custom Plugins
 
 ### jwt_edns Plugin
@@ -26,7 +40,8 @@ The `jwt_edns` plugin enforces JWT authorization via EDNS OPT records (option co
    ```shell
    ./jwt-tools generate-token --client-id "dns-client-1" --permissions "query" --allowed-zones "example.com" --expiry "30d"
    ```
-7. **Start CoreDNS**: Run `./coredns` (key_file configured in Corefile)
+7. **Configure Corefile** with required directives (see below)
+8. **Start CoreDNS**: Run `./coredns`
 
 **Corefile Configuration**:
 ```
@@ -92,7 +107,7 @@ https://.:4430 {
 
 - **JWT-enforced DNS over TLS**:
   ```shell
-  ./q A --jwt="<token>" --opt google.com @tls://localhost:8530 --verbose
+  ./q A google.com @tls://localhost:8530 --jwt --token "<your-jwt-token>" --verbose
   ```
 
 - **DNS over HTTPS**:
@@ -102,7 +117,7 @@ https://.:4430 {
 
 - **JWT-enforced DNS over HTTPS**:
   ```shell
-  ./q A google.com --jwt="<token>" --opt google.com @https://localhost:4430/dns-query --verbose
+  ./q A google.com @https://localhost:4430/dns-query --jwt --token "<your-jwt-token>" --verbose
   ```
 
 ---
@@ -155,20 +170,35 @@ dig @localhost -p 1053 api.example.com
 
 ### etcd_calypso Plugin
 
-The `etcd_calypso` plugin implements **Zero Trust DNS** for Calypso encrypted records. CoreDNS performs **no decryption** - it only routes queries to search tag-based storage paths and returns encrypted data as-is to clients.
+The `etcd_calypso` plugin implements **Zero Trust DNS** with client-side encryption. CoreDNS performs **no decryption** - it only routes queries based on EDNS options and returns encrypted data as-is to authorized clients.
 
-**Key Architecture Principles**:
-- **Zero Trust**: CoreDNS has no decryption keys, only performs SHA-256 hashing for path routing
-- **Client-side decryption**: Encrypted TXT records are decrypted by authorized clients only
-- **EDNS signaling**: Client sends EDNS option 65002 to trigger Calypso search tag routing
-- **Reconnaissance prevention**: Records stored at `/skydns-calypso/[hash]` instead of hierarchical DNS paths
+**Key Features**:
+- **Zero Trust Architecture**: CoreDNS has no decryption keys
+- **Three Request Types**:
+  - Regular queries: Returns plaintext records, filters out encrypted ones
+  - WKDIBE queries (EDNS 65002): Returns WKDIBE encrypted TXT records (marker `02:`)
+  - Calypso queries (EDNS 65003): Returns Calypso encrypted TXT records (marker `03:`) using searchtag-based routing
+- **Client-side decryption**: Only authorized clients with proper keys can decrypt responses
+- **Reconnaissance prevention**: Calypso records stored at `/skydns-calypso/[searchtag]` instead of hierarchical DNS paths
 
 **How It Works**:
-1. Client query includes EDNS option 65002 → CoreDNS detects Calypso request
-2. CoreDNS computes search tag: `SHA256(domain pattern) → 64-char hex hash`
-3. Lookup at `/skydns-calypso/[hash]` instead of `/skydns/com/example/domain`
-4. Returns encrypted TXT record (marker `0x03`) to client without decryption
-5. Client decrypts using Calypso reader key
+
+*Regular DNS Query (no EDNS)*:
+1. Client sends standard DNS query
+2. CoreDNS looks up record at standard path `/skydns/com/example/domain`
+3. Returns plaintext records, filters out any encrypted records (01:, 02:, 03:)
+
+*WKDIBE Query (EDNS 65002)*:
+1. Client includes EDNS option 65002
+2. CoreDNS looks up at standard path `/skydns/com/example/domain`
+3. Returns encrypted TXT record with `02:` prefix to client (no decryption)
+4. Client decrypts using WKDIBE private key
+
+*Calypso Query (EDNS 65003 with searchtag)*:
+1. Client generates searchtag and includes it in EDNS option 65003
+2. CoreDNS routes to `/skydns-calypso/[searchtag]`
+3. Returns encrypted TXT record with `03:` prefix to client (no decryption)
+4. Client decrypts using Calypso reader key
 
 **Setup**:
 1. **Register plugin**: Add `etcd_calypso:etcd_calypso` to `plugin.cfg` (after `etcd:etcd`)
@@ -185,37 +215,52 @@ The `etcd_calypso` plugin implements **Zero Trust DNS** for Calypso encrypted re
         endpoint http://localhost:2379
         path /skydns
         calypso_path_prefix skydns-calypso  # Optional: default is "skydns-calypso"
-        calypso_max_depth 5                 # Optional: default is 5
     }
     log
 }
 ```
 
 **Client Requirements**:
-- DNS client must send EDNS option 65002 to signal Calypso handling
-- Example with `q` tool: `CALYPSO_PARAMS_FILE=params.bin CALYPSO_KEY_FILE=reader.key ./q TXT verify.example.com @localhost:1053 `
+
+For WKDIBE queries:
+- DNS client must send EDNS option 65002
+- Example with `q` tool: `./q A --wkdibe --key=user.key domain.example.com @localhost:1053`
+- WKDIBE private key for client-side decryption
+
+For Calypso queries:
+- DNS client must send EDNS option 65003 with searchtag payload
+- Example with `q` tool: `./q A --calypso --params=params.bin --key=reader.key verify.example.com @localhost:1053`
 - Calypso reader key for client-side decryption
 
 **Testing with etcd-client**:
 
-Register Calypso encrypted record:
+Register WKDIBE encrypted record:
 ```shell
 cd /path/to/etcd-client
+CRYPTO_TYPE=wkdibe \
+WKDIBE_PARAMS_FILE=params.bin \
+WKDIBE_MASTER_KEY=master.key \
+./etcd-client -register wkdibe.example.com=10.0.0.5
+```
+
+Register Calypso encrypted record:
+```shell
 CRYPTO_TYPE=calypso \
 CALYPSO_PARAMS_FILE=params.bin \
 CALYPSO_WRITER_KEY=alice-writer.key \
 ./etcd-client -register verify.example.com=10.0.0.6
 ```
 
-Query via CoreDNS (client with EDNS option 65002):
+Query via CoreDNS:
 ```shell
-CALYPSO_PARAMS_FILE=params.bin CALYPSO_KEY_FILE=alice-reader.key ./q TXT verify.example.com @localhost:1053 --verbose
-```
+# Regular query (returns only plaintext, filters encrypted)
+./q A verify.example.com @localhost:1053
 
-**Search Tag Computation** (matches etcd-client exactly):
-- Domain normalized: lowercase, trailing dot removed
-- Pattern: reversed domain labels padded to maxDepth
-- Concrete components joined with `\x00` separator
-- Full SHA-256 hash (64 hex characters)
+# WKDIBE query (returns encrypted record with 02: prefix)
+./q A --wkdibe --key=user.key wkdibe.example.com @localhost:1053
+
+# Calypso query (returns encrypted record with 03: prefix)
+./q A --calypso --params=params.bin --key=alice-reader.key verify.example.com @localhost:1053
+```
 
 
