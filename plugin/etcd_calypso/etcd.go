@@ -3,8 +3,6 @@ package etcd_calypso
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,8 +42,7 @@ type Etcd struct {
 	MaxLeaseTTL uint32 // maximum TTL for lease-based records
 
 	// Calypso-specific configuration
-	CalypsoPathPrefix   string            // Path prefix for Calypso records (default: "skydns-calypso")
-	CalypsoMaxDepth     int               // Maximum depth for pattern matching (default: 5)
+	CalypsoPathPrefix string // Path prefix for Calypso records (default: "skydns-calypso")
 
 	endpoints []string // Stored here as well, to aid in testing.
 }
@@ -80,28 +77,6 @@ func (e *Etcd) IsNameError(err error) bool {
 // name. This is used when find matches when completing SRV lookups for instance.
 func (e *Etcd) Records(ctx context.Context, state request.Request, exact bool) ([]msg.Service, error) {
 	name := state.Name()
-
-	// Check if this should use Calypso search tag routing
-	if e.shouldUseSearchTag(state) {
-		// Use search tag for Calypso domains
-		searchTag, err := ComputeSearchTag(name, e.CalypsoMaxDepth)
-		if err != nil {
-			return nil, fmt.Errorf("failed to compute search tag: %w", err)
-		}
-
-		// Construct search tag path
-		path := fmt.Sprintf("/%s/%s", e.CalypsoPathPrefix, searchTag)
-
-		// Search tag lookups are always exact (no wildcards)
-		r, err := e.get(ctx, path, false)
-		if err != nil {
-			return nil, err
-		}
-
-		// Use empty segments for Calypso records (no hierarchy matching needed)
-		segments := []string{}
-		return e.loopNodes(r.Kvs, segments, false, state.QType())
-	}
 
 	// Standard etcd path resolution
 	path, star := msg.PathWithWildcard(name, e.PathPrefix)
@@ -254,96 +229,3 @@ func (e *Etcd) OnShutdown() error {
 	return nil
 }
 
-// DomainToPattern converts a domain name to a pattern array for Calypso search tags.
-// This matches the etcd-client implementation exactly.
-func DomainToPattern(domain string, maxDepth int) ([]string, error) {
-	if maxDepth < 2 {
-		return nil, errors.New("maxDepth must be at least 2")
-	}
-
-	// Normalize domain (lowercase, remove trailing dot)
-	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
-
-	parts := strings.Split(domain, ".")
-	if len(parts) > maxDepth-1 {
-		return nil, errors.New("domain exceeds maxDepth capacity")
-	}
-
-	pattern := make([]string, maxDepth)
-
-	// Reverse domain parts (alice.example.com → com, example, alice)
-	wildcardSeen := false
-	for i := 0; i < len(parts); i++ {
-		reversedIdx := len(parts) - 1 - i
-		part := parts[reversedIdx]
-
-		// Check for wildcard marker
-		if part == "*" {
-			wildcardSeen = true
-			pattern[i] = "" // Wildcard represented as empty string
-		} else {
-			// Validate: concrete labels cannot follow wildcards
-			if wildcardSeen {
-				return nil, errors.New("invalid pattern: concrete labels cannot follow wildcards")
-			}
-			pattern[i] = part
-		}
-	}
-
-	// Remaining slots are empty (for wildcards/signatures)
-	// Already initialized to empty strings by make()
-
-	return pattern, nil
-}
-
-// ComputeSearchTag computes a search tag for a domain name.
-// This matches the etcd-client implementation exactly to ensure compatibility.
-func ComputeSearchTag(domain string, maxDepth int) (string, error) {
-	// Convert domain to pattern
-	pattern, err := DomainToPattern(domain, maxDepth)
-	if err != nil {
-		return "", fmt.Errorf("failed to convert domain to pattern: %w", err)
-	}
-
-	// Extract only concrete (non-empty) pattern components
-	var concrete []string
-	for _, part := range pattern {
-		if part != "" {
-			concrete = append(concrete, part)
-		}
-	}
-
-	if len(concrete) == 0 {
-		return "", fmt.Errorf("pattern has no concrete components")
-	}
-
-	// Hash the concrete pattern components
-	// Join with null byte separator to prevent collision (e.g., ["a","bc"] vs ["ab","c"])
-	patternStr := strings.Join(concrete, "\x00")
-	hash := sha256.Sum256([]byte(patternStr))
-
-	// Return full hex-encoded hash (64 characters)
-	return hex.EncodeToString(hash[:]), nil
-}
-
-const (
-	// EDNS0_CALYPSO_SEARCH_TAG is the EDNS option code for signaling Calypso search tag requests
-	EDNS0_CALYPSO_SEARCH_TAG = 65002
-)
-
-// shouldUseSearchTag determines if a query should use Calypso search tag routing.
-// It checks for explicit EDNS signaling (option code 65002).
-func (e *Etcd) shouldUseSearchTag(state request.Request) bool {
-	// Check for EDNS option signal from client
-	if opt := state.Req.IsEdns0(); opt != nil {
-		for _, option := range opt.Option {
-			if local, ok := option.(*dns.EDNS0_LOCAL); ok {
-				if local.Code == EDNS0_CALYPSO_SEARCH_TAG {
-					return true
-				}
-			}
-		}
-	}
-
-	return false
-}

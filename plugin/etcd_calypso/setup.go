@@ -42,7 +42,6 @@ func etcdParse(c *caddy.Controller) (*Etcd, error) {
 		MinLeaseTTL:       defaultLeaseMinTTL,
 		MaxLeaseTTL:       defaultLeaseMaxTTL,
 		CalypsoPathPrefix: "skydns-calypso",
-		CalypsoMaxDepth:   5,
 	}
 	var (
 		tlsConfig *tls.Config
@@ -116,15 +115,6 @@ func etcdParse(c *caddy.Controller) (*Etcd, error) {
 					return &Etcd{}, c.Errf("invalid max-lease-ttl value: %v", err)
 				}
 				etc.MaxLeaseTTL = maxLeaseTTL
-			case "calypso_max_depth":
-				if !c.NextArg() {
-					return &Etcd{}, c.ArgErr()
-				}
-				depth, err := strconv.Atoi(c.Val())
-				if err != nil || depth < 2 {
-					return &Etcd{}, c.Errf("calypso_max_depth must be an integer >= 2")
-				}
-				etc.CalypsoMaxDepth = depth
 			case "calypso_path_prefix":
 				if !c.NextArg() {
 					return &Etcd{}, c.ArgErr()
