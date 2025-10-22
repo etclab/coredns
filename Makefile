@@ -19,11 +19,17 @@ all: coredns
 coredns: $(CHECKS)
 	CGO_ENABLED=$(CGO_ENABLED) $(SYSTEM) go build $(BUILDOPTS) -ldflags="-s -w -X github.com/coredns/coredns/coremain.GitCommit=$(GITCOMMIT)" -o $(BINARY)
 
-.PHONY: ego ego-run
+.PHONY: ego ego-run ego-eval
 ego: $(CHECKS)
 	CGO_ENABLED=$(CGO_ENABLED) $(SYSTEM) GOTOOLCHAIN=auto ego-go build $(BUILDOPTS) \
 	-ldflags="-s -w -X github.com/coredns/coredns/coremain.GitCommit=$(GITCOMMIT)" -o $(BINARY)-ego
 	ego sign dev/e/enclave.json
+
+# ego-eval builds coredns binary with ego & includes the required keys
+ego-eval: $(CHECKS)
+	CGO_ENABLED=$(CGO_ENABLED) $(SYSTEM) GOTOOLCHAIN=auto ego-go build $(BUILDOPTS) \
+	-ldflags="-s -w -X github.com/coredns/coredns/coremain.GitCommit=$(GITCOMMIT)" -o $(BINARY)-ego
+	ego sign dev/e/enclave-eval.json
 
 ego-run: 
 	sudo ego run $(BINARY)-ego -dns.port=1053

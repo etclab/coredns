@@ -1,0 +1,29 @@
+{
+    "exe": "../../coredns-ego",
+    "key": "./keys/private.pem",
+    "debug": true,
+    "heapSize": 512,
+    "executableHeap": false,
+    "productID": 1,
+    "securityVersion": 1,
+    "mounts": null,
+    "env": null,
+    "files": [
+        {
+            "source": "../../approaches/enclave/Corefile",
+            "target": "Corefile"
+        },
+        {
+            "source": "../../approaches/enclave/aes.key",
+            "target": "aes.key"
+        },
+        {
+            "source": "../../approaches/enclave/key.pem",
+            "target": "key.pem"
+        },
+        {
+            "source": "../../approaches/enclave/cert.pem",
+            "target": "cert.pem"
+        }
+    ]
+}
