@@ -1,0 +1,11 @@
+. {
+    odohproxy {
+        target https://127.0.0.1:8443/dns-query
+        port 8080
+        tls_cert proxy.pem
+        tls_key proxy-key.pem
+        insecure_skip_verify true
+    }
+    prometheus
+    log
+}
