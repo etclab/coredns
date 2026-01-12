@@ -1,0 +1,13 @@
+. {
+    codohtarget {
+        port 8443
+        tls_cert target.pem
+        tls_key target-key.pem
+        upstream 1.1.1.1:53
+        token_enabled
+        epoch_duration 1h
+        rate_limit 100
+    }
+    prometheus
+    log
+}

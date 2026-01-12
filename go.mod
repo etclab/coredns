@@ -49,7 +49,11 @@ require (
 	sigs.k8s.io/mcs-api v0.3.0
 )
 
-require github.com/stretchr/testify v1.11.1
+require (
+	github.com/cloudflare/circl v1.3.7
+	github.com/cloudflare/odoh-go v1.0.0
+	github.com/stretchr/testify v1.11.1
+)
 
 require (
 	cloud.google.com/go/auth v0.17.0 // indirect
@@ -90,13 +94,12 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.40.0 // indirect
 	github.com/aws/smithy-go v1.23.2 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
+	github.com/bwesterb/go-ristretto v1.2.3 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cihub/seelog v0.0.0-20170130134532-f561c5e57575 // indirect
 	github.com/cisco/go-hpke v0.0.0-20210215210317-01c430f1f302 // indirect
 	github.com/cisco/go-tls-syntax v0.0.0-20200617162716-46b0cfb76b9b // indirect
-	github.com/cloudflare/circl v1.0.0 // indirect
-	github.com/cloudflare/odoh-go v1.0.0 // indirect
 	github.com/coreos/go-semver v0.3.1 // indirect
 	github.com/coreos/go-systemd/v22 v22.5.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
