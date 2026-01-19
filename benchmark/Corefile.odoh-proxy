@@ -1,6 +1,6 @@
 # ODoH Proxy Server (Baseline)
 # Standard ODoH proxy without CODoH extensions
-. {
+.:5353 {
     odohproxy {
         target https://127.0.0.1:9443/dns-query
         port 9080

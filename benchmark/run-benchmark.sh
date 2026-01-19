@@ -11,7 +11,7 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 ITERATIONS=${1:-1000}
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 OUTPUT_DIR="$SCRIPT_DIR/results/$TIMESTAMP"
-CLIENT_PATH="/Users/pniroula/Projects/codoh/odoh-client-go/odoh-client"
+CLIENT_PATH="$(dirname "$ROOT_DIR")/codoh-client/odoh-client"
 CERT_PATH="$ROOT_DIR/localhost.pem"
 DOMAINS_PATH="$SCRIPT_DIR/top-1m.csv"
 

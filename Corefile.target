@@ -1,7 +1,7 @@
 # CODoH Target Server
 # Handles: token issuance, ODoH key distribution, DNS resolution
 
-. {
+.:5353 {
     codohtarget {
         port 8443
         tls_cert localhost.pem
