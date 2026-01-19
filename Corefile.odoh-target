@@ -1,0 +1,10 @@
+# ODoH Target Server (Baseline)
+# Standard ODoH without CODoH extensions
+. {
+    odohtarget {
+        port 9443
+        tls_cert localhost.pem
+        tls_key localhost-key.pem
+        upstream 8.8.8.8:53
+    }
+}

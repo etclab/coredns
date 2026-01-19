@@ -1,0 +1,11 @@
+# ODoH Proxy Server (Baseline)
+# Standard ODoH proxy without CODoH extensions
+. {
+    odohproxy {
+        target https://127.0.0.1:9443/dns-query
+        port 9080
+        tls_cert localhost.pem
+        tls_key localhost-key.pem
+        insecure_skip_verify true
+    }
+}

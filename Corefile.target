@@ -11,7 +11,7 @@
         # Token issuance
         token_enabled
         epoch_duration 1h
-        rate_limit 100
+        rate_limit 10000  # High limit for benchmarking
         master_secret dev-master-secret.txt
 
         log_queries true
