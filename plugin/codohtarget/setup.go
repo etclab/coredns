@@ -89,6 +89,12 @@ func parse(c *caddy.Controller) (*odohTarget, error) {
 					return nil, c.Errf("invalid rate_limit: must be positive integer")
 				}
 				t.rateLimit = limit
+			case "master_secret":
+				args := c.RemainingArgs()
+				if len(args) != 1 {
+					return nil, c.ArgErr()
+				}
+				t.masterSecretFile = args[0]
 			default:
 				return nil, c.ArgErr()
 			}

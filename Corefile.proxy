@@ -1,0 +1,20 @@
+# CODoH Proxy Server
+# Handles: client connections, enclave IPC, target forwarding
+
+. {
+    codohproxy {
+        target https://127.0.0.1:8443/dns-query
+        port 8080
+        tls_cert localhost.pem
+        tls_key localhost-key.pem
+        insecure_skip_verify true
+
+        # Phase 2: Enclave integration
+        enclave_enabled
+        enclave_socket /tmp/codoh-enclave.sock
+        enclave_bypass_on_failure true
+    }
+
+    errors
+    log
+}

@@ -6,7 +6,9 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
+	"os"
 	"sync"
 	"time"
 
@@ -184,5 +186,29 @@ func generateMasterSecret() ([]byte, error) {
 	if _, err := rand.Read(secret); err != nil {
 		return nil, err
 	}
+	return secret, nil
+}
+
+// loadMasterSecretFromFile loads a hex-encoded 32-byte secret from file.
+func loadMasterSecretFromFile(path string) ([]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	// Trim whitespace
+	secretHex := string(data)
+	for len(secretHex) > 0 && (secretHex[len(secretHex)-1] == '\n' || secretHex[len(secretHex)-1] == '\r' || secretHex[len(secretHex)-1] == ' ') {
+		secretHex = secretHex[:len(secretHex)-1]
+	}
+
+	secret, err := hex.DecodeString(secretHex)
+	if err != nil {
+		return nil, errors.New("master secret file must contain hex-encoded data")
+	}
+	if len(secret) != 32 {
+		return nil, errors.New("master secret must be 32 bytes (64 hex chars)")
+	}
+
 	return secret, nil
 }

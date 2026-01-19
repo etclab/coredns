@@ -4,6 +4,7 @@ package codohtarget
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"io"
 	"net"
 	"net/http"
@@ -28,9 +29,10 @@ type odohTarget struct {
 	logQueries bool
 
 	// Token issuance config (Phase 1)
-	tokenEnabled  bool
-	epochDuration time.Duration
-	rateLimit     int
+	tokenEnabled     bool
+	epochDuration    time.Duration
+	rateLimit        int
+	masterSecretFile string // Path to hex-encoded 32-byte secret (Phase 2)
 
 	keyPair   odoh.ObliviousDoHKeyPair
 	dnsClient *dns.Client
@@ -57,9 +59,21 @@ func (t *odohTarget) OnStartup() error {
 
 	// Initialize token issuance if enabled
 	if t.tokenEnabled {
-		masterSecret, err := generateMasterSecret()
-		if err != nil {
-			return err
+		var masterSecret []byte
+		if t.masterSecretFile != "" {
+			// Load from file (Phase 2: shared with enclave)
+			masterSecret, err = loadMasterSecretFromFile(t.masterSecretFile)
+			if err != nil {
+				return err
+			}
+			log.Infof("Loaded master secret from %s", t.masterSecretFile)
+		} else {
+			// Generate random (Phase 1 / standalone mode)
+			masterSecret, err = generateMasterSecret()
+			if err != nil {
+				return err
+			}
+			log.Warning("Using random master secret (not shared with enclave)")
 		}
 		t.epochs, err = newEpochManager(masterSecret, t.epochDuration)
 		if err != nil {
@@ -230,6 +244,21 @@ func (t *odohTarget) odohQueryHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	targetEncryptSeconds.Observe(time.Since(encryptStart).Seconds())
+
+	// Phase 2: If enclave public key provided, encrypt raw DNS for cache
+	if enclavePubKey := r.Header.Get("X-Enclave-PubKey"); enclavePubKey != "" {
+		pubKeyBytes, err := base64.StdEncoding.DecodeString(enclavePubKey)
+		if err == nil {
+			encryptedForCache, err := EncryptForEnclave(pubKeyBytes, packedResponse)
+			if err == nil {
+				w.Header().Set("X-Enclave-Cache", base64.StdEncoding.EncodeToString(encryptedForCache))
+			} else {
+				log.Warningf("Failed to encrypt for enclave cache: %v", err)
+			}
+		} else {
+			log.Warningf("Invalid X-Enclave-PubKey encoding: %v", err)
+		}
+	}
 
 	// Send response
 	w.Header().Set("Content-Type", odohContentType)

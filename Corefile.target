@@ -1,0 +1,22 @@
+# CODoH Target Server
+# Handles: token issuance, ODoH key distribution, DNS resolution
+
+. {
+    codohtarget {
+        port 8443
+        tls_cert localhost.pem
+        tls_key localhost-key.pem
+        upstream 8.8.8.8:53
+
+        # Token issuance
+        token_enabled
+        epoch_duration 1h
+        rate_limit 100
+        master_secret dev-master-secret.txt
+
+        log_queries true
+    }
+
+    errors
+    log
+}

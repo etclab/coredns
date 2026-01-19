@@ -22,8 +22,10 @@ func setup(c *caddy.Controller) error {
 
 func parse(c *caddy.Controller) (*odohProxy, error) {
 	p := &odohProxy{
-		addr:               ":8080",
-		insecureSkipVerify: false,
+		addr:                 ":8080",
+		insecureSkipVerify:   false,
+		enclaveSocketPath:    "/tmp/codoh-enclave.sock",
+		enclaveBypassOnFail:  true,
 	}
 
 	for c.Next() {
@@ -64,6 +66,20 @@ func parse(c *caddy.Controller) (*odohProxy, error) {
 					return nil, c.ArgErr()
 				}
 				p.verifyURL = args[0]
+			// Phase 2: Enclave configuration
+			case "enclave_enabled":
+				p.enclaveEnabled = true
+			case "enclave_socket":
+				args := c.RemainingArgs()
+				if len(args) != 1 {
+					return nil, c.ArgErr()
+				}
+				p.enclaveSocketPath = args[0]
+			case "enclave_bypass_on_failure":
+				args := c.RemainingArgs()
+				if len(args) == 1 && args[0] == "false" {
+					p.enclaveBypassOnFail = false
+				}
 			default:
 				return nil, c.ArgErr()
 			}
