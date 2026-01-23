@@ -159,6 +159,19 @@ if ! kill -0 $TARGET_PID 2>/dev/null; then
 fi
 log "Target started (PID: $TARGET_PID)"
 
+# Wait for enclave socket (in SGX mode, target must provision first)
+log "Waiting for enclave IPC socket..."
+for i in {1..30}; do
+    if [ -S "$TEST_DIR/enclave.sock" ]; then
+        log "Enclave socket ready"
+        break
+    fi
+    sleep 1
+done
+if [ ! -S "$TEST_DIR/enclave.sock" ]; then
+    warn "Enclave socket not found after 30s, continuing anyway"
+fi
+
 # Step 7: Start proxy
 log "Starting proxy..."
 "$TEST_DIR/coredns" -conf "$TEST_DIR/proxy-corefile" \

@@ -285,3 +285,64 @@ codohtarget {
 - Enclave generates DCAP quote binding HPKE public key
 - Target verifies quote and provisions master secret via HTTPS
 - Simulation mode uses shared secret file for development
+
+---
+
+## Benchmarking
+
+Compare ODoH baseline vs CODoH (simulation and SGX) latency with real domain datasets.
+
+### Quick Start
+
+```bash
+# Simulation only (ODoH baseline + CODoH simulation)
+./benchmark/run-benchmark.sh 1000
+
+# Include SGX hardware benchmark
+./benchmark/run-benchmark.sh --sgx 1000
+```
+
+### What It Measures
+
+| Benchmark | Description |
+|-----------|-------------|
+| ODoH (baseline) | Standard ODoH without tokens or enclave |
+| CODoH Simulation (cold) | Sequential queries, empty cache |
+| CODoH Simulation (zipf) | Zipf distribution, realistic cache behavior |
+| CODoH Simulation (warm) | Single domain repeated, best-case cache |
+| CODoH SGX (cold/zipf/warm) | Same as above with real SGX hardware |
+
+### Output Files
+
+Results saved to `benchmark/results/<timestamp>/`:
+
+| File | Description |
+|------|-------------|
+| `odoh.csv/json` | ODoH baseline latencies |
+| `codoh_sim_cold.csv/json` | CODoH simulation, cold cache |
+| `codoh_sim_zipf.csv/json` | CODoH simulation, Zipf distribution |
+| `codoh_sim_warm.csv/json` | CODoH simulation, warm cache |
+| `codoh_sgx_*.csv/json` | CODoH SGX (only with `--sgx`) |
+
+### Requirements
+
+- `../codoh-client/odoh-client` built with latency command
+- `localhost.pem` and `localhost-key.pem` in project root
+- `dev-master-secret.txt` with 64 hex characters
+- `benchmark/top-1m.csv` domain list
+
+For SGX mode additionally:
+- EGo SDK installed
+- SGX device access (`sgx` and `sgx_prv` groups)
+- PCCS configured
+
+### Analyzing Results
+
+```bash
+# View summary
+cat benchmark/results/<timestamp>/codoh_sim_zipf.json | jq '.mean, .p50, .p95, .p99'
+
+# Compare all
+cd benchmark/results/<timestamp>
+for f in *.json; do echo "=== $f ==="; cat $f | grep -E '"(mean|p50|p95|cache_hit_rate)"'; done
+```
