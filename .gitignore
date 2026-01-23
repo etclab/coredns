@@ -8,3 +8,8 @@ vendor/
 benchmark/results/
 coredns-test
 enclave-test
+
+# Enclave binaries and keys
+enclave/enclave
+enclave/enclave-sim
+enclave/*.pem

@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -17,16 +18,11 @@ import (
 
 func main() {
 	socketPath := flag.String("socket", "/tmp/codoh-enclave.sock", "Unix socket path")
-	secretFile := flag.String("secret", "", "Path to master secret file (hex-encoded)")
+	secretFile := flag.String("secret", "", "Path to master secret file (hex-encoded, for simulation mode)")
+	httpsPort := flag.Int("https-port", 8444, "HTTPS port for attestation server")
 	flag.Parse()
 
 	log.Println("CODoH Enclave starting...")
-
-	// Load config
-	cfg, err := loadConfig(*socketPath, *secretFile)
-	if err != nil {
-		log.Fatalf("Config error: %v", err)
-	}
 
 	// Generate HPKE keypair
 	keypair, err := enclave.GenerateKeypair()
@@ -36,6 +32,48 @@ func main() {
 
 	pubBytes, _ := keypair.PublicKeyBytes()
 	log.Printf("Public key: %s", base64.StdEncoding.EncodeToString(pubBytes))
+
+	// Channel for receiving provisioned master secret
+	provisionCh := make(chan []byte, 1)
+
+	// Try to generate quote to determine if we're in SGX mode
+	quote, quoteErr := enclave.GenerateQuote(pubBytes)
+	if quoteErr != nil {
+		// Simulation mode: fall back to file/env-based secret
+		log.Printf("SGX quote generation failed (simulation mode): %v", quoteErr)
+		masterSecret, err := loadFallbackSecret(*socketPath, *secretFile)
+		if err != nil {
+			log.Fatalf("Failed to load fallback secret: %v", err)
+		}
+		provisionCh <- masterSecret
+	} else {
+		// SGX mode: start attestation server and wait for provisioning
+		log.Printf("SGX mode enabled, quote generated (%d bytes)", len(quote))
+		attestServer := enclave.NewAttestationServer(*httpsPort, keypair, provisionCh)
+		go func() {
+			if err := attestServer.Start(); err != nil {
+				log.Fatalf("Attestation server error: %v", err)
+			}
+		}()
+		log.Printf("Attestation server starting on port %d, waiting for provisioning...", *httpsPort)
+	}
+
+	// Wait for master secret (blocks until provisioned)
+	log.Println("Waiting for master secret provisioning...")
+	masterSecret := <-provisionCh
+	log.Println("Master secret received, initializing enclave...")
+
+	// Load config (now with provisioned secret)
+	cfg := enclave.DefaultConfig()
+	cfg.SocketPath = *socketPath
+	cfg.MasterSecret = masterSecret
+
+	// Try to override from environment (for epoch duration, cache size, etc.)
+	if envCfg, err := enclave.LoadConfigFromEnv(); err == nil {
+		cfg.EpochDuration = envCfg.EpochDuration
+		cfg.CacheSize = envCfg.CacheSize
+		// Don't override MasterSecret - we got it from provisioning
+	}
 
 	// Initialize epoch manager for token verification
 	epochMgr, err := enclave.NewEpochManager(cfg.MasterSecret, cfg.EpochDuration)
@@ -60,6 +98,7 @@ func main() {
 		epochMgr: epochMgr,
 		spentSet: spentSet,
 		cache:    cache,
+		ready:    true, // Ready after provisioning
 	}
 
 	// Start IPC server
@@ -80,40 +119,30 @@ func main() {
 		os.Exit(0)
 	}()
 
-	log.Printf("Listening on %s", cfg.SocketPath)
+	log.Printf("Enclave ready, listening on %s", cfg.SocketPath)
 	if err := server.Serve(); err != nil {
 		log.Fatalf("Server error: %v", err)
 	}
 }
 
-func loadConfig(socketPath, secretFile string) (*enclave.Config, error) {
+// loadFallbackSecret loads master secret from file or environment (for simulation mode).
+func loadFallbackSecret(socketPath, secretFile string) ([]byte, error) {
 	// Try environment first
 	cfg, err := enclave.LoadConfigFromEnv()
-	if err == nil {
-		if socketPath != "" {
-			cfg.SocketPath = socketPath
-		}
-		return cfg, nil
+	if err == nil && len(cfg.MasterSecret) > 0 {
+		return cfg.MasterSecret, nil
 	}
 
-	// Fall back to file-based config
-	cfg = enclave.DefaultConfig()
-	cfg.SocketPath = socketPath
-
+	// Try file
 	if secretFile != "" {
-		secret, err := enclave.LoadMasterSecretFromFile(secretFile)
-		if err != nil {
-			return nil, err
-		}
-		cfg.MasterSecret = secret
-	} else {
-		// For development, use a default secret (NOT FOR PRODUCTION)
-		log.Println("WARNING: Using default master secret for development")
-		cfg.MasterSecret = make([]byte, 32)
-		copy(cfg.MasterSecret, []byte("codoh-dev-secret-not-for-prod!!"))
+		return enclave.LoadMasterSecretFromFile(secretFile)
 	}
 
-	return cfg, nil
+	// Development fallback (NOT FOR PRODUCTION)
+	log.Println("WARNING: Using default master secret for development")
+	secret := make([]byte, 32)
+	copy(secret, []byte("codoh-dev-secret-not-for-prod!!"))
+	return secret, nil
 }
 
 // EnclaveHandler implements enclave.RequestHandler.
@@ -122,6 +151,25 @@ type EnclaveHandler struct {
 	epochMgr *enclave.EpochManager
 	spentSet *enclave.SpentSet
 	cache    *enclave.LRUCache
+	ready    bool
+	mu       sync.RWMutex
+}
+
+// SetReady sets the ready status.
+func (h *EnclaveHandler) SetReady(ready bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.ready = ready
+}
+
+// HandleReady returns the ready status (for proxy to poll).
+func (h *EnclaveHandler) HandleReady() *enclave.Response {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return &enclave.Response{
+		Status: enclave.StatusOK,
+		Ready:  h.ready,
+	}
 }
 
 func (h *EnclaveHandler) HandleProcess(blobB, clientIP string) *enclave.Response {

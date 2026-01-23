@@ -84,6 +84,15 @@ func (p *odohProxy) OnStartup() error {
 			}
 		} else {
 			log.Infof("Connected to enclave at %s", p.enclaveSocketPath)
+
+			// Wait for enclave to be ready (provisioned)
+			if err := p.waitForEnclaveReady(30 * time.Second); err != nil {
+				if p.enclaveBypassOnFail {
+					log.Warningf("Enclave not ready (bypass enabled): %v", err)
+				} else {
+					return fmt.Errorf("enclave not ready: %w", err)
+				}
+			}
 		}
 	}
 
@@ -442,4 +451,21 @@ func getClientIP(r *http.Request) string {
 // decodeToken decodes a base64-encoded token from the X-ODoH-Token header.
 func decodeToken(token string) ([]byte, error) {
 	return base64.StdEncoding.DecodeString(token)
+}
+
+// waitForEnclaveReady polls the enclave until it reports ready (provisioned).
+func (p *odohProxy) waitForEnclaveReady(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		ready, err := p.enclaveClient.CheckReady()
+		if err == nil && ready {
+			log.Info("Enclave is ready (provisioned)")
+			return nil
+		}
+		if err != nil {
+			log.Debugf("Enclave ready check: %v", err)
+		}
+		time.Sleep(1 * time.Second)
+	}
+	return fmt.Errorf("timeout waiting for enclave ready after %v", timeout)
 }

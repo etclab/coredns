@@ -25,6 +25,7 @@ const (
 	msgTypeStoreEncrypted = "store_encrypted"
 	msgTypeGetPubKey      = "get_pubkey"
 	msgTypeHealth         = "health"
+	msgTypeReady          = "ready" // Returns provisioning status
 )
 
 // IPC Response Status
@@ -54,6 +55,7 @@ type EnclaveResponse struct {
 	Kc       string `json:"kc,omitempty"`
 	Error    string `json:"error,omitempty"`
 	PubKey   string `json:"pubkey,omitempty"`
+	Ready    bool   `json:"ready,omitempty"` // For ready check (provisioning status)
 }
 
 // NewEnclaveClient creates a new enclave client.
@@ -181,6 +183,18 @@ func (c *EnclaveClient) CheckHealth() error {
 	c.healthy = true
 	c.mu.Unlock()
 	return nil
+}
+
+// CheckReady checks if the enclave has been provisioned and is ready.
+func (c *EnclaveClient) CheckReady() (bool, error) {
+	resp, err := c.sendRequest(&EnclaveRequest{Type: msgTypeReady})
+	if err != nil {
+		return false, err
+	}
+	if resp.Status != statusOK {
+		return false, fmt.Errorf("ready check failed: %s", resp.Error)
+	}
+	return resp.Ready, nil
 }
 
 // sendRequest sends a request to the enclave and returns the response.

@@ -52,6 +52,7 @@ require (
 require (
 	github.com/cloudflare/circl v1.3.7
 	github.com/cloudflare/odoh-go v1.0.0
+	github.com/edgelesssys/ego v1.8.1
 	github.com/stretchr/testify v1.11.1
 )
 
@@ -110,6 +111,7 @@ require (
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/flynn/go-shlex v0.0.0-20150515145356-3f9db97f8568 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.0 // indirect
+	github.com/go-jose/go-jose/v4 v4.1.2 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/go-openapi/jsonpointer v0.21.0 // indirect

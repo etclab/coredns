@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -33,6 +34,10 @@ type odohTarget struct {
 	epochDuration    time.Duration
 	rateLimit        int
 	masterSecretFile string // Path to hex-encoded 32-byte secret (Phase 2)
+
+	// Enclave attestation config (Phase 2f)
+	enclaveURL       string // URL of enclave's attestation endpoint (e.g., https://proxy:8444)
+	expectedMRSigner []byte // Expected MRSIGNER (32 bytes)
 
 	keyPair   odoh.ObliviousDoHKeyPair
 	dnsClient *dns.Client
@@ -75,6 +80,16 @@ func (t *odohTarget) OnStartup() error {
 			}
 			log.Warning("Using random master secret (not shared with enclave)")
 		}
+
+		// Phase 2f: Provision secret to enclave via attestation
+		if t.enclaveURL != "" {
+			log.Infof("Provisioning master secret to enclave at %s", t.enclaveURL)
+			if err := VerifyEnclaveAndProvision(t.enclaveURL, t.expectedMRSigner, masterSecret); err != nil {
+				return fmt.Errorf("enclave provisioning failed: %w", err)
+			}
+			log.Info("Master secret provisioned to enclave successfully")
+		}
+
 		t.epochs, err = newEpochManager(masterSecret, t.epochDuration)
 		if err != nil {
 			return err

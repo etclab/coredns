@@ -8,6 +8,7 @@ const (
 	MsgTypeStoreEncrypted = "store_encrypted"
 	MsgTypeGetPubKey      = "get_pubkey"
 	MsgTypeHealth         = "health"
+	MsgTypeReady          = "ready" // Returns provisioning status
 )
 
 // IPC Response Status
@@ -37,6 +38,7 @@ type Response struct {
 	Kc       string `json:"kc,omitempty"`       // base64, ephemeral key for encrypting miss response
 	Error    string `json:"error,omitempty"`    // error description
 	PubKey   string `json:"pubkey,omitempty"`   // base64, for get_pubkey
+	Ready    bool   `json:"ready,omitempty"`    // for ready check (provisioning status)
 }
 
 // BlobB is the decrypted content of the encrypted blob from client.

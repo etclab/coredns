@@ -21,6 +21,7 @@ type RequestHandler interface {
 	HandleStoreEncrypted(query, encryptedResponse string, ttl int) *Response
 	HandleGetPubKey() *Response
 	HandleHealth() *Response
+	HandleReady() *Response // Returns provisioning status
 }
 
 // NewIPCServer creates a new IPC server on the given socket path.
@@ -82,6 +83,8 @@ func (s *IPCServer) dispatch(req *Request) *Response {
 		return s.handler.HandleGetPubKey()
 	case MsgTypeHealth:
 		return s.handler.HandleHealth()
+	case MsgTypeReady:
+		return s.handler.HandleReady()
 	default:
 		return &Response{
 			Status: StatusError,

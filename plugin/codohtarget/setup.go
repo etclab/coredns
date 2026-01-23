@@ -1,6 +1,7 @@
 package codohtarget
 
 import (
+	"encoding/hex"
 	"strconv"
 	"time"
 
@@ -28,8 +29,8 @@ func parse(c *caddy.Controller) (*odohTarget, error) {
 		addr:          ":8443",
 		upstream:      "8.8.8.8:53",
 		logQueries:    false,
-		epochDuration: time.Hour,     // Default: 1 hour epochs
-		rateLimit:     10,            // Default: 10 tokens per IP per epoch
+		epochDuration: time.Hour, // Default: 1 hour epochs
+		rateLimit:     10,        // Default: 10 tokens per IP per epoch
 	}
 
 	for c.Next() {
@@ -95,6 +96,27 @@ func parse(c *caddy.Controller) (*odohTarget, error) {
 					return nil, c.ArgErr()
 				}
 				t.masterSecretFile = args[0]
+			case "enclave_url":
+				// URL of enclave's attestation endpoint (e.g., https://proxy:8444)
+				args := c.RemainingArgs()
+				if len(args) != 1 {
+					return nil, c.ArgErr()
+				}
+				t.enclaveURL = args[0]
+			case "enclave_mrsigner":
+				// Expected MRSIGNER (hex, 32 bytes = 64 hex chars)
+				args := c.RemainingArgs()
+				if len(args) != 1 {
+					return nil, c.ArgErr()
+				}
+				mrsigner, err := hex.DecodeString(args[0])
+				if err != nil {
+					return nil, c.Errf("invalid enclave_mrsigner: %v", err)
+				}
+				if len(mrsigner) != 32 {
+					return nil, c.Errf("enclave_mrsigner must be 32 bytes (64 hex chars)")
+				}
+				t.expectedMRSigner = mrsigner
 			default:
 				return nil, c.ArgErr()
 			}
