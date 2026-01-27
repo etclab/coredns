@@ -66,7 +66,7 @@ func parse(c *caddy.Controller) (*odohProxy, error) {
 					return nil, c.ArgErr()
 				}
 				p.verifyURL = args[0]
-			// Phase 2: Enclave configuration
+			// Enclave configuration
 			case "enclave_enabled":
 				p.enclaveEnabled = true
 			case "enclave_socket":

@@ -14,6 +14,10 @@ TEST_DIR="/tmp/codoh-test-$$"
 SGX_MODE=false
 if [[ "$1" == "--sgx" ]]; then
     SGX_MODE=true
+    # Source Open Enclave environment for quote verification
+    if [ -f /opt/openenclave/share/openenclave/openenclaverc ]; then
+        source /opt/openenclave/share/openenclave/openenclaverc
+    fi
 fi
 
 # Colors for output
@@ -68,7 +72,13 @@ else
 fi
 
 log "Building coredns..."
-go build -o "$TEST_DIR/coredns" .
+if $SGX_MODE; then
+    CGO_CFLAGS="-I/opt/openenclave/include" \
+    CGO_LDFLAGS="-L/opt/openenclave/lib/openenclave/host" \
+    go build -tags sgxverify -o "$TEST_DIR/coredns" .
+else
+    go build -o "$TEST_DIR/coredns" .
+fi
 
 # Step 4: Create Corefiles
 log "Creating configuration files..."

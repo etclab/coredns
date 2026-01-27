@@ -212,7 +212,11 @@ cd ../codoh-client
    ```
 4. PCCS configured in `/etc/sgx_default_qcnl.conf`:
    ```json
-   "pccs_url": "https://api.trustedservices.intel.com/sgx/certification/v4/"
+    //PCCS server address
+    //"pccs_url": "https://api.trustedservices.intel.com/sgx/certification/v4/"
+    "pccs_url": "https://localhost:8081/sgx/certification/v4/"
+    // To accept insecure HTTPS certificate, set this option to false
+    ,"use_secure_cert": false
    ```
 
 ### SGX Build & Run

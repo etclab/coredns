@@ -17,8 +17,7 @@ type IPCServer struct {
 // RequestHandler processes incoming IPC requests.
 type RequestHandler interface {
 	HandleProcess(blobB, clientIP string) *Response
-	HandleStore(query, response string, ttl int) *Response
-	HandleStoreEncrypted(query, encryptedResponse string, ttl int) *Response
+	HandleStoreEncrypted(query, encryptedResponse, signature, blobB string, ttl int) *Response
 	HandleGetPubKey() *Response
 	HandleHealth() *Response
 	HandleReady() *Response // Returns provisioning status
@@ -75,10 +74,8 @@ func (s *IPCServer) dispatch(req *Request) *Response {
 	switch req.Type {
 	case MsgTypeProcess:
 		return s.handler.HandleProcess(req.BlobB, req.ClientIP)
-	case MsgTypeStore:
-		return s.handler.HandleStore(req.Query, req.Response, req.TTL)
 	case MsgTypeStoreEncrypted:
-		return s.handler.HandleStoreEncrypted(req.Query, req.EncryptedResponse, req.TTL)
+		return s.handler.HandleStoreEncrypted(req.Query, req.EncryptedResponse, req.Signature, req.BlobB, req.TTL)
 	case MsgTypeGetPubKey:
 		return s.handler.HandleGetPubKey()
 	case MsgTypeHealth:

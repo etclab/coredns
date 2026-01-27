@@ -16,7 +16,7 @@ import (
 type AttestationServer struct {
 	port        int
 	keypair     *EnclaveKeypair
-	provisionCh chan<- []byte
+	provisionCh chan<- ProvisionData
 	server      *http.Server
 	quote       []byte
 	ready       bool
@@ -31,11 +31,18 @@ type AttestResponse struct {
 
 // ProvisionRequest is sent to the /provision endpoint.
 type ProvisionRequest struct {
-	EncryptedSecret string `json:"encrypted_secret"` // Base64-encoded HPKE-encrypted master secret
+	EncryptedSecret  string `json:"encrypted_secret"`         // Base64-encoded HPKE-encrypted master secret
+	SigningPublicKey string `json:"signing_pubkey,omitempty"` // Base64-encoded Ed25519 public key for target response verification
+}
+
+// ProvisionData is the data sent through the provisioning channel.
+type ProvisionData struct {
+	MasterSecret     []byte
+	SigningPublicKey []byte
 }
 
 // NewAttestationServer creates a new attestation server.
-func NewAttestationServer(port int, keypair *EnclaveKeypair, provisionCh chan<- []byte) *AttestationServer {
+func NewAttestationServer(port int, keypair *EnclaveKeypair, provisionCh chan<- ProvisionData) *AttestationServer {
 	return &AttestationServer{
 		port:        port,
 		keypair:     keypair,
@@ -179,13 +186,35 @@ func (s *AttestationServer) provisionHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// Decode signing public key (optional)
+	var signingPubKey []byte
+	if req.SigningPublicKey != "" {
+		signingPubKey, err = base64.StdEncoding.DecodeString(req.SigningPublicKey)
+		if err != nil {
+			http.Error(w, "Invalid signing pubkey encoding", http.StatusBadRequest)
+			return
+		}
+		if len(signingPubKey) != 32 { // Ed25519 public key is 32 bytes
+			http.Error(w, "Invalid signing pubkey length", http.StatusBadRequest)
+			return
+		}
+	}
+
 	// Send to provisioning channel (non-blocking)
+	provData := ProvisionData{
+		MasterSecret:     masterSecret,
+		SigningPublicKey: signingPubKey,
+	}
 	select {
-	case s.provisionCh <- masterSecret:
+	case s.provisionCh <- provData:
 		s.mu.Lock()
 		s.ready = true
 		s.mu.Unlock()
-		log.Println("Master secret provisioned successfully")
+		if len(signingPubKey) > 0 {
+			log.Println("Master secret and signing pubkey provisioned successfully")
+		} else {
+			log.Println("Master secret provisioned successfully (no signing key)")
+		}
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"status":"ok"}`))
 	default:

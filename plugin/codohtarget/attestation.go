@@ -19,7 +19,8 @@ type AttestResponse struct {
 
 // ProvisionRequest is sent to the enclave's /provision endpoint.
 type ProvisionRequest struct {
-	EncryptedSecret string `json:"encrypted_secret"` // Base64-encoded HPKE-encrypted master secret
+	EncryptedSecret  string `json:"encrypted_secret"`  // Base64-encoded HPKE-encrypted master secret
+	SigningPublicKey string `json:"signing_pubkey"`    // Base64-encoded Ed25519 public key for target response verification
 }
 
 // VerifyEnclaveAndProvision fetches the SGX quote from the enclave, verifies it,
@@ -28,7 +29,7 @@ type ProvisionRequest struct {
 // IMPORTANT: TLS verification is intentionally skipped because EGo's attested TLS
 // uses a self-signed certificate bound to the enclave. Security is provided by
 // SGX quote verification, not TLS certificate verification.
-func VerifyEnclaveAndProvision(enclaveURL string, expectedMRSigner []byte, masterSecret []byte) error {
+func VerifyEnclaveAndProvision(enclaveURL string, expectedMRSigner []byte, masterSecret []byte, signingKey *SigningKey) error {
 	// Create HTTP client that skips TLS verification
 	// This is safe because we verify the SGX quote instead
 	client := &http.Client{
@@ -67,8 +68,14 @@ func VerifyEnclaveAndProvision(enclaveURL string, expectedMRSigner []byte, maste
 		return fmt.Errorf("encrypt secret: %w", err)
 	}
 
+	// Get signing public key (if available)
+	var signingPubKey []byte
+	if signingKey != nil {
+		signingPubKey = signingKey.PublicKeyBytes()
+	}
+
 	// Provision the secret to the enclave
-	if err := provisionSecretWithRetry(client, enclaveURL+"/provision", encryptedSecret, 5); err != nil {
+	if err := provisionSecretWithRetry(client, enclaveURL+"/provision", encryptedSecret, signingPubKey, 5); err != nil {
 		return fmt.Errorf("provision secret: %w", err)
 	}
 
@@ -122,12 +129,15 @@ func fetchAttestationWithRetry(client *http.Client, url string, maxAttempts int)
 }
 
 // provisionSecretWithRetry sends the encrypted secret to the enclave with exponential backoff.
-func provisionSecretWithRetry(client *http.Client, url string, encryptedSecret []byte, maxAttempts int) error {
+func provisionSecretWithRetry(client *http.Client, url string, encryptedSecret, signingPubKey []byte, maxAttempts int) error {
 	var lastErr error
 	backoff := time.Second
 
 	req := ProvisionRequest{
 		EncryptedSecret: base64.StdEncoding.EncodeToString(encryptedSecret),
+	}
+	if len(signingPubKey) > 0 {
+		req.SigningPublicKey = base64.StdEncoding.EncodeToString(signingPubKey)
 	}
 	reqBody, err := json.Marshal(req)
 	if err != nil {

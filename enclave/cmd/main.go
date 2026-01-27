@@ -4,6 +4,8 @@
 package main
 
 import (
+	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/base64"
 	"flag"
 	"log"
@@ -33,8 +35,8 @@ func main() {
 	pubBytes, _ := keypair.PublicKeyBytes()
 	log.Printf("Public key: %s", base64.StdEncoding.EncodeToString(pubBytes))
 
-	// Channel for receiving provisioned master secret
-	provisionCh := make(chan []byte, 1)
+	// Channel for receiving provisioned data
+	provisionCh := make(chan enclave.ProvisionData, 1)
 
 	// Try to generate quote to determine if we're in SGX mode
 	quote, quoteErr := enclave.GenerateQuote(pubBytes)
@@ -45,7 +47,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to load fallback secret: %v", err)
 		}
-		provisionCh <- masterSecret
+		provisionCh <- enclave.ProvisionData{MasterSecret: masterSecret}
 	} else {
 		// SGX mode: start attestation server and wait for provisioning
 		log.Printf("SGX mode enabled, quote generated (%d bytes)", len(quote))
@@ -58,15 +60,15 @@ func main() {
 		log.Printf("Attestation server starting on port %d, waiting for provisioning...", *httpsPort)
 	}
 
-	// Wait for master secret (blocks until provisioned)
+	// Wait for provisioning data (blocks until provisioned)
 	log.Println("Waiting for master secret provisioning...")
-	masterSecret := <-provisionCh
-	log.Println("Master secret received, initializing enclave...")
+	provData := <-provisionCh
+	log.Println("Provisioning data received, initializing enclave...")
 
 	// Load config (now with provisioned secret)
 	cfg := enclave.DefaultConfig()
 	cfg.SocketPath = *socketPath
-	cfg.MasterSecret = masterSecret
+	cfg.MasterSecret = provData.MasterSecret
 
 	// Try to override from environment (for epoch duration, cache size, etc.)
 	if envCfg, err := enclave.LoadConfigFromEnv(); err == nil {
@@ -94,11 +96,15 @@ func main() {
 
 	// Create handler
 	handler := &EnclaveHandler{
-		keypair:  keypair,
-		epochMgr: epochMgr,
-		spentSet: spentSet,
-		cache:    cache,
-		ready:    true, // Ready after provisioning
+		keypair:             keypair,
+		epochMgr:            epochMgr,
+		spentSet:            spentSet,
+		cache:               cache,
+		targetSigningPubKey: provData.SigningPublicKey,
+		ready:               true, // Ready after provisioning
+	}
+	if len(provData.SigningPublicKey) > 0 {
+		log.Printf("Target signing pubkey registered (%d bytes)", len(provData.SigningPublicKey))
 	}
 
 	// Start IPC server
@@ -147,12 +153,13 @@ func loadFallbackSecret(socketPath, secretFile string) ([]byte, error) {
 
 // EnclaveHandler implements enclave.RequestHandler.
 type EnclaveHandler struct {
-	keypair  *enclave.EnclaveKeypair
-	epochMgr *enclave.EpochManager
-	spentSet *enclave.SpentSet
-	cache    *enclave.LRUCache
-	ready    bool
-	mu       sync.RWMutex
+	keypair             *enclave.EnclaveKeypair
+	epochMgr            *enclave.EpochManager
+	spentSet            *enclave.SpentSet
+	cache               *enclave.LRUCache
+	targetSigningPubKey ed25519.PublicKey // Target's Ed25519 public key for signature verification
+	ready               bool
+	mu                  sync.RWMutex
 }
 
 // SetReady sets the ready status.
@@ -261,28 +268,9 @@ func (h *EnclaveHandler) HandleProcess(blobB, clientIP string) *enclave.Response
 	}
 }
 
-func (h *EnclaveHandler) HandleStore(query, response string, ttl int) *enclave.Response {
-	// Decode response
-	respBytes, err := base64.StdEncoding.DecodeString(response)
-	if err != nil {
-		log.Printf("Store: invalid response encoding")
-		return &enclave.Response{
-			Status: enclave.StatusError,
-			Error:  "invalid_response",
-		}
-	}
-
-	// Store in cache (plaintext DNS response, encrypted on retrieval)
-	ttlDuration := time.Duration(ttl) * time.Second
-	h.cache.Put(query, respBytes, nil, ttlDuration)
-	log.Printf("Stored in cache: query=%s ttl=%ds cache_size=%d", query, ttl, h.cache.Size())
-
-	return &enclave.Response{Status: enclave.StatusOK}
-}
-
-// HandleStoreEncrypted decrypts and stores a cache entry from target.
+// HandleStoreEncrypted decrypts, verifies signature, and stores a cache entry from target.
 // The response is HPKE-encrypted under the enclave's public key.
-func (h *EnclaveHandler) HandleStoreEncrypted(query, encryptedResponse string, ttl int) *enclave.Response {
+func (h *EnclaveHandler) HandleStoreEncrypted(query, encryptedResponse, signature, blobB string, ttl int) *enclave.Response {
 	// Decode base64
 	ciphertext, err := base64.StdEncoding.DecodeString(encryptedResponse)
 	if err != nil {
@@ -303,12 +291,52 @@ func (h *EnclaveHandler) HandleStoreEncrypted(query, encryptedResponse string, t
 		}
 	}
 
+	// Verify signature if signing key is configured
+	if len(h.targetSigningPubKey) > 0 {
+		if signature == "" {
+			log.Printf("StoreEncrypted: signature required but not provided")
+			return &enclave.Response{
+				Status: enclave.StatusError,
+				Error:  "signature_required",
+			}
+		}
+
+		sigBytes, err := base64.StdEncoding.DecodeString(signature)
+		if err != nil {
+			log.Printf("StoreEncrypted: invalid signature encoding")
+			return &enclave.Response{
+				Status: enclave.StatusError,
+				Error:  "invalid_signature_encoding",
+			}
+		}
+
+		// Compute signature input: H(response || query || blobB)
+		toVerify := computeSignatureInput(plaintext, query, blobB)
+		if !ed25519.Verify(h.targetSigningPubKey, toVerify, sigBytes) {
+			log.Printf("StoreEncrypted: signature verification failed for query=%s", query)
+			return &enclave.Response{
+				Status: enclave.StatusError,
+				Error:  "invalid_signature",
+			}
+		}
+		log.Printf("StoreEncrypted: signature verified for query=%s", query)
+	}
+
 	// Store plaintext DNS in cache
 	ttlDuration := time.Duration(ttl) * time.Second
 	h.cache.Put(query, plaintext, nil, ttlDuration)
 	log.Printf("StoreEncrypted: stored in cache: query=%s ttl=%ds cache_size=%d", query, ttl, h.cache.Size())
 
 	return &enclave.Response{Status: enclave.StatusOK}
+}
+
+// computeSignatureInput computes H(response || query || blobB) for signature verification.
+func computeSignatureInput(response []byte, query, blobB string) []byte {
+	h := sha256.New()
+	h.Write(response)
+	h.Write([]byte(query))
+	h.Write([]byte(blobB))
+	return h.Sum(nil)
 }
 
 func (h *EnclaveHandler) HandleGetPubKey() *enclave.Response {

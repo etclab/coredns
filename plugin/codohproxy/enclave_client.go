@@ -21,7 +21,6 @@ type EnclaveClient struct {
 // IPC Message Types (must match enclave/types.go)
 const (
 	msgTypeProcess        = "process"
-	msgTypeStore          = "store"
 	msgTypeStoreEncrypted = "store_encrypted"
 	msgTypeGetPubKey      = "get_pubkey"
 	msgTypeHealth         = "health"
@@ -44,6 +43,7 @@ type EnclaveRequest struct {
 	Query             string `json:"query,omitempty"`
 	Response          string `json:"response,omitempty"`
 	EncryptedResponse string `json:"encrypted_response,omitempty"`
+	Signature         string `json:"signature,omitempty"` // Base64 Ed25519 signature
 	TTL               int    `json:"ttl,omitempty"`
 }
 
@@ -129,23 +129,6 @@ func (c *EnclaveClient) ProcessRequest(blobB, clientIP string) (*EnclaveResponse
 	})
 }
 
-// StoreCache stores a DNS response in the enclave cache.
-func (c *EnclaveClient) StoreCache(query, response string, ttl int) error {
-	resp, err := c.sendRequest(&EnclaveRequest{
-		Type:     msgTypeStore,
-		Query:    query,
-		Response: response,
-		TTL:      ttl,
-	})
-	if err != nil {
-		return err
-	}
-	if resp.Status != statusOK {
-		return fmt.Errorf("store cache failed: %s", resp.Error)
-	}
-	return nil
-}
-
 // StoreEncrypted stores an HPKE-encrypted DNS response in the enclave cache.
 // The enclave will decrypt it using its private key before storing.
 func (c *EnclaveClient) StoreEncrypted(query, encryptedResponse string, ttl int) error {
@@ -160,6 +143,26 @@ func (c *EnclaveClient) StoreEncrypted(query, encryptedResponse string, ttl int)
 	}
 	if resp.Status != statusOK {
 		return fmt.Errorf("store encrypted failed: %s", resp.Error)
+	}
+	return nil
+}
+
+// StoreEncryptedWithSig stores an HPKE-encrypted DNS response with signature verification.
+// The enclave will verify the signature before storing.
+func (c *EnclaveClient) StoreEncryptedWithSig(query, encryptedResponse, signature, blobB string, ttl int) error {
+	resp, err := c.sendRequest(&EnclaveRequest{
+		Type:              msgTypeStoreEncrypted,
+		Query:             query,
+		EncryptedResponse: encryptedResponse,
+		Signature:         signature,
+		BlobB:             blobB,
+		TTL:               ttl,
+	})
+	if err != nil {
+		return err
+	}
+	if resp.Status != statusOK {
+		return fmt.Errorf("store encrypted with sig failed: %s", resp.Error)
 	}
 	return nil
 }

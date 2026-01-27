@@ -47,7 +47,7 @@ var (
 		Buckets:   prometheus.DefBuckets,
 	})
 
-	// Token metrics (Phase 1)
+	// Token metrics
 	tokensIssuedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: plugin.Namespace,
 		Subsystem: "codoh_target",

@@ -4,7 +4,6 @@ package enclave
 // IPC Message Types
 const (
 	MsgTypeProcess        = "process"
-	MsgTypeStore          = "store"
 	MsgTypeStoreEncrypted = "store_encrypted"
 	MsgTypeGetPubKey      = "get_pubkey"
 	MsgTypeHealth         = "health"
@@ -22,12 +21,13 @@ const (
 // Request is the incoming IPC message from proxy.
 type Request struct {
 	Type              string `json:"type"`
-	BlobB             string `json:"blob_b,omitempty"`             // base64, for process
+	BlobB             string `json:"blob_b,omitempty"`             // base64, for process and store_encrypted
 	ClientIP          string `json:"client_ip,omitempty"`          // for process
-	Query             string `json:"query,omitempty"`              // for store/store_encrypted
-	Response          string `json:"response,omitempty"`           // base64, for store (plaintext)
+	Query             string `json:"query,omitempty"`              // for store_encrypted
+	Response          string `json:"response,omitempty"`           // base64, for store (plaintext) - DEPRECATED
 	EncryptedResponse string `json:"encrypted_response,omitempty"` // base64, for store_encrypted (HPKE encrypted)
-	TTL               int    `json:"ttl,omitempty"`                // seconds, for store/store_encrypted
+	Signature         string `json:"signature,omitempty"`          // base64, Ed25519 signature for store_encrypted
+	TTL               int    `json:"ttl,omitempty"`                // seconds, for store_encrypted
 }
 
 // Response is the outgoing IPC message to proxy.

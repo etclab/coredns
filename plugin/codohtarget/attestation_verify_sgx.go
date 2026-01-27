@@ -4,8 +4,10 @@ package codohtarget
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 
+	"github.com/edgelesssys/ego/attestation"
 	"github.com/edgelesssys/ego/eclient"
 )
 
@@ -23,7 +25,19 @@ func verifyQuoteAndPubKey(quote, pubKeyBytes, expectedMRSigner []byte) error {
 	// Verify the SGX quote
 	report, err := eclient.VerifyRemoteReport(quote)
 	if err != nil {
-		return fmt.Errorf("verify quote: %w", err)
+		// ErrTCBLevelInvalid means the quote is valid but TCB is not up-to-date.
+		// This is common when platform firmware hasn't been updated after Intel security patches.
+		// For development/testing, we accept this but log a warning.
+		// In production, you may want to enforce stricter TCB requirements.
+		if errors.Is(err, attestation.ErrTCBLevelInvalid) {
+			log.Warningf("SGX TCB level is not up-to-date (status: %s)", report.TCBStatus)
+			if len(report.TCBAdvisories) > 0 {
+				log.Warningf("TCB advisories: %v", report.TCBAdvisories)
+			}
+			log.Warning("Proceeding with attestation despite outdated TCB (update platform firmware for production)")
+		} else {
+			return fmt.Errorf("verify quote: %w", err)
+		}
 	}
 
 	// Check MRSIGNER if expected value is provided

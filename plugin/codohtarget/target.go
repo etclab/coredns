@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	odoh "github.com/cloudflare/odoh-go"
@@ -29,15 +30,19 @@ type odohTarget struct {
 	upstream   string // 8.8.8.8:53
 	logQueries bool
 
-	// Token issuance config (Phase 1)
+	// Token issuance config
 	tokenEnabled     bool
 	epochDuration    time.Duration
 	rateLimit        int
-	masterSecretFile string // Path to hex-encoded 32-byte secret (Phase 2)
+	masterSecretFile string // Path to hex-encoded 32-byte secret
 
-	// Enclave attestation config (Phase 2f)
+	// Enclave attestation config
 	enclaveURL       string // URL of enclave's attestation endpoint (e.g., https://proxy:8444)
 	expectedMRSigner []byte // Expected MRSIGNER (32 bytes)
+
+	// Signing key for target response authentication
+	signingKeyPath string
+	signingKey     *SigningKey
 
 	keyPair   odoh.ObliviousDoHKeyPair
 	dnsClient *dns.Client
@@ -66,14 +71,14 @@ func (t *odohTarget) OnStartup() error {
 	if t.tokenEnabled {
 		var masterSecret []byte
 		if t.masterSecretFile != "" {
-			// Load from file (Phase 2: shared with enclave)
+			// Load from file (shared with enclave)
 			masterSecret, err = loadMasterSecretFromFile(t.masterSecretFile)
 			if err != nil {
 				return err
 			}
 			log.Infof("Loaded master secret from %s", t.masterSecretFile)
 		} else {
-			// Generate random (Phase 1 / standalone mode)
+			// Generate random (standalone mode)
 			masterSecret, err = generateMasterSecret()
 			if err != nil {
 				return err
@@ -81,10 +86,19 @@ func (t *odohTarget) OnStartup() error {
 			log.Warning("Using random master secret (not shared with enclave)")
 		}
 
-		// Phase 2f: Provision secret to enclave via attestation
+		// Load signing key (if configured)
+		if t.signingKeyPath != "" {
+			t.signingKey, err = LoadOrGenerateSigningKey(t.signingKeyPath)
+			if err != nil {
+				return fmt.Errorf("failed to load signing key: %w", err)
+			}
+			log.Infof("Loaded signing key from %s", t.signingKeyPath)
+		}
+
+		// Provision secret to enclave via attestation
 		if t.enclaveURL != "" {
 			log.Infof("Provisioning master secret to enclave at %s", t.enclaveURL)
-			if err := VerifyEnclaveAndProvision(t.enclaveURL, t.expectedMRSigner, masterSecret); err != nil {
+			if err := VerifyEnclaveAndProvision(t.enclaveURL, t.expectedMRSigner, masterSecret, t.signingKey); err != nil {
 				return fmt.Errorf("enclave provisioning failed: %w", err)
 			}
 			log.Info("Master secret provisioned to enclave successfully")
@@ -124,7 +138,7 @@ func (t *odohTarget) OnStartup() error {
 	t.mux.HandleFunc("/dns-query", t.odohQueryHandler)
 	t.mux.HandleFunc("/health", t.healthHandler)
 
-	// Token routes (Phase 1)
+	// Token routes
 	if t.tokenEnabled {
 		t.mux.HandleFunc("/token", t.tokenHandler)
 		t.mux.HandleFunc("/verify", t.verifyHandler)
@@ -260,13 +274,30 @@ func (t *odohTarget) odohQueryHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	targetEncryptSeconds.Observe(time.Since(encryptStart).Seconds())
 
-	// Phase 2: If enclave public key provided, encrypt raw DNS for cache
+	// If enclave public key provided, encrypt raw DNS for cache
 	if enclavePubKey := r.Header.Get("X-Enclave-PubKey"); enclavePubKey != "" {
 		pubKeyBytes, err := base64.StdEncoding.DecodeString(enclavePubKey)
 		if err == nil {
 			encryptedForCache, err := EncryptForEnclave(pubKeyBytes, packedResponse)
 			if err == nil {
 				w.Header().Set("X-Enclave-Cache", base64.StdEncoding.EncodeToString(encryptedForCache))
+
+				// Sign the response if signing key is configured
+				if t.signingKey != nil && len(dnsQuery.Question) > 0 {
+					// Canonicalize query: "name:qtype" (matches client's CanonicalizeQuery format)
+					q := dnsQuery.Question[0]
+					canonicalQuery := fmt.Sprintf("%s:%d", strings.ToLower(q.Name), q.Qtype)
+
+					// Get blob B for signature binding
+					blobB := r.Header.Get("X-ODoH-Blob")
+
+					// Compute signature: Sign(H(response || query || B))
+					toSign := ComputeSignatureInput(packedResponse, canonicalQuery, blobB)
+					signature := t.signingKey.Sign(toSign)
+
+					w.Header().Set("X-Enclave-Cache-Sig", base64.StdEncoding.EncodeToString(signature))
+					w.Header().Set("X-Enclave-Cache-Query", canonicalQuery)
+				}
 			} else {
 				log.Warningf("Failed to encrypt for enclave cache: %v", err)
 			}

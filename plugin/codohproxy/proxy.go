@@ -27,9 +27,9 @@ type odohProxy struct {
 	tlsCert            string
 	tlsKey             string
 	insecureSkipVerify bool
-	verifyURL          string // https://target:8443/verify (Phase 1: target, Phase 2: enclave)
+	verifyURL          string // https://target:8443/verify
 
-	// Enclave configuration (Phase 2)
+	// Enclave configuration
 	enclaveEnabled       bool
 	enclaveSocketPath    string
 	enclaveBypassOnFail  bool
@@ -162,20 +162,20 @@ func (p *odohProxy) proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Phase 2: Enclave-first flow
+	// Enclave-first flow
 	if p.enclaveEnabled && p.enclaveClient != nil && p.enclaveClient.IsHealthy() {
 		p.handleEnclaveFlow(w, r, start)
 		return
 	}
 
-	// Bypass mode or Phase 1: Token verification via target
+	// Bypass mode: Token verification via target
 	if p.enclaveEnabled && !p.enclaveBypassOnFail {
 		http.Error(w, `{"error":"enclave_unavailable"}`, http.StatusServiceUnavailable)
 		proxyRequestsTotal.WithLabelValues("enclave_down").Inc()
 		return
 	}
 
-	// Phase 1 token verification (fallback)
+	// Token verification fallback
 	if p.verifyURL != "" {
 		token := r.Header.Get("X-ODoH-Token")
 		if token == "" {
@@ -219,7 +219,7 @@ func (p *odohProxy) proxyHandler(w http.ResponseWriter, r *http.Request) {
 	p.forwardToTarget(w, r, start)
 }
 
-// handleEnclaveFlow processes requests through the enclave (Phase 2).
+// handleEnclaveFlow processes requests through the enclave.
 func (p *odohProxy) handleEnclaveFlow(w http.ResponseWriter, r *http.Request, start time.Time) {
 	// Extract blob B from header
 	blobB := r.Header.Get("X-ODoH-Blob")
@@ -315,7 +315,12 @@ func (p *odohProxy) handleCacheMiss(w http.ResponseWriter, r *http.Request, encl
 	}
 	req.Header.Set("Content-Type", odohContentType)
 
-	// Phase 2: Include enclave public key for cache encryption
+	// Forward blob B to target for signature binding
+	if blobB := r.Header.Get("X-ODoH-Blob"); blobB != "" {
+		req.Header.Set("X-ODoH-Blob", blobB)
+	}
+
+	// Include enclave public key for cache encryption
 	var enclavePubKey string
 	if p.enclaveClient != nil {
 		enclavePubKey, _ = p.enclaveClient.GetPublicKey()
@@ -340,11 +345,21 @@ func (p *odohProxy) handleCacheMiss(w http.ResponseWriter, r *http.Request, encl
 		return
 	}
 
-	// Phase 2: Store encrypted cache data from target
+	// Store encrypted cache data from target
 	if enclaveCache := resp.Header.Get("X-Enclave-Cache"); enclaveCache != "" {
+		// Get signature and query from response headers
+		sig := resp.Header.Get("X-Enclave-Cache-Sig")
+		query := resp.Header.Get("X-Enclave-Cache-Query")
+		blobB := r.Header.Get("X-ODoH-Blob")
+
+		// Fall back to enclave's canonical query if target didn't provide one
+		if query == "" {
+			query = enclaveResp.Query
+		}
+
 		// Target encrypted raw DNS under enclave's public key
 		go func() {
-			if err := p.enclaveClient.StoreEncrypted(enclaveResp.Query, enclaveCache, 300); err != nil {
+			if err := p.enclaveClient.StoreEncryptedWithSig(query, enclaveCache, sig, blobB, 300); err != nil {
 				log.Errorf("Failed to store encrypted cache: %v", err)
 			}
 		}()

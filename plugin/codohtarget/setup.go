@@ -117,6 +117,13 @@ func parse(c *caddy.Controller) (*odohTarget, error) {
 					return nil, c.Errf("enclave_mrsigner must be 32 bytes (64 hex chars)")
 				}
 				t.expectedMRSigner = mrsigner
+			case "signing_key":
+				// Path to Ed25519 signing key (auto-generates if missing)
+				args := c.RemainingArgs()
+				if len(args) != 1 {
+					return nil, c.ArgErr()
+				}
+				t.signingKeyPath = args[0]
 			default:
 				return nil, c.ArgErr()
 			}
