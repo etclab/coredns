@@ -45,7 +45,11 @@ cleanup() {
     pkill -9 -f enclave-sgx 2>/dev/null || true
     pkill -9 -f erthost 2>/dev/null || true  # EGo runtime host
     # Kill any processes on our test ports
-    fuser -k 8080/tcp 8443/tcp 9080/tcp 9443/tcp 18080/tcp 18443/tcp 18444/tcp 2>/dev/null || true
+    # fuser -k 8080/tcp 8443/tcp 9080/tcp 9443/tcp 18080/tcp 18443/tcp 18444/tcp 2>/dev/null || true
+    # With (cross-platform):
+    for port in 8080 8443 9080 9443 18080 18443 18444; do
+        lsof -ti :$port | xargs kill -9 2>/dev/null || true
+    done
     rm -f /tmp/codoh-enclave.sock /tmp/codoh-sgx-enclave.sock 2>/dev/null || true
     sleep 2
 }

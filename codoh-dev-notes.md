@@ -175,7 +175,8 @@ cd ../codoh-client
 |----------|--------|-------------|
 | `/.well-known/odohconfigs` | GET | HPKE public key config |
 | `/dns-query` | POST | ODoH query endpoint |
-| `/tokens` | POST | VOPRF token issuance |
+| `/token` | POST | VOPRF token issuance |
+| `/verify` | POST | Token verification (fallback) |
 | `/health` | GET | Health check |
 
 ### Proxy (default :8080)
@@ -191,11 +192,25 @@ cd ../codoh-client
 | Endpoint | Description |
 |----------|-------------|
 | IPC: `process` | Verify token, decrypt blob B, check cache |
-| IPC: `store` | Store response in cache |
+| IPC: `store_encrypted` | Store HPKE-encrypted response with signature verification |
+| IPC: `get_pubkey` | Get enclave's HPKE public key |
+| IPC: `health` | Health check |
 | IPC: `ready` | Check if enclave is provisioned |
 | HTTPS: `/attest` | Get SGX quote + public key |
-| HTTPS: `/provision` | Receive encrypted master secret |
+| HTTPS: `/provision` | Receive encrypted master secret + signing pubkey |
 | HTTPS: `/health` | Health check |
+
+---
+
+## HTTP Headers
+
+| Header | Direction | Description |
+|--------|-----------|-------------|
+| `X-ODoH-Blob` | Client -> Proxy | Base64-encoded encrypted blob B |
+| `X-Enclave-PubKey` | Proxy -> Target | Base64-encoded enclave HPKE public key |
+| `X-Enclave-Cache` | Target -> Proxy | Base64-encoded HPKE-encrypted raw DNS response |
+| `X-Enclave-Cache-Sig` | Target -> Proxy | Base64-encoded Ed25519 signature |
+| `X-Enclave-Cache-Query` | Target -> Proxy | Canonicalized query string |
 
 ---
 
@@ -253,10 +268,12 @@ codohtarget {
 | `upstream` | Upstream DNS resolver | 8.8.8.8:53 |
 | `token_enabled` | Enable VOPRF tokens | false |
 | `epoch_duration` | Token epoch duration | 1h |
-| `rate_limit` | Tokens per IP per epoch | 100 |
-| `master_secret` | Path to 32-byte hex secret | required |
+| `rate_limit` | Tokens per IP per epoch | 10 |
+| `master_secret` | Path to 32-byte hex secret | - |
+| `signing_key` | Path to Ed25519 signing key (auto-generates if missing) | - |
 | `enclave_url` | Enclave HTTPS URL (SGX mode) | - |
 | `enclave_mrsigner` | Expected MRSIGNER (SGX mode) | - |
+| `log_queries` | Log DNS queries | false |
 
 ### codohproxy
 
@@ -269,14 +286,14 @@ codohtarget {
 | `insecure_skip_verify` | Skip target TLS verification | false |
 | `enclave_enabled` | Enable enclave integration | false |
 | `enclave_socket` | Enclave IPC socket path | /tmp/codoh-enclave.sock |
-| `enclave_bypass_on_failure` | Continue without enclave if unavailable | false |
+| `enclave_bypass_on_failure` | Continue without enclave if unavailable | true |
 
 ---
 
 ## What's Implemented
 
 ### Phase 1: VOPRF Token Issuance
-- Target issues blind tokens via `/tokens` endpoint
+- Target issues blind tokens via `/token` endpoint
 - Tokens bound to epoch for rate limiting
 - Client includes unblinded token in ODoH request
 
@@ -285,9 +302,11 @@ codohtarget {
 - Enclave verifies token, checks spent set, manages cache
 - Cache hits return encrypted response without target roundtrip
 
-### Phase 2f: SGX Attestation
+### Phase 2f: SGX Attestation & Response Signing
 - Enclave generates DCAP quote binding HPKE public key
-- Target verifies quote and provisions master secret via HTTPS
+- Target verifies quote and provisions master secret + signing pubkey via HTTPS
+- Target signs DNS responses with Ed25519 before caching (binds response to query + blob B)
+- Enclave verifies signatures on `store_encrypted` to prevent cache poisoning
 - Simulation mode uses shared secret file for development
 
 ---
