@@ -151,6 +151,8 @@ github.com/edgelesssys/ego v1.8.1 h1:cpc9PfxLbADg+ZelHz3g02JBr/89N9zXpsEQCq0IIH4
 github.com/edgelesssys/ego v1.8.1/go.mod h1:fg0M/xfLWnrkoD2OZpY9xmltGlAPFsIiUmyHTuCS7zo=
 github.com/emicklei/go-restful/v3 v3.12.2 h1:DhwDP0vY3k8ZzE0RunuJy8GhNpPL6zqLkDf9B/a0/xU=
 github.com/emicklei/go-restful/v3 v3.12.2/go.mod h1:6n3XBCmQQb25CM2LCACGz8ukIrRry+4bhvbpWn3mrbc=
+github.com/etclab/pathoram-go v0.1.0 h1:388V1pO32m7eE1k/jHOtm3IIFP/hOZ7oPjgXC+PGF3M=
+github.com/etclab/pathoram-go v0.1.0/go.mod h1:Up6xDiYcF4DdHWTINIoy+iimgJK0bMSeAybODU+KGMs=
 github.com/expr-lang/expr v1.17.6 h1:1h6i8ONk9cexhDmowO/A64VPxHScu7qfSl2k8OlINec=
 github.com/expr-lang/expr v1.17.6/go.mod h1:8/vRC7+7HBzESEqt5kKpYXxrxkr31SaO8r40VO/1IT4=
 github.com/farsightsec/golang-framestream v0.3.0 h1:/spFQHucTle/ZIPkYqrfshQqPe2VQEzesH243TjIwqA=

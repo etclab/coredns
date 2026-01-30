@@ -74,6 +74,8 @@ func main() {
 	if envCfg, err := enclave.LoadConfigFromEnv(); err == nil {
 		cfg.EpochDuration = envCfg.EpochDuration
 		cfg.CacheSize = envCfg.CacheSize
+		cfg.UseORAMCache = envCfg.UseORAMCache
+		cfg.ORAMBlockSize = envCfg.ORAMBlockSize
 		// Don't override MasterSecret - we got it from provisioning
 	}
 
@@ -88,8 +90,26 @@ func main() {
 	spentSet := enclave.NewSpentSet(epochMgr.CurrentEpoch())
 
 	// Initialize cache
-	cache := enclave.NewLRUCache(cfg.CacheSize)
-	log.Printf("Cache initialized with capacity %d", cfg.CacheSize)
+	var cache enclave.Cache
+	var oramCache *enclave.ORAMCache
+	if cfg.UseORAMCache {
+		oramCfg := enclave.ORAMCacheConfig{
+			Capacity:     cfg.CacheSize,
+			BlockSize:    cfg.ORAMBlockSize,
+			BucketSize:   5,
+			ConstantTime: true,
+		}
+		var err error
+		oramCache, err = enclave.NewORAMCache(oramCfg)
+		if err != nil {
+			log.Fatalf("Failed to create ORAM cache: %v", err)
+		}
+		cache = oramCache
+		log.Printf("ORAM cache initialized with capacity %d, block size %d", cfg.CacheSize, cfg.ORAMBlockSize)
+	} else {
+		cache = enclave.NewLRUCache(cfg.CacheSize)
+		log.Printf("LRU cache initialized with capacity %d", cfg.CacheSize)
+	}
 
 	// Remove stale socket
 	os.Remove(cfg.SocketPath)
@@ -100,6 +120,7 @@ func main() {
 		epochMgr:            epochMgr,
 		spentSet:            spentSet,
 		cache:               cache,
+		oramCache:           oramCache,
 		targetSigningPubKey: provData.SigningPublicKey,
 		ready:               true, // Ready after provisioning
 	}
@@ -156,8 +177,9 @@ type EnclaveHandler struct {
 	keypair             *enclave.EnclaveKeypair
 	epochMgr            *enclave.EpochManager
 	spentSet            *enclave.SpentSet
-	cache               *enclave.LRUCache
-	targetSigningPubKey ed25519.PublicKey // Target's Ed25519 public key for signature verification
+	cache               enclave.Cache
+	oramCache           *enclave.ORAMCache // nil if not using ORAM (for stash monitoring)
+	targetSigningPubKey ed25519.PublicKey  // Target's Ed25519 public key for signature verification
 	ready               bool
 	mu                  sync.RWMutex
 }
@@ -251,7 +273,7 @@ func (h *EnclaveHandler) HandleProcess(blobB, clientIP string) *enclave.Response
 			// Fall through to miss
 		} else {
 			_ = cachedKc // unused, we encrypt with client's kc
-			log.Printf("Cache hit for %s", blob.Query)
+			h.logCacheOp("hit", blob.Query)
 			return &enclave.Response{
 				Status:   enclave.StatusHit,
 				Response: base64.StdEncoding.EncodeToString(encrypted),
@@ -260,7 +282,7 @@ func (h *EnclaveHandler) HandleProcess(blobB, clientIP string) *enclave.Response
 	}
 
 	// Cache miss
-	log.Printf("Cache miss for %s, cache size: %d", blob.Query, h.cache.Size())
+	h.logCacheOp("miss", blob.Query)
 	return &enclave.Response{
 		Status: enclave.StatusMiss,
 		Query:  blob.Query,
@@ -325,7 +347,7 @@ func (h *EnclaveHandler) HandleStoreEncrypted(query, encryptedResponse, signatur
 	// Store plaintext DNS in cache
 	ttlDuration := time.Duration(ttl) * time.Second
 	h.cache.Put(query, plaintext, nil, ttlDuration)
-	log.Printf("StoreEncrypted: stored in cache: query=%s ttl=%ds cache_size=%d", query, ttl, h.cache.Size())
+	h.logCacheOp("store", query)
 
 	return &enclave.Response{Status: enclave.StatusOK}
 }
@@ -355,4 +377,13 @@ func (h *EnclaveHandler) HandleGetPubKey() *enclave.Response {
 
 func (h *EnclaveHandler) HandleHealth() *enclave.Response {
 	return &enclave.Response{Status: enclave.StatusOK}
+}
+
+// logCacheOp logs cache operations with stash size when using ORAM.
+func (h *EnclaveHandler) logCacheOp(op, query string) {
+	if h.oramCache != nil {
+		log.Printf("Cache %s for %s, cache_size=%d, stash_size=%d", op, query, h.cache.Size(), h.oramCache.StashSize())
+	} else {
+		log.Printf("Cache %s for %s, cache_size=%d", op, query, h.cache.Size())
+	}
 }

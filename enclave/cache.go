@@ -123,6 +123,9 @@ func (c *LRUCache) Clear() {
 	c.lru.Init()
 }
 
+// Compile-time interface check
+var _ Cache = (*LRUCache)(nil)
+
 // CleanExpired removes all expired entries from the cache.
 // Returns the number of entries removed.
 func (c *LRUCache) CleanExpired() int {

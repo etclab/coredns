@@ -195,6 +195,8 @@ Response status: hit, miss, error, ok
 | Token verification (VOPRF) | enclave/voprf.go | Done |
 | Spent-set (double-spend) | enclave/spentset.go | Done |
 | LRU cache with TTL | enclave/cache.go | Done |
+| ORAM cache (Path ORAM) | enclave/oram_cache.go | Done |
+| Cache interface | enclave/cache_interface.go | Done |
 | Query canonicalization | enclave/query.go | Done |
 | SGX attestation server | enclave/attestation.go | Done |
 | SGX quote generation | enclave/attestation_sgx.go | Done |
@@ -235,8 +237,7 @@ Response status: hit, miss, error, ok
 
 ### Deferred
 
-
-- ORAM cache 
+(none) 
 
 ---
 
@@ -309,6 +310,8 @@ ego run enclave --socket /tmp/codoh-enclave.sock --https-port 8444
 | CODOH_EPOCH_DURATION | Epoch duration in seconds | 3600 |
 | CODOH_SOCKET_PATH | Unix socket path | /tmp/codoh-enclave.sock |
 | CODOH_CACHE_SIZE | Cache entries | 10000 |
+| CODOH_USE_ORAM | Enable ORAM cache | false |
+| CODOH_ORAM_BLOCK_SIZE | ORAM block size (bytes) | 4096 |
 
 ### Client Usage
 
@@ -344,6 +347,8 @@ coredns/
 │   ├── voprf.go               # Token verification, epoch keys
 │   ├── spentset.go            # Double-spend tracking
 │   ├── cache.go               # LRU cache with TTL
+│   ├── cache_interface.go     # Cache interface
+│   ├── oram_cache.go          # Path ORAM cache (access-pattern hiding)
 │   ├── query.go               # Query canonicalization
 │   ├── config.go              # Configuration loading (env/file)
 │   ├── types.go               # IPC message types
@@ -475,5 +480,6 @@ CODOH_MASTER_SECRET=$(cat dev-master-secret.txt) ./enclave-sim
 
 ## Next Steps
 
-- ORAM Implementation
-- LRU Cache -> ORAM
+- MLE ciphertext-only cache (hide plaintext from enclave)
+- Stochastic hit suppression / non-insertion
+- Random churn eviction

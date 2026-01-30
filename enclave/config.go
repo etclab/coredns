@@ -10,18 +10,22 @@ import (
 
 // Config holds enclave configuration.
 type Config struct {
-	MasterSecret  []byte        // Shared with target (32 bytes)
-	EpochDuration time.Duration // Default: 1 hour
-	SocketPath    string        // Default: /tmp/codoh-enclave.sock
-	CacheSize     int           // Default: 10000 entries
+	MasterSecret   []byte        // Shared with target (32 bytes)
+	EpochDuration  time.Duration // Default: 1 hour
+	SocketPath     string        // Default: /tmp/codoh-enclave.sock
+	CacheSize      int           // Default: 10000 entries
+	UseORAMCache   bool          // Use ORAM-backed cache (default: false)
+	ORAMBlockSize  int           // ORAM block size in bytes (default: 4096)
 }
 
 // DefaultConfig returns configuration with default values.
 func DefaultConfig() *Config {
 	return &Config{
-		EpochDuration: time.Hour,
-		SocketPath:    "/tmp/codoh-enclave.sock",
-		CacheSize:     10000,
+		EpochDuration:  time.Hour,
+		SocketPath:     "/tmp/codoh-enclave.sock",
+		CacheSize:      10000,
+		UseORAMCache:   false,
+		ORAMBlockSize:  4096,
 	}
 }
 
@@ -31,6 +35,8 @@ func DefaultConfig() *Config {
 //   - CODOH_EPOCH_DURATION: epoch duration in seconds (default: 3600)
 //   - CODOH_SOCKET_PATH: Unix socket path (default: /tmp/codoh-enclave.sock)
 //   - CODOH_CACHE_SIZE: cache size in entries (default: 10000)
+//   - CODOH_USE_ORAM: use ORAM-backed cache (default: false)
+//   - CODOH_ORAM_BLOCK_SIZE: ORAM block size in bytes (default: 4096)
 func LoadConfigFromEnv() (*Config, error) {
 	cfg := DefaultConfig()
 
@@ -69,6 +75,20 @@ func LoadConfigFromEnv() (*Config, error) {
 			return nil, errors.New("CODOH_CACHE_SIZE must be an integer")
 		}
 		cfg.CacheSize = n
+	}
+
+	// Use ORAM cache (optional)
+	if useORAM := os.Getenv("CODOH_USE_ORAM"); useORAM != "" {
+		cfg.UseORAMCache = useORAM == "true" || useORAM == "1"
+	}
+
+	// ORAM block size (optional)
+	if blockSize := os.Getenv("CODOH_ORAM_BLOCK_SIZE"); blockSize != "" {
+		n, err := strconv.Atoi(blockSize)
+		if err != nil {
+			return nil, errors.New("CODOH_ORAM_BLOCK_SIZE must be an integer")
+		}
+		cfg.ORAMBlockSize = n
 	}
 
 	return cfg, nil
