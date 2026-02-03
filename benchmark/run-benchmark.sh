@@ -1,8 +1,9 @@
 #!/bin/bash
 # CODoH Benchmark Script
 # Compares ODoH (baseline) vs CODoH latency with real domain dataset
-# Usage: ./benchmark/run-benchmark.sh [--sgx] [iterations]
+# Usage: ./benchmark/run-benchmark.sh [--sgx] [--oram] [iterations]
 #   --sgx       Include SGX hardware enclave benchmark (requires SGX device access)
+#   --oram      Use ORAM cache instead of LRU cache (for access pattern hiding)
 #   iterations  Number of queries per benchmark (default: 1000)
 
 set -e
@@ -12,10 +13,13 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
 # Parse arguments
 SGX_MODE=false
+ORAM_MODE=false
 ITERATIONS=1000
 for arg in "$@"; do
     if [[ "$arg" == "--sgx" ]]; then
         SGX_MODE=true
+    elif [[ "$arg" == "--oram" ]]; then
+        ORAM_MODE=true
     elif [[ "$arg" =~ ^[0-9]+$ ]]; then
         ITERATIONS=$arg
     fi
@@ -32,6 +36,7 @@ mkdir -p "$OUTPUT_DIR"
 echo "=== CODoH Benchmark Suite ==="
 echo "Iterations: $ITERATIONS"
 echo "SGX mode:   $SGX_MODE"
+echo "ORAM cache: $ORAM_MODE"
 echo "Output dir: $OUTPUT_DIR"
 echo "Domains:    $DOMAINS_PATH"
 echo ""
@@ -104,71 +109,79 @@ $CLIENT_PATH latency \
 #######################################
 # CODoH Benchmark (Simulation Mode)
 #######################################
-echo ""
-echo "=== Starting CODoH Benchmark (Simulation) ==="
+if ! $SGX_MODE; then
+    echo ""
+    echo "=== Starting CODoH Benchmark (Simulation) ==="
 
-cleanup
+    cleanup
 
-# Start enclave (simulation mode)
-echo "Starting enclave (simulation)..."
-SECRET_HEX=$(cat "$ROOT_DIR/dev-master-secret.txt")
-CODOH_MASTER_SECRET=$SECRET_HEX ./enclave-sim > /tmp/enclave.log 2>&1 &
-sleep 2
+    # Start enclave (simulation mode)
+    echo "Starting enclave (simulation)..."
+    SECRET_HEX=$(cat "$ROOT_DIR/dev-master-secret.txt")
+    if $ORAM_MODE; then
+        echo "Using ORAM cache"
+        CODOH_USE_ORAM=true CODOH_MASTER_SECRET=$SECRET_HEX ./enclave-sim > /tmp/enclave.log 2>&1 &
+    else
+        echo "Using LRU cache"
+        CODOH_MASTER_SECRET=$SECRET_HEX ./enclave-sim > /tmp/enclave.log 2>&1 &
+    fi
+    sleep 2
 
-# Start CODoH target (port 8443)
-echo "Starting CODoH target..."
-./coredns-test -conf "$ROOT_DIR/Corefile.target" > /tmp/codoh-target.log 2>&1 &
-sleep 2
+    # Start CODoH target (port 8443)
+    echo "Starting CODoH target..."
+    ./coredns-test -conf "$ROOT_DIR/Corefile.target" > /tmp/codoh-target.log 2>&1 &
+    sleep 2
 
-# Start CODoH proxy (port 8080)
-echo "Starting CODoH proxy..."
-./coredns-test -conf "$ROOT_DIR/Corefile.proxy" > /tmp/codoh-proxy.log 2>&1 &
-sleep 2
+    # Start CODoH proxy (port 8080)
+    echo "Starting CODoH proxy..."
+    ./coredns-test -conf "$ROOT_DIR/Corefile.proxy" > /tmp/codoh-proxy.log 2>&1 &
+    sleep 2
 
-# Health check
-curl -sk https://127.0.0.1:8080/health > /dev/null && echo "CODoH proxy: OK" || echo "CODoH proxy: FAILED"
-curl -sk https://127.0.0.1:8443/health > /dev/null && echo "CODoH target: OK" || echo "CODoH target: FAILED"
+    # Health check
+    curl -sk https://127.0.0.1:8080/health > /dev/null && echo "CODoH proxy: OK" || echo "CODoH proxy: FAILED"
+    curl -sk https://127.0.0.1:8443/health > /dev/null && echo "CODoH target: OK" || echo "CODoH target: FAILED"
 
-echo "Running CODoH simulation benchmark (cold)..."
-$CLIENT_PATH latency \
-    --protocol codoh \
-    --distribution sequential \
-    --iterations $ITERATIONS \
-    --target 127.0.0.1:8443 \
-    --proxy 127.0.0.1:8080 \
-    --customcert $CERT_PATH \
-    --domains $DOMAINS_PATH \
-    --output "$OUTPUT_DIR/codoh_sim_cold.csv" \
-    --summary "$OUTPUT_DIR/codoh_sim_cold.json"
+    echo "Running CODoH simulation benchmark (cold)..."
+    $CLIENT_PATH latency \
+        --protocol codoh \
+        --distribution sequential \
+        --iterations $ITERATIONS \
+        --target 127.0.0.1:8443 \
+        --proxy 127.0.0.1:8080 \
+        --customcert $CERT_PATH \
+        --domains $DOMAINS_PATH \
+        --output "$OUTPUT_DIR/codoh_sim_cold.csv" \
+        --summary "$OUTPUT_DIR/codoh_sim_cold.json"
 
-echo ""
-echo "Running CODoH simulation benchmark (zipf)..."
-$CLIENT_PATH latency \
-    --protocol codoh \
-    --distribution zipf \
-    --zipf-s 1.0 \
-    --iterations $ITERATIONS \
-    --target 127.0.0.1:8443 \
-    --proxy 127.0.0.1:8080 \
-    --customcert $CERT_PATH \
-    --domains $DOMAINS_PATH \
-    --output "$OUTPUT_DIR/codoh_sim_zipf.csv" \
-    --summary "$OUTPUT_DIR/codoh_sim_zipf.json"
+    echo ""
+    echo "Running CODoH simulation benchmark (zipf)..."
+    $CLIENT_PATH latency \
+        --protocol codoh \
+        --distribution zipf \
+        --zipf-s 1.0 \
+        --iterations $ITERATIONS \
+        --target 127.0.0.1:8443 \
+        --proxy 127.0.0.1:8080 \
+        --customcert $CERT_PATH \
+        --domains $DOMAINS_PATH \
+        --output "$OUTPUT_DIR/codoh_sim_zipf.csv" \
+        --summary "$OUTPUT_DIR/codoh_sim_zipf.json"
 
-echo ""
-echo "Running CODoH simulation benchmark (warm)..."
-# Create single-domain file for warm test
-echo "1,google.com" > /tmp/warm-domain.csv
-$CLIENT_PATH latency \
-    --protocol codoh \
-    --distribution sequential \
-    --iterations $ITERATIONS \
-    --target 127.0.0.1:8443 \
-    --proxy 127.0.0.1:8080 \
-    --customcert $CERT_PATH \
-    --domains /tmp/warm-domain.csv \
-    --output "$OUTPUT_DIR/codoh_sim_warm.csv" \
-    --summary "$OUTPUT_DIR/codoh_sim_warm.json"
+    echo ""
+    echo "Running CODoH simulation benchmark (warm)..."
+    # Create single-domain file for warm test
+    echo "1,google.com" > /tmp/warm-domain.csv
+    $CLIENT_PATH latency \
+        --protocol codoh \
+        --distribution sequential \
+        --iterations $ITERATIONS \
+        --target 127.0.0.1:8443 \
+        --proxy 127.0.0.1:8080 \
+        --customcert $CERT_PATH \
+        --domains /tmp/warm-domain.csv \
+        --output "$OUTPUT_DIR/codoh_sim_warm.csv" \
+        --summary "$OUTPUT_DIR/codoh_sim_warm.json"
+fi
 
 #######################################
 # CODoH Benchmark (SGX Hardware Mode)
@@ -213,7 +226,13 @@ EOF
 
     # Start SGX enclave
     echo "Starting SGX enclave..."
-    ego run ./enclave-sgx --socket /tmp/codoh-sgx-enclave.sock --https-port 18444 > /tmp/enclave-sgx.log 2>&1 &
+    if $ORAM_MODE; then
+        echo "Using ORAM cache (SGX)"
+        CODOH_USE_ORAM=true ego run ./enclave-sgx --socket /tmp/codoh-sgx-enclave.sock --https-port 18444 > /tmp/enclave-sgx.log 2>&1 &
+    else
+        echo "Using LRU cache (SGX)"
+        ego run ./enclave-sgx --socket /tmp/codoh-sgx-enclave.sock --https-port 18444 > /tmp/enclave-sgx.log 2>&1 &
+    fi
     ENCLAVE_SGX_PID=$!
     sleep 3
 
@@ -310,15 +329,18 @@ echo ""
 echo "=== Quick Comparison ==="
 echo "ODoH (baseline):"
 cat "$OUTPUT_DIR/odoh.json" | grep -E '"(mean|p50|p95|p99|cache_hit_rate)"' | head -5
-echo ""
-echo "CODoH Simulation (cold):"
-cat "$OUTPUT_DIR/codoh_sim_cold.json" | grep -E '"(mean|p50|p95|p99|cache_hit_rate)"' | head -5
-echo ""
-echo "CODoH Simulation (zipf):"
-cat "$OUTPUT_DIR/codoh_sim_zipf.json" | grep -E '"(mean|p50|p95|p99|cache_hit_rate)"' | head -5
-echo ""
-echo "CODoH Simulation (warm):"
-cat "$OUTPUT_DIR/codoh_sim_warm.json" | grep -E '"(mean|p50|p95|p99|cache_hit_rate)"' | head -5
+
+if ! $SGX_MODE; then
+    echo ""
+    echo "CODoH Simulation (cold):"
+    cat "$OUTPUT_DIR/codoh_sim_cold.json" | grep -E '"(mean|p50|p95|p99|cache_hit_rate)"' | head -5
+    echo ""
+    echo "CODoH Simulation (zipf):"
+    cat "$OUTPUT_DIR/codoh_sim_zipf.json" | grep -E '"(mean|p50|p95|p99|cache_hit_rate)"' | head -5
+    echo ""
+    echo "CODoH Simulation (warm):"
+    cat "$OUTPUT_DIR/codoh_sim_warm.json" | grep -E '"(mean|p50|p95|p99|cache_hit_rate)"' | head -5
+fi
 
 if $SGX_MODE; then
     echo ""
