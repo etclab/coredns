@@ -309,6 +309,60 @@ codohtarget {
 - Enclave verifies signatures on `store_encrypted` to prevent cache poisoning
 - Simulation mode uses shared secret file for development
 
+### Phase 3: Stochastic Cache Defenses (Snapshot Resistance)
+Protects against memory snapshot attacks by making cache behavior unpredictable:
+
+- **TTL-Aware Caching**: Target extracts DNS TTL and propagates via `X-Enclave-Cache-TTL` header
+- **Hit Suppression (p_fn)**: Probabilistically return cache miss even when entry exists
+- **Non-Insertion (p_ins)**: Probabilistically skip caching some responses
+- **Random Churn** (ORAM only): Background eviction without user queries
+
+#### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CODOH_HIT_SUPPRESSION_PROB` | 0.0 | Probability of suppressing hits [0.0-1.0] |
+| `CODOH_INSERT_PROB` | 1.0 | Probability of inserting entries [0.0-1.0] |
+| `CODOH_CHURN_ENABLED` | false | Enable background churn (ORAM only) |
+| `CODOH_CHURN_INTERVAL_SECS` | 0 | Seconds between churn events |
+| `CODOH_USE_ORAM` | false | Use ORAM cache instead of LRU |
+| `CODOH_ORAM_BLOCK_SIZE` | 4096 | ORAM block size in bytes |
+
+#### Example Configurations
+
+```bash
+# Production (balanced)
+CODOH_HIT_SUPPRESSION_PROB=0.1
+CODOH_INSERT_PROB=0.9
+
+# High Security (ORAM + churn)
+CODOH_USE_ORAM=true
+CODOH_HIT_SUPPRESSION_PROB=0.2
+CODOH_INSERT_PROB=0.8
+CODOH_CHURN_ENABLED=true
+CODOH_CHURN_INTERVAL_SECS=60
+
+# Maximum Security
+CODOH_USE_ORAM=true
+CODOH_HIT_SUPPRESSION_PROB=0.3
+CODOH_INSERT_PROB=0.7
+CODOH_CHURN_ENABLED=true
+CODOH_CHURN_INTERVAL_SECS=30
+```
+
+#### Testing Stochastic Defenses
+
+```bash
+# Unit tests
+cd enclave && go test -v -run "Test.*Suppression|Test.*Insertion|Test.*Churn"
+
+# Benchmark different defense levels
+./benchmark/run-stochastic-benchmark.sh --quick
+
+# With ORAM cache
+./benchmark/run-stochastic-benchmark.sh --quick --oram
+```
+
 ---
 
 ## Benchmarking

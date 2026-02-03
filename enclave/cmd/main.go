@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -70,14 +71,8 @@ func main() {
 	cfg.SocketPath = *socketPath
 	cfg.MasterSecret = provData.MasterSecret
 
-	// Try to override from environment (for epoch duration, cache size, etc.)
-	if envCfg, err := enclave.LoadConfigFromEnv(); err == nil {
-		cfg.EpochDuration = envCfg.EpochDuration
-		cfg.CacheSize = envCfg.CacheSize
-		cfg.UseORAMCache = envCfg.UseORAMCache
-		cfg.ORAMBlockSize = envCfg.ORAMBlockSize
-		// Don't override MasterSecret - we got it from provisioning
-	}
+	// Load optional settings from environment (master secret already provisioned)
+	loadOptionalEnvSettings(cfg)
 
 	// Initialize epoch manager for token verification
 	epochMgr, err := enclave.NewEpochManager(cfg.MasterSecret, cfg.EpochDuration)
@@ -88,6 +83,14 @@ func main() {
 
 	// Initialize spent set
 	spentSet := enclave.NewSpentSet(epochMgr.CurrentEpoch())
+
+	// Build stochastic config
+	stochasticCfg := enclave.StochasticConfig{
+		HitSuppressionProb: cfg.HitSuppressionProb,
+		InsertProb:         cfg.InsertProb,
+		ChurnInterval:      cfg.ChurnInterval,
+		ChurnEnabled:       cfg.ChurnEnabled,
+	}
 
 	// Initialize cache
 	var cache enclave.Cache
@@ -100,15 +103,19 @@ func main() {
 			ConstantTime: true,
 		}
 		var err error
-		oramCache, err = enclave.NewORAMCache(oramCfg)
+		oramCache, err = enclave.NewORAMCacheWithStochastic(oramCfg, stochasticCfg)
 		if err != nil {
 			log.Fatalf("Failed to create ORAM cache: %v", err)
 		}
 		cache = oramCache
-		log.Printf("ORAM cache initialized with capacity %d, block size %d", cfg.CacheSize, cfg.ORAMBlockSize)
+		log.Printf("ORAM cache: capacity=%d, p_fn=%.2f, p_ins=%.2f, churn=%v",
+			cfg.CacheSize, stochasticCfg.HitSuppressionProb, stochasticCfg.InsertProb,
+			stochasticCfg.ChurnEnabled)
 	} else {
-		cache = enclave.NewLRUCache(cfg.CacheSize)
-		log.Printf("LRU cache initialized with capacity %d", cfg.CacheSize)
+		cache = enclave.NewLRUCacheWithStochastic(cfg.CacheSize, stochasticCfg)
+		log.Printf("LRU cache: capacity=%d, p_fn=%.2f, p_ins=%.2f, churn=%v",
+			cfg.CacheSize, stochasticCfg.HitSuppressionProb, stochasticCfg.InsertProb,
+			stochasticCfg.ChurnEnabled)
 	}
 
 	// Remove stale socket
@@ -149,6 +156,47 @@ func main() {
 	log.Printf("Enclave ready, listening on %s", cfg.SocketPath)
 	if err := server.Serve(); err != nil {
 		log.Fatalf("Server error: %v", err)
+	}
+}
+
+// loadOptionalEnvSettings loads optional settings from environment variables.
+// Does not require CODOH_MASTER_SECRET since it's already provisioned.
+func loadOptionalEnvSettings(cfg *enclave.Config) {
+	if dur := os.Getenv("CODOH_EPOCH_DURATION"); dur != "" {
+		if secs, err := strconv.Atoi(dur); err == nil {
+			cfg.EpochDuration = time.Duration(secs) * time.Second
+		}
+	}
+	if size := os.Getenv("CODOH_CACHE_SIZE"); size != "" {
+		if n, err := strconv.Atoi(size); err == nil {
+			cfg.CacheSize = n
+		}
+	}
+	if useORAM := os.Getenv("CODOH_USE_ORAM"); useORAM == "true" || useORAM == "1" {
+		cfg.UseORAMCache = true
+	}
+	if blockSize := os.Getenv("CODOH_ORAM_BLOCK_SIZE"); blockSize != "" {
+		if n, err := strconv.Atoi(blockSize); err == nil {
+			cfg.ORAMBlockSize = n
+		}
+	}
+	if p := os.Getenv("CODOH_HIT_SUPPRESSION_PROB"); p != "" {
+		if prob, err := strconv.ParseFloat(p, 64); err == nil && prob >= 0.0 && prob <= 1.0 {
+			cfg.HitSuppressionProb = prob
+		}
+	}
+	if p := os.Getenv("CODOH_INSERT_PROB"); p != "" {
+		if prob, err := strconv.ParseFloat(p, 64); err == nil && prob >= 0.0 && prob <= 1.0 {
+			cfg.InsertProb = prob
+		}
+	}
+	if interval := os.Getenv("CODOH_CHURN_INTERVAL_SECS"); interval != "" {
+		if secs, err := strconv.Atoi(interval); err == nil {
+			cfg.ChurnInterval = time.Duration(secs) * time.Second
+		}
+	}
+	if churn := os.Getenv("CODOH_CHURN_ENABLED"); churn == "true" || churn == "1" {
+		cfg.ChurnEnabled = true
 	}
 }
 

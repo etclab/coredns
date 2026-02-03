@@ -19,6 +19,11 @@ type ORAMCache struct {
 
 	// Track which block IDs are in use (for Size())
 	used map[int]bool
+
+	// Stochastic defenses
+	stochastic StochasticConfig
+	rng        *SecureRNG
+	stopChurn  chan struct{}
 }
 
 // ORAMCacheConfig configures the ORAM cache.
@@ -41,6 +46,11 @@ func DefaultORAMCacheConfig() ORAMCacheConfig {
 
 // NewORAMCache creates a new ORAM-backed cache.
 func NewORAMCache(cfg ORAMCacheConfig) (*ORAMCache, error) {
+	return NewORAMCacheWithStochastic(cfg, DefaultStochasticConfig())
+}
+
+// NewORAMCacheWithStochastic creates a new ORAM-backed cache with stochastic defenses.
+func NewORAMCacheWithStochastic(cfg ORAMCacheConfig, stochastic StochasticConfig) (*ORAMCache, error) {
 	oramCfg := pathoram.Config{
 		NumBlocks:    cfg.Capacity,
 		BlockSize:    cfg.BlockSize,
@@ -53,11 +63,20 @@ func NewORAMCache(cfg ORAMCacheConfig) (*ORAMCache, error) {
 		return nil, err
 	}
 
-	return &ORAMCache{
-		oram: oram,
-		cfg:  cfg,
-		used: make(map[int]bool),
-	}, nil
+	cache := &ORAMCache{
+		oram:       oram,
+		cfg:        cfg,
+		used:       make(map[int]bool),
+		stochastic: stochastic,
+		rng:        NewSecureRNG(),
+		stopChurn:  make(chan struct{}),
+	}
+
+	if stochastic.ChurnEnabled && stochastic.ChurnInterval > 0 {
+		go cache.churnLoop()
+	}
+
+	return cache, nil
 }
 
 // Get retrieves a cached response for the given query.
@@ -83,6 +102,12 @@ func (c *ORAMCache) Get(query string) ([]byte, []byte, bool) {
 		return nil, nil, false
 	}
 
+	// Apply stochastic hit suppression
+	if c.stochastic.ShouldSuppressHit(c.rng) {
+		log.Printf("ORAMCache: suppressing hit (p_fn=%.2f)", c.stochastic.HitSuppressionProb)
+		return nil, nil, false
+	}
+
 	return entry.Response, entry.Kc, true
 }
 
@@ -90,6 +115,12 @@ func (c *ORAMCache) Get(query string) ([]byte, []byte, bool) {
 func (c *ORAMCache) Put(query string, response, kc []byte, ttl time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// Apply stochastic non-insertion
+	if !c.stochastic.ShouldInsert(c.rng) {
+		log.Printf("ORAMCache: skipping insert (p_ins=%.2f)", c.stochastic.InsertProb)
+		return
+	}
 
 	blockID := c.queryToBlockID(query)
 	entry := &CacheEntry{
@@ -298,6 +329,49 @@ func (c *ORAMCache) deserialize(data []byte) (*CacheEntry, bool) {
 		Kc:        kc,
 		ExpiresAt: time.Unix(0, int64(expiresNano)),
 	}, true
+}
+
+// churnLoop periodically evicts a random cache entry.
+func (c *ORAMCache) churnLoop() {
+	ticker := time.NewTicker(c.stochastic.ChurnInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			c.churnOnce()
+		case <-c.stopChurn:
+			return
+		}
+	}
+}
+
+// churnOnce evicts a random cache entry.
+func (c *ORAMCache) churnOnce() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if len(c.used) == 0 {
+		return
+	}
+
+	// Pick a random block to evict
+	blockID := int(c.rng.Float64() * float64(c.cfg.Capacity))
+	emptyBlock := make([]byte, c.cfg.BlockSize)
+	if _, err := c.oram.Write(blockID, emptyBlock); err != nil {
+		log.Printf("ORAMCache: churn write error: %v", err)
+		return
+	}
+	delete(c.used, blockID)
+
+	log.Printf("ORAMCache: churned block %d, size=%d", blockID, len(c.used))
+}
+
+// StopChurn stops the churn loop.
+func (c *ORAMCache) StopChurn() {
+	if c.stopChurn != nil {
+		close(c.stopChurn)
+	}
 }
 
 // Compile-time interface check

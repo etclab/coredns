@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	clog "github.com/coredns/coredns/plugin/pkg/log"
@@ -357,9 +358,17 @@ func (p *odohProxy) handleCacheMiss(w http.ResponseWriter, r *http.Request, encl
 			query = enclaveResp.Query
 		}
 
+		// Parse TTL from response header, default to 300
+		ttl := 300
+		if ttlStr := resp.Header.Get("X-Enclave-Cache-TTL"); ttlStr != "" {
+			if parsedTTL, err := strconv.Atoi(ttlStr); err == nil && parsedTTL > 0 {
+				ttl = parsedTTL
+			}
+		}
+
 		// Target encrypted raw DNS under enclave's public key
 		go func() {
-			if err := p.enclaveClient.StoreEncryptedWithSig(query, enclaveCache, sig, blobB, 300); err != nil {
+			if err := p.enclaveClient.StoreEncryptedWithSig(query, enclaveCache, sig, blobB, ttl); err != nil {
 				log.Errorf("Failed to store encrypted cache: %v", err)
 			}
 		}()

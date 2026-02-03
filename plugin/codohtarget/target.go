@@ -13,7 +13,9 @@ import (
 	"time"
 
 	odoh "github.com/cloudflare/odoh-go"
+	"github.com/coredns/coredns/plugin/pkg/dnsutil"
 	clog "github.com/coredns/coredns/plugin/pkg/log"
+	"github.com/coredns/coredns/plugin/pkg/response"
 	"github.com/coredns/coredns/plugin/pkg/reuseport"
 	pkgtls "github.com/coredns/coredns/plugin/pkg/tls"
 	"github.com/miekg/dns"
@@ -255,6 +257,9 @@ func (t *odohTarget) odohQueryHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	targetResolutionSeconds.Observe(time.Since(resolveStart).Seconds())
 
+	// Extract minimal TTL from response
+	ttl := extractMinimalTTL(response)
+
 	// Pack DNS response
 	packedResponse, err := response.Pack()
 	if err != nil {
@@ -281,6 +286,7 @@ func (t *odohTarget) odohQueryHandler(w http.ResponseWriter, r *http.Request) {
 			encryptedForCache, err := EncryptForEnclave(pubKeyBytes, packedResponse)
 			if err == nil {
 				w.Header().Set("X-Enclave-Cache", base64.StdEncoding.EncodeToString(encryptedForCache))
+				w.Header().Set("X-Enclave-Cache-TTL", fmt.Sprintf("%d", ttl))
 
 				// Sign the response if signing key is configured
 				if t.signingKey != nil && len(dnsQuery.Question) > 0 {
@@ -426,6 +432,25 @@ func (t *odohTarget) verifyHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusOK)
 	tokensVerifiedTotal.WithLabelValues("valid").Inc()
+}
+
+// extractMinimalTTL determines the appropriate TTL for caching based on DNS response type
+func extractMinimalTTL(msg *dns.Msg) uint32 {
+	var responseType response.Type
+	if msg.Rcode == dns.RcodeSuccess {
+		if len(msg.Answer) > 0 {
+			responseType = response.NoError
+		} else {
+			responseType = response.NoData
+		}
+	} else if msg.Rcode == dns.RcodeNameError {
+		responseType = response.NameError
+	} else {
+		responseType = response.OtherError
+	}
+
+	ttl := dnsutil.MinimalTTL(msg, responseType)
+	return uint32(ttl.Seconds())
 }
 
 // getClientIP extracts client IP from request.

@@ -35,18 +35,28 @@ CODoH (ports 8080/8443):
 
 ```
 benchmark/
-├── run-benchmark.sh      # Automated benchmark script
-├── SPEC.md               # Full specification
-├── README.md             # This file
-├── top-1m.csv            # Cisco Umbrella Top 1M domains
-├── Corefile.odoh-proxy   # ODoH baseline proxy config
-├── Corefile.odoh-target  # ODoH baseline target config
-└── results/              # Benchmark output
-    └── <timestamp>/
-        ├── odoh.{csv,json}
-        ├── codoh_cold.{csv,json}
-        ├── codoh_zipf.{csv,json}
-        └── codoh_warm.{csv,json}
+├── run-benchmark.sh              # Main benchmark (ODoH vs CODoH)
+├── run-stochastic-benchmark.sh   # Stochastic defense benchmark
+├── SPEC.md                       # Full specification
+├── README.md                     # This file
+├── top-1m.csv                    # Cisco Umbrella Top 1M domains
+├── top-1k.csv                    # Top 1K domains (for quick tests)
+├── Corefile.odoh-proxy           # ODoH baseline proxy config
+├── Corefile.odoh-target          # ODoH baseline target config
+└── results/                      # Benchmark output
+    ├── <timestamp>/              # Main benchmark results
+    │   ├── odoh.{csv,json}
+    │   ├── codoh_cold.{csv,json}
+    │   ├── codoh_zipf.{csv,json}
+    │   └── codoh_warm.{csv,json}
+    └── stochastic_<timestamp>/   # Stochastic benchmark results
+        ├── baseline_zipf.{csv,json}
+        ├── light_zipf.{csv,json}
+        ├── moderate_zipf.{csv,json}
+        ├── heavy_zipf.{csv,json}
+        ├── max_security_zipf.{csv,json}
+        ├── *_enclave.log
+        └── comparison_report.txt
 ```
 
 ## Manual Usage
@@ -129,3 +139,91 @@ timestamp,protocol,distribution,query_num,domain,latency_ms,cache_status,success
 | Proxy | 9080 | 8080 |
 | Target | 9443 | 8443 |
 | Enclave | - | Unix socket |
+
+---
+
+## Stochastic Defense Benchmark
+
+Measures the latency impact of Phase 3 stochastic defenses (hit suppression, non-insertion, churn).
+
+### Quick Start
+
+```bash
+# Quick test (100 iterations, ~2-3 minutes)
+./benchmark/run-stochastic-benchmark.sh --quick
+
+# Standard test (500 iterations)
+./benchmark/run-stochastic-benchmark.sh
+
+# With ORAM cache + churn test
+./benchmark/run-stochastic-benchmark.sh --oram
+
+# Custom iterations
+./benchmark/run-stochastic-benchmark.sh --iterations=200
+```
+
+### Test Configurations
+
+| Config | p_fn | p_ins | Churn | Description |
+|--------|------|-------|-------|-------------|
+| baseline | 0.0 | 1.0 | No | No defenses (reference) |
+| light | 0.1 | 0.9 | No | Production recommended |
+| moderate | 0.2 | 0.8 | No | Balanced security |
+| heavy | 0.3 | 0.7 | No | Higher security |
+| max_security | 0.5 | 0.5 | No | Maximum snapshot resistance |
+| oram_churn | 0.1 | 0.9 | 30s | ORAM only, with background eviction |
+
+### Stochastic Parameters
+
+| Parameter | Env Variable | Description |
+|-----------|--------------|-------------|
+| Hit Suppression (p_fn) | `CODOH_HIT_SUPPRESSION_PROB` | Probability of returning miss even when cached [0.0-1.0] |
+| Insert Probability (p_ins) | `CODOH_INSERT_PROB` | Probability of caching a response [0.0-1.0] |
+| Churn Enabled | `CODOH_CHURN_ENABLED` | Enable background random eviction (ORAM only) |
+| Churn Interval | `CODOH_CHURN_INTERVAL_SECS` | Seconds between churn events |
+
+### Output
+
+Results saved to `benchmark/results/stochastic_<timestamp>/`:
+
+| File | Description |
+|------|-------------|
+| `*_zipf.csv/json` | Latency measurements |
+| `*_enclave.log` | Cache hit/miss/suppression logs |
+| `*_cache_stats.txt` | Cache behavior summary |
+| `comparison_report.txt` | Side-by-side comparison |
+
+### Example Results
+
+```
+Config            Mean(ms)    P50(ms)    P95(ms)    P99(ms)    HitRate
+-------           --------    -------    -------    -------    -------
+baseline             12.36      13.84      24.67      27.24      36.0%
+light                12.69      13.75      25.23      28.71      30.0%
+moderate             15.24      13.91      27.11      83.16      21.0%
+heavy                14.11      14.01      25.68      29.52      25.0%
+max_security         15.37      14.17      26.76      28.98      13.0%
+
+Config              Hits   Misses Suppressed    Skipped  Churned
+-------             ----   ------ ----------    -------  -------
+baseline              36       64          0          0        0
+light                 30       70          4          6        0
+moderate              21       79         10         16        0
+heavy                 25       75         10         20        0
+max_security          13       87         17         46        0
+```
+
+### Recommended Production Settings
+
+```bash
+# Balanced security/performance (~3% latency overhead)
+CODOH_HIT_SUPPRESSION_PROB=0.1
+CODOH_INSERT_PROB=0.9
+
+# High security with ORAM (~25% latency overhead)
+CODOH_USE_ORAM=true
+CODOH_HIT_SUPPRESSION_PROB=0.2
+CODOH_INSERT_PROB=0.8
+CODOH_CHURN_ENABLED=true
+CODOH_CHURN_INTERVAL_SECS=60
+```

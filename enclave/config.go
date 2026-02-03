@@ -16,16 +16,26 @@ type Config struct {
 	CacheSize      int           // Default: 10000 entries
 	UseORAMCache   bool          // Use ORAM-backed cache (default: false)
 	ORAMBlockSize  int           // ORAM block size in bytes (default: 4096)
+
+	// Stochastic cache defenses
+	HitSuppressionProb float64       // Probability of suppressing cache hits [0.0, 1.0]
+	InsertProb         float64       // Probability of inserting into cache [0.0, 1.0]
+	ChurnInterval      time.Duration // Interval for random churn
+	ChurnEnabled       bool          // Whether churn is enabled
 }
 
 // DefaultConfig returns configuration with default values.
 func DefaultConfig() *Config {
 	return &Config{
-		EpochDuration:  time.Hour,
-		SocketPath:     "/tmp/codoh-enclave.sock",
-		CacheSize:      10000,
-		UseORAMCache:   false,
-		ORAMBlockSize:  4096,
+		EpochDuration:      time.Hour,
+		SocketPath:         "/tmp/codoh-enclave.sock",
+		CacheSize:          10000,
+		UseORAMCache:       false,
+		ORAMBlockSize:      4096,
+		HitSuppressionProb: 0.0,
+		InsertProb:         1.0,
+		ChurnInterval:      0,
+		ChurnEnabled:       false,
 	}
 }
 
@@ -89,6 +99,35 @@ func LoadConfigFromEnv() (*Config, error) {
 			return nil, errors.New("CODOH_ORAM_BLOCK_SIZE must be an integer")
 		}
 		cfg.ORAMBlockSize = n
+	}
+
+	// Stochastic cache defenses
+	if p := os.Getenv("CODOH_HIT_SUPPRESSION_PROB"); p != "" {
+		prob, err := strconv.ParseFloat(p, 64)
+		if err != nil || prob < 0.0 || prob > 1.0 {
+			return nil, errors.New("CODOH_HIT_SUPPRESSION_PROB must be float [0.0, 1.0]")
+		}
+		cfg.HitSuppressionProb = prob
+	}
+
+	if p := os.Getenv("CODOH_INSERT_PROB"); p != "" {
+		prob, err := strconv.ParseFloat(p, 64)
+		if err != nil || prob < 0.0 || prob > 1.0 {
+			return nil, errors.New("CODOH_INSERT_PROB must be float [0.0, 1.0]")
+		}
+		cfg.InsertProb = prob
+	}
+
+	if interval := os.Getenv("CODOH_CHURN_INTERVAL_SECS"); interval != "" {
+		secs, err := strconv.Atoi(interval)
+		if err != nil {
+			return nil, errors.New("CODOH_CHURN_INTERVAL_SECS must be integer")
+		}
+		cfg.ChurnInterval = time.Duration(secs) * time.Second
+	}
+
+	if churn := os.Getenv("CODOH_CHURN_ENABLED"); churn != "" {
+		cfg.ChurnEnabled = churn == "true" || churn == "1"
 	}
 
 	return cfg, nil

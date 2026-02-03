@@ -2,6 +2,7 @@ package enclave
 
 import (
 	"container/list"
+	"log"
 	"sync"
 	"time"
 )
@@ -20,14 +21,25 @@ type LRUCache struct {
 	cache    map[string]*list.Element // query -> list element
 	lru      *list.List               // front = most recent, back = least recent
 	mu       sync.RWMutex
+
+	// Stochastic defenses
+	stochastic StochasticConfig
+	rng        *SecureRNG
 }
 
 // NewLRUCache creates a new LRU cache with the given capacity.
 func NewLRUCache(capacity int) *LRUCache {
+	return NewLRUCacheWithStochastic(capacity, DefaultStochasticConfig())
+}
+
+// NewLRUCacheWithStochastic creates a new LRU cache with stochastic defenses.
+func NewLRUCacheWithStochastic(capacity int, stochastic StochasticConfig) *LRUCache {
 	return &LRUCache{
-		capacity: capacity,
-		cache:    make(map[string]*list.Element),
-		lru:      list.New(),
+		capacity:   capacity,
+		cache:      make(map[string]*list.Element),
+		lru:        list.New(),
+		stochastic: stochastic,
+		rng:        NewSecureRNG(),
 	}
 }
 
@@ -52,6 +64,12 @@ func (c *LRUCache) Get(query string) ([]byte, []byte, bool) {
 		return nil, nil, false
 	}
 
+	// Apply stochastic hit suppression
+	if c.stochastic.ShouldSuppressHit(c.rng) {
+		log.Printf("LRUCache: suppressing hit (p_fn=%.2f)", c.stochastic.HitSuppressionProb)
+		return nil, nil, false
+	}
+
 	// Move to front (most recently used)
 	c.lru.MoveToFront(elem)
 
@@ -63,6 +81,12 @@ func (c *LRUCache) Get(query string) ([]byte, []byte, bool) {
 func (c *LRUCache) Put(query string, response, kc []byte, ttl time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// Apply stochastic non-insertion
+	if !c.stochastic.ShouldInsert(c.rng) {
+		log.Printf("LRUCache: skipping insert (p_ins=%.2f)", c.stochastic.InsertProb)
+		return
+	}
 
 	// Check if already exists
 	if elem, ok := c.cache[query]; ok {
