@@ -25,6 +25,10 @@ const (
 	msgTypeGetPubKey      = "get_pubkey"
 	msgTypeHealth         = "health"
 	msgTypeReady          = "ready" // Returns provisioning status
+
+	// MLE message types
+	msgTypeMLELookup = "mle_lookup"
+	msgTypeMLEStore  = "mle_store"
 )
 
 // IPC Response Status
@@ -45,6 +49,9 @@ type EnclaveRequest struct {
 	EncryptedResponse string `json:"encrypted_response,omitempty"`
 	Signature         string `json:"signature,omitempty"` // Base64 Ed25519 signature
 	TTL               int    `json:"ttl,omitempty"`
+
+	// MLE fields
+	MLEInsertBlob string `json:"mle_insert_blob,omitempty"` // Base64 HPKE-encrypted MLE insert blob
 }
 
 // EnclaveResponse is the IPC response from the enclave.
@@ -56,6 +63,9 @@ type EnclaveResponse struct {
 	Error    string `json:"error,omitempty"`
 	PubKey   string `json:"pubkey,omitempty"`
 	Ready    bool   `json:"ready,omitempty"` // For ready check (provisioning status)
+
+	// MLE fields
+	Exp int64 `json:"exp,omitempty"` // Expiry timestamp for MLE cache hit
 }
 
 // NewEnclaveClient creates a new enclave client.
@@ -198,6 +208,32 @@ func (c *EnclaveClient) CheckReady() (bool, error) {
 		return false, fmt.Errorf("ready check failed: %s", resp.Error)
 	}
 	return resp.Ready, nil
+}
+
+// MLELookup sends an MLE lookup request to the enclave.
+// blobB is the base64-encoded HPKE-encrypted BlobBv2.
+func (c *EnclaveClient) MLELookup(blobB, clientIP string) (*EnclaveResponse, error) {
+	return c.sendRequest(&EnclaveRequest{
+		Type:     msgTypeMLELookup,
+		BlobB:    blobB,
+		ClientIP: clientIP,
+	})
+}
+
+// MLEStore sends an MLE store request to the enclave.
+// mleInsertBlob is the base64-encoded HPKE-encrypted MLEInsertBlob from target.
+func (c *EnclaveClient) MLEStore(mleInsertBlob string) error {
+	resp, err := c.sendRequest(&EnclaveRequest{
+		Type:          msgTypeMLEStore,
+		MLEInsertBlob: mleInsertBlob,
+	})
+	if err != nil {
+		return err
+	}
+	if resp.Status != statusOK {
+		return fmt.Errorf("MLE store failed: %s", resp.Error)
+	}
+	return nil
 }
 
 // sendRequest sends a request to the enclave and returns the response.

@@ -21,6 +21,10 @@ type RequestHandler interface {
 	HandleGetPubKey() *Response
 	HandleHealth() *Response
 	HandleReady() *Response // Returns provisioning status
+
+	// MLE handlers
+	HandleMLELookup(blobB, clientIP string) *Response
+	HandleMLEStore(mleInsertBlob string) *Response
 }
 
 // NewIPCServer creates a new IPC server on the given socket path.
@@ -82,6 +86,10 @@ func (s *IPCServer) dispatch(req *Request) *Response {
 		return s.handler.HandleHealth()
 	case MsgTypeReady:
 		return s.handler.HandleReady()
+	case MsgTypeMLELookup:
+		return s.handler.HandleMLELookup(req.BlobB, req.ClientIP)
+	case MsgTypeMLEStore:
+		return s.handler.HandleMLEStore(req.MLEInsertBlob)
 	default:
 		return &Response{
 			Status: StatusError,

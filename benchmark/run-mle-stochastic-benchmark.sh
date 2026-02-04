@@ -1,9 +1,10 @@
 #!/bin/bash
-# CODoH Stochastic Defense Benchmark
-# Measures latency impact of Phase 3 stochastic defenses
+# CODoH MLE + Stochastic Defense Benchmark
+# Measures latency impact of MLE (ciphertext-only cache) and stochastic defenses
 #
 # Usage: ./benchmark/run-stochastic-benchmark.sh [options]
 #   --oram         Use ORAM cache (default: LRU)
+#   --mle          Enable MLE (Message-Locked Encryption) mode
 #   --iterations N Number of queries per test (default: 500)
 #   --quick        Quick mode: fewer iterations (100)
 #   --domains FILE Path to domains file (default: top-1k.csv)
@@ -15,6 +16,7 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
 # Parse arguments
 ORAM_MODE=false
+MLE_MODE=false
 ITERATIONS=500
 DOMAINS_FILE="$SCRIPT_DIR/top-1k.csv"
 
@@ -22,6 +24,9 @@ for arg in "$@"; do
     case "$arg" in
         --oram)
             ORAM_MODE=true
+            ;;
+        --mle)
+            MLE_MODE=true
             ;;
         --quick)
             ITERATIONS=100
@@ -36,7 +41,11 @@ for arg in "$@"; do
 done
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-OUTPUT_DIR="$SCRIPT_DIR/results/stochastic_$TIMESTAMP"
+if $MLE_MODE; then
+    OUTPUT_DIR="$SCRIPT_DIR/results/mle_stochastic_$TIMESTAMP"
+else
+    OUTPUT_DIR="$SCRIPT_DIR/results/stochastic_$TIMESTAMP"
+fi
 CLIENT_PATH="$(dirname "$ROOT_DIR")/codoh-client/odoh-client"
 CERT_PATH="$ROOT_DIR/localhost.pem"
 SECRET_HEX=$(cat "$ROOT_DIR/dev-master-secret.txt")
@@ -49,11 +58,17 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-echo -e "${GREEN}=== CODoH Stochastic Defense Benchmark ===${NC}"
+echo -e "${GREEN}=== CODoH MLE + Stochastic Defense Benchmark ===${NC}"
 echo ""
 echo "Configuration:"
 echo "  Iterations:  $ITERATIONS"
-echo "  Cache type:  $(if $ORAM_MODE; then echo 'ORAM'; else echo 'LRU'; fi)"
+if $MLE_MODE; then
+    echo "  MLE mode:    enabled (MLE cache always uses ORAM)"
+    echo "  Cache type:  ORAM (hardcoded for MLE)"
+else
+    echo "  MLE mode:    disabled (legacy enclave)"
+    echo "  Cache type:  $(if $ORAM_MODE; then echo 'ORAM'; else echo 'LRU'; fi)"
+fi
 echo "  Domains:     $DOMAINS_FILE"
 echo "  Output:      $OUTPUT_DIR"
 echo ""
@@ -154,6 +169,14 @@ run_benchmark() {
         return 1
     fi
 
+    # Build MLE flag if enabled
+    local MLE_FLAG=""
+    if $MLE_MODE; then
+        MLE_FLAG="--mle"
+    fi
+
+    # Run benchmark and capture full output
+    local bench_log="$OUTPUT_DIR/${test_name}_${distribution}_bench.log"
     $CLIENT_PATH latency \
         --protocol codoh \
         --distribution "$distribution" \
@@ -163,7 +186,18 @@ run_benchmark() {
         --customcert "$CERT_PATH" \
         --domains "$DOMAINS_FILE" \
         --output "$OUTPUT_DIR/${test_name}_${distribution}.csv" \
-        --summary "$OUTPUT_DIR/${test_name}_${distribution}.json" 2>&1 | grep -E "(mean|p50|p95|completed)" || true
+        --summary "$OUTPUT_DIR/${test_name}_${distribution}.json" \
+        $MLE_FLAG > "$bench_log" 2>&1
+
+    local exit_code=$?
+    if [ $exit_code -ne 0 ]; then
+        echo "  ERROR: Benchmark failed (exit code $exit_code)"
+        tail -10 "$bench_log"
+        return 1
+    fi
+
+    # Show summary
+    grep -E "(mean|p50|p95|completed|Progress)" "$bench_log" | tail -5 || true
 
     return 0
 }
@@ -182,15 +216,37 @@ analyze_cache_behavior() {
     local skipped=$(grep -c "skipping insert" "$log_file" 2>/dev/null) || skipped=0
     local churned=$(grep -c "churned block" "$log_file" 2>/dev/null) || churned=0
 
-    echo "    Hits: $hits, Misses: $misses"
-    echo "    Suppressed: $suppressed, Skipped inserts: $skipped, Churned: $churned"
+    # MLE-specific counters
+    local mle_hits=$(grep -c "MLE cache hit for" "$log_file" 2>/dev/null) || mle_hits=0
+    local mle_misses=$(grep -c "MLE cache miss for" "$log_file" 2>/dev/null) || mle_misses=0
+    local mle_stores=$(grep -c "MLE cache store for" "$log_file" 2>/dev/null) || mle_stores=0
+
+    if $MLE_MODE; then
+        echo "    MLE Hits: $mle_hits, MLE Misses: $mle_misses, MLE Stores: $mle_stores"
+        echo "    Suppressed: $suppressed, Skipped inserts: $skipped, Churned: $churned"
+    else
+        echo "    Hits: $hits, Misses: $misses"
+        echo "    Suppressed: $suppressed, Skipped inserts: $skipped, Churned: $churned"
+    fi
 
     # Save to summary
     cat >> "$OUTPUT_DIR/${test_name}_cache_stats.txt" << EOF
 Cache Statistics for $test_name
 ================================
+EOF
+    if $MLE_MODE; then
+        cat >> "$OUTPUT_DIR/${test_name}_cache_stats.txt" << EOF
+MLE Hits:        $mle_hits
+MLE Misses:      $mle_misses
+MLE Stores:      $mle_stores
+EOF
+    else
+        cat >> "$OUTPUT_DIR/${test_name}_cache_stats.txt" << EOF
 Hits:            $hits
 Misses:          $misses
+EOF
+    fi
+    cat >> "$OUTPUT_DIR/${test_name}_cache_stats.txt" << EOF
 Suppressed hits: $suppressed
 Skipped inserts: $skipped
 Churned blocks:  $churned
@@ -258,11 +314,18 @@ echo ""
 
 # Generate comparison report
 REPORT_FILE="$OUTPUT_DIR/comparison_report.txt"
+if $MLE_MODE; then
+    CACHE_DESC="ORAM"
+else
+    CACHE_DESC=$(if $ORAM_MODE; then echo 'ORAM'; else echo 'LRU'; fi)
+fi
+
 cat > "$REPORT_FILE" << EOF
-CODoH Stochastic Defense Benchmark Report
-==========================================
+CODoH MLE + Stochastic Defense Benchmark Report
+================================================
 Date: $(date)
-Cache: $(if $ORAM_MODE; then echo 'ORAM'; else echo 'LRU'; fi)
+MLE Mode: $(if $MLE_MODE; then echo 'enabled'; else echo 'disabled (legacy)'; fi)
+Cache: $CACHE_DESC
 Iterations: $ITERATIONS
 Domains: $DOMAINS_FILE
 
@@ -292,18 +355,33 @@ done
 echo ""
 echo -e "${BLUE}=== Cache Behavior Summary ===${NC}"
 echo ""
-printf "%-15s %8s %8s %10s %10s %8s\n" "Config" "Hits" "Misses" "Suppressed" "Skipped" "Churned"
-printf "%-15s %8s %8s %10s %10s %8s\n" "-------" "----" "------" "----------" "-------" "-------"
+if $MLE_MODE; then
+    printf "%-15s %8s %8s %8s %10s %10s %8s\n" "Config" "MLEHits" "MLEMiss" "MLEStor" "Suppressed" "Skipped" "Churned"
+    printf "%-15s %8s %8s %8s %10s %10s %8s\n" "-------" "-------" "-------" "-------" "----------" "-------" "-------"
+else
+    printf "%-15s %8s %8s %10s %10s %8s\n" "Config" "Hits" "Misses" "Suppressed" "Skipped" "Churned"
+    printf "%-15s %8s %8s %10s %10s %8s\n" "-------" "----" "------" "----------" "-------" "-------"
+fi
 
 for config in baseline light moderate heavy max_security oram_churn; do
     log_file="$OUTPUT_DIR/${config}_enclave.log"
     if [ -f "$log_file" ]; then
-        hits=$(grep -c "Cache hit for" "$log_file" 2>/dev/null) || hits=0
-        misses=$(grep -c "Cache miss for" "$log_file" 2>/dev/null) || misses=0
-        suppressed=$(grep -c "suppressing hit" "$log_file" 2>/dev/null) || suppressed=0
-        skipped=$(grep -c "skipping insert" "$log_file" 2>/dev/null) || skipped=0
-        churned=$(grep -c "churned block" "$log_file" 2>/dev/null) || churned=0
-        printf "%-15s %8s %8s %10s %10s %8s\n" "$config" "$hits" "$misses" "$suppressed" "$skipped" "$churned"
+        if $MLE_MODE; then
+            mle_hits=$(grep -c "MLE cache hit for" "$log_file" 2>/dev/null) || mle_hits=0
+            mle_misses=$(grep -c "MLE cache miss for" "$log_file" 2>/dev/null) || mle_misses=0
+            mle_stores=$(grep -c "MLE cache store for" "$log_file" 2>/dev/null) || mle_stores=0
+            suppressed=$(grep -c "suppressing hit" "$log_file" 2>/dev/null) || suppressed=0
+            skipped=$(grep -c "skipping insert" "$log_file" 2>/dev/null) || skipped=0
+            churned=$(grep -c "churned block" "$log_file" 2>/dev/null) || churned=0
+            printf "%-15s %8s %8s %8s %10s %10s %8s\n" "$config" "$mle_hits" "$mle_misses" "$mle_stores" "$suppressed" "$skipped" "$churned"
+        else
+            hits=$(grep -c "Cache hit for" "$log_file" 2>/dev/null) || hits=0
+            misses=$(grep -c "Cache miss for" "$log_file" 2>/dev/null) || misses=0
+            suppressed=$(grep -c "suppressing hit" "$log_file" 2>/dev/null) || suppressed=0
+            skipped=$(grep -c "skipping insert" "$log_file" 2>/dev/null) || skipped=0
+            churned=$(grep -c "churned block" "$log_file" 2>/dev/null) || churned=0
+            printf "%-15s %8s %8s %10s %10s %8s\n" "$config" "$hits" "$misses" "$suppressed" "$skipped" "$churned"
+        fi
     fi
 done
 
@@ -313,6 +391,33 @@ echo "Log files: $OUTPUT_DIR/*_enclave.log"
 echo ""
 
 # Show defense recommendations
+if $MLE_MODE; then
+cat << 'EOF'
+
+=== MLE Defense Level Recommendations ===
+
+MLE mode provides ciphertext-only cache - the enclave cannot decrypt
+cached responses, only the original client can with their MLE key.
+
+Production (balanced security/performance):
+  --mle flag + stochastic defenses
+  CODOH_HIT_SUPPRESSION_PROB=0.1
+  CODOH_INSERT_PROB=0.9
+  Expected: +20-30ms per query (Argon2 key derivation), strong snapshot resistance
+
+High Security (privacy-focused):
+  --mle flag + ORAM + stochastic defenses
+  CODOH_HIT_SUPPRESSION_PROB=0.2
+  CODOH_INSERT_PROB=0.8
+  CODOH_USE_ORAM=true
+  CODOH_CHURN_ENABLED=true
+  Expected: +30-40ms per query, very strong snapshot resistance
+
+Note: MLE mode adds ~22ms latency per query due to Argon2id key derivation.
+This is intentional - it rate-limits queries and prevents brute-force attacks.
+
+EOF
+else
 cat << 'EOF'
 
 === Defense Level Recommendations ===
@@ -338,4 +443,7 @@ Maximum Security (paranoid mode):
   CODOH_CHURN_INTERVAL_SECS=30
   Expected: ~50% latency increase, maximum snapshot resistance
 
+For MLE (ciphertext-only cache), add --mle flag to benchmark.
+
 EOF
+fi

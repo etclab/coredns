@@ -35,27 +35,26 @@ CODoH (ports 8080/8443):
 
 ```
 benchmark/
-├── run-benchmark.sh              # Main benchmark (ODoH vs CODoH)
-├── run-stochastic-benchmark.sh   # Stochastic defense benchmark
-├── SPEC.md                       # Full specification
-├── README.md                     # This file
-├── top-1m.csv                    # Cisco Umbrella Top 1M domains
-├── top-1k.csv                    # Top 1K domains (for quick tests)
-├── Corefile.odoh-proxy           # ODoH baseline proxy config
-├── Corefile.odoh-target          # ODoH baseline target config
-└── results/                      # Benchmark output
-    ├── <timestamp>/              # Main benchmark results
+├── run-benchmark.sh                  # Main benchmark (ODoH vs CODoH)
+├── run-mle-stochastic-benchmark.sh   # MLE + Stochastic defense benchmark
+├── SPEC.md                           # Full specification
+├── README.md                         # This file
+├── top-1m.csv                        # Cisco Umbrella Top 1M domains
+├── top-1k.csv                        # Top 1K domains (for quick tests)
+├── Corefile.odoh-proxy               # ODoH baseline proxy config
+├── Corefile.odoh-target              # ODoH baseline target config
+└── results/                          # Benchmark output
+    ├── <timestamp>/                  # Main benchmark results
     │   ├── odoh.{csv,json}
     │   ├── codoh_cold.{csv,json}
     │   ├── codoh_zipf.{csv,json}
     │   └── codoh_warm.{csv,json}
-    └── stochastic_<timestamp>/   # Stochastic benchmark results
+    ├── stochastic_<timestamp>/       # Stochastic benchmark results (legacy)
+    └── mle_stochastic_<timestamp>/   # MLE + Stochastic benchmark results
         ├── baseline_zipf.{csv,json}
-        ├── light_zipf.{csv,json}
-        ├── moderate_zipf.{csv,json}
-        ├── heavy_zipf.{csv,json}
-        ├── max_security_zipf.{csv,json}
-        ├── *_enclave.log
+        ├── *_bench.log               # Client benchmark output
+        ├── *_enclave.log             # Enclave logs
+        ├── *_cache_stats.txt         # Cache statistics
         └── comparison_report.txt
 ```
 
@@ -95,6 +94,7 @@ cd ../odoh-client-go && go build -o odoh-client ./cmd/odoh-client.go
 | `--customcert` | - | Path to CA cert for self-signed TLS |
 | `--output` | - | CSV output path |
 | `--summary` | - | JSON summary path |
+| `--mle` | false | Enable MLE (Message-Locked Encryption) mode |
 
 ## Output Format
 
@@ -142,24 +142,27 @@ timestamp,protocol,distribution,query_num,domain,latency_ms,cache_status,success
 
 ---
 
-## Stochastic Defense Benchmark
+## MLE + Stochastic Defense Benchmark
 
-Measures the latency impact of Phase 3 stochastic defenses (hit suppression, non-insertion, churn).
+Measures the latency impact of MLE (ciphertext-only cache) and stochastic defenses (hit suppression, non-insertion, churn).
 
 ### Quick Start
 
 ```bash
-# Quick test (100 iterations, ~2-3 minutes)
-./benchmark/run-stochastic-benchmark.sh --quick
+# MLE mode with quick test (100 iterations)
+./benchmark/run-mle-stochastic-benchmark.sh --mle --quick
 
-# Standard test (500 iterations)
-./benchmark/run-stochastic-benchmark.sh
+# MLE mode with standard test (500 iterations)
+./benchmark/run-mle-stochastic-benchmark.sh --mle
 
-# With ORAM cache + churn test
-./benchmark/run-stochastic-benchmark.sh --oram
+# MLE + ORAM cache + churn test
+./benchmark/run-mle-stochastic-benchmark.sh --mle --oram
+
+# Legacy enclave mode (without MLE)
+./benchmark/run-mle-stochastic-benchmark.sh --quick
 
 # Custom iterations
-./benchmark/run-stochastic-benchmark.sh --iterations=200
+./benchmark/run-mle-stochastic-benchmark.sh --mle --iterations=200
 ```
 
 ### Test Configurations
@@ -173,6 +176,20 @@ Measures the latency impact of Phase 3 stochastic defenses (hit suppression, non
 | max_security | 0.5 | 0.5 | No | Maximum snapshot resistance |
 | oram_churn | 0.1 | 0.9 | 30s | ORAM only, with background eviction |
 
+### MLE Mode
+
+MLE (Message-Locked Encryption) provides ciphertext-only cache - the enclave stores encrypted responses that only the original client can decrypt.
+
+| Aspect | Legacy Enclave | MLE Mode |
+|--------|----------------|----------|
+| Cache content | Plaintext DNS | MLE-encrypted ciphertext |
+| Enclave can decrypt | Yes | No |
+| Cache backend | LRU or ORAM (`--oram`) | **Always ORAM** (hardcoded) |
+| Latency overhead | ~5-10ms | ~25-35ms (Argon2 key derivation) |
+| Privacy | Good | Maximum |
+
+**Note:** The `--oram` flag only affects legacy enclave mode. MLE mode always uses ORAM for access pattern hiding.
+
 ### Stochastic Parameters
 
 | Parameter | Env Variable | Description |
@@ -184,7 +201,7 @@ Measures the latency impact of Phase 3 stochastic defenses (hit suppression, non
 
 ### Output
 
-Results saved to `benchmark/results/stochastic_<timestamp>/`:
+Results saved to `benchmark/results/mle_stochastic_<timestamp>/` (or `stochastic_<timestamp>/` without `--mle`):
 
 | File | Description |
 |------|-------------|
@@ -193,37 +210,48 @@ Results saved to `benchmark/results/stochastic_<timestamp>/`:
 | `*_cache_stats.txt` | Cache behavior summary |
 | `comparison_report.txt` | Side-by-side comparison |
 
-### Example Results
+### Example Results (MLE Mode)
 
 ```
 Config            Mean(ms)    P50(ms)    P95(ms)    P99(ms)    HitRate
 -------           --------    -------    -------    -------    -------
-baseline             12.36      13.84      24.67      27.24      36.0%
-light                12.69      13.75      25.23      28.71      30.0%
-moderate             15.24      13.91      27.11      83.16      21.0%
-heavy                14.11      14.01      25.68      29.52      25.0%
-max_security         15.37      14.17      26.76      28.98      13.0%
+baseline             53.97      63.89      78.84      88.93      38.0%
+light                55.14      63.77      78.98      86.48      31.0%
+moderate             54.07      63.62      75.59      78.14      32.0%
+heavy                59.44      66.45      80.35      91.36      25.0%
+max_security         62.59      65.86      78.00      80.13      12.0%
 
-Config              Hits   Misses Suppressed    Skipped  Churned
--------             ----   ------ ----------    -------  -------
-baseline              36       64          0          0        0
-light                 30       70          4          6        0
-moderate              21       79         10         16        0
-heavy                 25       75         10         20        0
-max_security          13       87         17         46        0
+Config           MLEHits  MLEMiss  MLEStor Suppressed    Skipped  Churned
+-------          -------  -------  ------- ----------    -------  -------
+baseline              38       62       62          0          0        0
+light                 31       69       69          8          4        0
+moderate              32       68       68          6         15        0
+heavy                 25       75       75          9         19        0
+max_security          12       88       88         12         39        0
 ```
+
+Note: MLE mode adds ~22ms latency per query due to Argon2id key derivation (intentional rate-limiting).
 
 ### Recommended Production Settings
 
 ```bash
-# Balanced security/performance (~3% latency overhead)
+# MLE mode with balanced stochastic defenses (recommended)
+# Client: use --mle flag
 CODOH_HIT_SUPPRESSION_PROB=0.1
 CODOH_INSERT_PROB=0.9
+# Expected: ~55ms mean latency, strong privacy
 
-# High security with ORAM (~25% latency overhead)
+# MLE + ORAM + High security
+# Client: use --mle flag
 CODOH_USE_ORAM=true
 CODOH_HIT_SUPPRESSION_PROB=0.2
 CODOH_INSERT_PROB=0.8
 CODOH_CHURN_ENABLED=true
 CODOH_CHURN_INTERVAL_SECS=60
+# Expected: ~65ms mean latency, maximum privacy
+
+# Legacy enclave mode (without MLE, lower latency)
+CODOH_HIT_SUPPRESSION_PROB=0.1
+CODOH_INSERT_PROB=0.9
+# Expected: ~12ms mean latency, good privacy
 ```

@@ -121,6 +121,19 @@ func main() {
 	// Remove stale socket
 	os.Remove(cfg.SocketPath)
 
+	// Initialize MLE cache (always uses ORAM)
+	mleCacheCfg := enclave.ORAMCacheConfig{
+		Capacity:     cfg.CacheSize,
+		BlockSize:    cfg.ORAMBlockSize,
+		BucketSize:   5,
+		ConstantTime: true,
+	}
+	mleCache, err := enclave.NewMLECacheWithStochastic(mleCacheCfg, stochasticCfg)
+	if err != nil {
+		log.Fatalf("Failed to create MLE cache: %v", err)
+	}
+	log.Printf("MLE cache initialized: capacity=%d, block_size=%d", cfg.CacheSize, cfg.ORAMBlockSize)
+
 	// Create handler
 	handler := &EnclaveHandler{
 		keypair:             keypair,
@@ -128,6 +141,7 @@ func main() {
 		spentSet:            spentSet,
 		cache:               cache,
 		oramCache:           oramCache,
+		mleCache:            mleCache,
 		targetSigningPubKey: provData.SigningPublicKey,
 		ready:               true, // Ready after provisioning
 	}
@@ -227,6 +241,7 @@ type EnclaveHandler struct {
 	spentSet            *enclave.SpentSet
 	cache               enclave.Cache
 	oramCache           *enclave.ORAMCache // nil if not using ORAM (for stash monitoring)
+	mleCache            *enclave.MLECache  // MLE cache for ciphertext-only storage
 	targetSigningPubKey ed25519.PublicKey  // Target's Ed25519 public key for signature verification
 	ready               bool
 	mu                  sync.RWMutex
@@ -434,4 +449,174 @@ func (h *EnclaveHandler) logCacheOp(op, query string) {
 	} else {
 		log.Printf("Cache %s for %s, cache_size=%d", op, query, h.cache.Size())
 	}
+}
+
+// HandleMLELookup handles MLE cache lookup requests.
+// 1. Decrypt MLEBlobB
+// 2. Verify epoch (E or E-1)
+// 3. Verify token FIRST
+// 4. Check spent set
+// 5. Lookup by tag
+// 6. If hit: WrapMLEResponse(Kc, exp, ciphertext)
+func (h *EnclaveHandler) HandleMLELookup(blobB, clientIP string) *enclave.Response {
+	// Check epoch rotation
+	if rotated, err := h.epochMgr.RotateIfNeeded(); err != nil {
+		log.Printf("Epoch rotation error: %v", err)
+	} else if rotated {
+		newEpoch := h.epochMgr.CurrentEpoch()
+		log.Printf("Epoch rotated to %d, clearing spent set", newEpoch)
+		h.spentSet.Clear(newEpoch)
+	}
+
+	// Decode blob B
+	blobBytes, err := base64.StdEncoding.DecodeString(blobB)
+	if err != nil {
+		return &enclave.Response{
+			Status: enclave.StatusError,
+			Error:  enclave.ErrInvalidBlob,
+		}
+	}
+
+	// Decrypt and parse MLEBlobB
+	blob, err := h.keypair.DecryptMLEBlobB(blobBytes)
+	if err != nil {
+		log.Printf("MLE decrypt failed: %v", err)
+		return &enclave.Response{
+			Status: enclave.StatusError,
+			Error:  enclave.ErrDecryptFailed,
+		}
+	}
+
+	log.Printf("MLE lookup: epoch=%d tag=%x client=%s", blob.Epoch, blob.Tag[:8], clientIP)
+
+	// Verify epoch (current or previous for grace period)
+	currentEpoch := h.epochMgr.CurrentEpoch()
+	if blob.Epoch != currentEpoch && blob.Epoch != currentEpoch-1 {
+		log.Printf("MLE token expired: token epoch %d not in [%d, %d]",
+			blob.Epoch, currentEpoch-1, currentEpoch)
+		return &enclave.Response{
+			Status: enclave.StatusError,
+			Error:  enclave.ErrTokenExpired,
+		}
+	}
+
+	// Verify token FIRST (before any cache operation)
+	if !h.epochMgr.Verify(blob.Epoch, blob.TokenInput, blob.TokenOutput) {
+		log.Printf("MLE token verification failed")
+		return &enclave.Response{
+			Status: enclave.StatusError,
+			Error:  enclave.ErrInvalidToken,
+		}
+	}
+
+	// Check spent set
+	tokenID := append(blob.TokenInput, blob.TokenOutput...)
+	if !h.spentSet.MarkSpent(tokenID) {
+		log.Printf("MLE token already spent")
+		return &enclave.Response{
+			Status: enclave.StatusError,
+			Error:  enclave.ErrTokenSpent,
+		}
+	}
+
+	log.Printf("MLE token verified and marked spent, spent set size: %d", h.spentSet.Size())
+
+	// Lookup by tag in MLE cache
+	entry, ok := h.mleCache.Get(blob.Tag)
+	if !ok {
+		// Cache miss
+		h.logMLECacheOp("miss", blob.Tag)
+		return &enclave.Response{
+			Status: enclave.StatusMiss,
+			Kc:     base64.StdEncoding.EncodeToString(blob.Kc),
+		}
+	}
+
+	// Cache hit - wrap response under client's Kc
+	wrapped, err := enclave.WrapMLEResponse(blob.Kc, entry.Exp, entry.Ciphertext)
+	if err != nil {
+		log.Printf("MLE wrap failed: %v", err)
+		return &enclave.Response{
+			Status: enclave.StatusError,
+			Error:  enclave.ErrInternal,
+		}
+	}
+
+	h.logMLECacheOp("hit", blob.Tag)
+	return &enclave.Response{
+		Status:   enclave.StatusHit,
+		Response: base64.StdEncoding.EncodeToString(wrapped),
+		Exp:      entry.Exp,
+	}
+}
+
+// HandleMLEStore handles MLE cache store requests from target.
+// 1. Decrypt MLEInsertBlob
+// 2. Verify signature: Sign_T(epoch || tag || exp || SHA256(C))
+// 3. Check expiry not in past
+// 4. Store in MLECache
+func (h *EnclaveHandler) HandleMLEStore(mleInsertBlob string) *enclave.Response {
+	// Decode base64
+	ciphertext, err := base64.StdEncoding.DecodeString(mleInsertBlob)
+	if err != nil {
+		log.Printf("MLE store: invalid base64 encoding")
+		return &enclave.Response{
+			Status: enclave.StatusError,
+			Error:  "invalid_encoding",
+		}
+	}
+
+	// Decrypt and parse MLEInsertBlob
+	blob, err := h.keypair.DecryptMLEInsertBlob(ciphertext)
+	if err != nil {
+		log.Printf("MLE store: decrypt failed: %v", err)
+		return &enclave.Response{
+			Status: enclave.StatusError,
+			Error:  enclave.ErrDecryptFailed,
+		}
+	}
+
+	log.Printf("MLE store: epoch=%d tag=%x exp=%d ctLen=%d",
+		blob.Epoch, blob.Tag[:8], blob.Exp, len(blob.Ciphertext))
+
+	// Verify signature if signing key is configured
+	if len(h.targetSigningPubKey) > 0 {
+		// Compute signature input
+		toVerify := enclave.ComputeMLESignatureInput(blob.Epoch, blob.Tag, blob.Exp, blob.Ciphertext)
+
+		if !ed25519.Verify(h.targetSigningPubKey, toVerify, blob.Signature) {
+			log.Printf("MLE store: signature verification failed")
+			return &enclave.Response{
+				Status: enclave.StatusError,
+				Error:  enclave.ErrInvalidSignature,
+			}
+		}
+		log.Printf("MLE store: signature verified")
+	}
+
+	// Check expiry not in past
+	if blob.Exp <= time.Now().Unix() {
+		log.Printf("MLE store: entry already expired (exp=%d, now=%d)", blob.Exp, time.Now().Unix())
+		return &enclave.Response{
+			Status: enclave.StatusError,
+			Error:  enclave.ErrEntryExpired,
+		}
+	}
+
+	// Store in MLE cache
+	entry := &enclave.MLECacheEntry{
+		Tag:        blob.Tag,
+		Exp:        blob.Exp,
+		Ciphertext: blob.Ciphertext,
+	}
+	h.mleCache.Put(entry)
+
+	h.logMLECacheOp("store", blob.Tag)
+	return &enclave.Response{Status: enclave.StatusOK}
+}
+
+// logMLECacheOp logs MLE cache operations with stash size.
+func (h *EnclaveHandler) logMLECacheOp(op string, tag [16]byte) {
+	log.Printf("MLE cache %s for tag=%x, cache_size=%d, stash_size=%d",
+		op, tag[:8], h.mleCache.Size(), h.mleCache.StashSize())
 }

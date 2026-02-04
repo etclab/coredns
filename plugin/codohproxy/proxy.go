@@ -147,6 +147,7 @@ func (p *odohProxy) healthHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 const codohCachedContentType = "application/codoh-cached"
+const codohMLECachedContentType = "application/codoh-mle-cached"
 
 func (p *odohProxy) proxyHandler(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
@@ -239,8 +240,17 @@ func (p *odohProxy) handleEnclaveFlow(w http.ResponseWriter, r *http.Request, st
 	// Get client IP
 	clientIP := getClientIP(r)
 
+	// Check for MLE mode (BlobBv2 uses mle_lookup)
+	mleMode := r.Header.Get("X-MLE-Mode") == "true"
+
 	// Send to enclave
-	enclaveResp, err := p.enclaveClient.ProcessRequest(blobB, clientIP)
+	var enclaveResp *EnclaveResponse
+	var err error
+	if mleMode {
+		enclaveResp, err = p.enclaveClient.MLELookup(blobB, clientIP)
+	} else {
+		enclaveResp, err = p.enclaveClient.ProcessRequest(blobB, clientIP)
+	}
 	if err != nil {
 		log.Errorf("Enclave process error: %v", err)
 		if p.enclaveBypassOnFail {
@@ -262,16 +272,28 @@ func (p *odohProxy) handleEnclaveFlow(w http.ResponseWriter, r *http.Request, st
 			proxyRequestsTotal.WithLabelValues("error").Inc()
 			return
 		}
-		w.Header().Set("Content-Type", codohCachedContentType)
+		contentType := codohCachedContentType
+		if mleMode {
+			contentType = codohMLECachedContentType
+		}
+		w.Header().Set("Content-Type", contentType)
 		w.WriteHeader(http.StatusOK)
 		w.Write(respBytes)
-		proxyRequestsTotal.WithLabelValues("cache_hit").Inc()
+		if mleMode {
+			proxyRequestsTotal.WithLabelValues("mle_cache_hit").Inc()
+		} else {
+			proxyRequestsTotal.WithLabelValues("cache_hit").Inc()
+		}
 		proxyLatencySeconds.Observe(time.Since(start).Seconds())
 		return
 
 	case statusMiss:
 		// Cache miss - forward to target, then store in cache
-		p.handleCacheMiss(w, r, enclaveResp, start)
+		if mleMode {
+			p.handleMLECacheMiss(w, r, enclaveResp, start)
+		} else {
+			p.handleCacheMiss(w, r, enclaveResp, start)
+		}
 		return
 
 	case statusError:
@@ -380,6 +402,89 @@ func (p *odohProxy) handleCacheMiss(w http.ResponseWriter, r *http.Request, encl
 	w.Write(respBody)
 
 	proxyRequestsTotal.WithLabelValues("cache_miss").Inc()
+	proxyLatencySeconds.Observe(time.Since(start).Seconds())
+}
+
+// handleMLECacheMiss forwards the request to target and stores the MLE response in cache.
+func (p *odohProxy) handleMLECacheMiss(w http.ResponseWriter, r *http.Request, enclaveResp *EnclaveResponse, start time.Time) {
+	// Read ODoH query body
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read body", http.StatusBadRequest)
+		proxyRequestsTotal.WithLabelValues("error").Inc()
+		return
+	}
+	defer r.Body.Close()
+
+	// Build target URL
+	targetURL := p.targetURL
+	if targetHost := r.URL.Query().Get("targethost"); targetHost != "" {
+		targetPath := r.URL.Query().Get("targetpath")
+		if targetPath == "" {
+			targetPath = "/dns-query"
+		}
+		targetURL = "https://" + targetHost + targetPath
+	}
+
+	// Forward to target
+	req, err := http.NewRequest(http.MethodPost, targetURL, bytes.NewReader(body))
+	if err != nil {
+		http.Error(w, "Failed to create request", http.StatusInternalServerError)
+		proxyRequestsTotal.WithLabelValues("error").Inc()
+		return
+	}
+	req.Header.Set("Content-Type", odohContentType)
+
+	// Forward blob B to target for signature binding
+	if blobB := r.Header.Get("X-ODoH-Blob"); blobB != "" {
+		req.Header.Set("X-ODoH-Blob", blobB)
+	}
+
+	// Forward MLE mode indicator so target prepares MLE insert blob
+	req.Header.Set("X-MLE-Mode", "true")
+
+	// Include enclave public key for MLE cache encryption
+	var enclavePubKey string
+	if p.enclaveClient != nil {
+		enclavePubKey, _ = p.enclaveClient.GetPublicKey()
+		if enclavePubKey != "" {
+			req.Header.Set("X-Enclave-PubKey", enclavePubKey)
+		}
+	}
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		http.Error(w, "Target request failed", http.StatusBadGateway)
+		proxyRequestsTotal.WithLabelValues("error").Inc()
+		return
+	}
+	defer resp.Body.Close()
+
+	// Read target response
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		http.Error(w, "Failed to read target response", http.StatusBadGateway)
+		proxyRequestsTotal.WithLabelValues("error").Inc()
+		return
+	}
+
+	// Store MLE insert blob from target
+	if mleInsertBlob := resp.Header.Get("X-MLE-Insert-Blob"); mleInsertBlob != "" {
+		go func() {
+			if err := p.enclaveClient.MLEStore(mleInsertBlob); err != nil {
+				log.Errorf("Failed to store MLE cache entry: %v", err)
+			} else {
+				log.Debug("Stored MLE cache entry")
+			}
+		}()
+	}
+
+	// Relay response back to client
+	w.Header().Set("Content-Type", odohContentType)
+	w.WriteHeader(resp.StatusCode)
+	w.Write(respBody)
+
+	proxyRequestsTotal.WithLabelValues("mle_cache_miss").Inc()
 	proxyLatencySeconds.Observe(time.Since(start).Seconds())
 }
 

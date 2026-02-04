@@ -46,6 +46,9 @@ type odohTarget struct {
 	signingKeyPath string
 	signingKey     *SigningKey
 
+	// MLE salt manager
+	saltManager *SaltManager
+
 	keyPair   odoh.ObliviousDoHKeyPair
 	dnsClient *dns.Client
 
@@ -144,6 +147,11 @@ func (t *odohTarget) OnStartup() error {
 	if t.tokenEnabled {
 		t.mux.HandleFunc("/token", t.tokenHandler)
 		t.mux.HandleFunc("/verify", t.verifyHandler)
+
+		// MLE salt endpoint
+		t.saltManager = NewSaltManager(int64(t.epochDuration.Seconds()))
+		t.mux.HandleFunc("/.well-known/codoh-salt", t.saltManager.ServeHTTP)
+		log.Infof("MLE salt endpoint enabled at /.well-known/codoh-salt")
 	}
 
 	t.srv = &http.Server{
@@ -303,6 +311,12 @@ func (t *odohTarget) odohQueryHandler(w http.ResponseWriter, r *http.Request) {
 
 					w.Header().Set("X-Enclave-Cache-Sig", base64.StdEncoding.EncodeToString(signature))
 					w.Header().Set("X-Enclave-Cache-Query", canonicalQuery)
+				}
+
+				// Prepare MLE insert blob (for ciphertext-only cache)
+				// Only run expensive Argon2 derivation when client requests MLE mode
+				if t.saltManager != nil && r.Header.Get("X-MLE-Mode") == "true" {
+					t.prepareMLE(w, pubKeyBytes, dnsQuery, packedResponse, ttl)
 				}
 			} else {
 				log.Warningf("Failed to encrypt for enclave cache: %v", err)
@@ -465,4 +479,74 @@ func getClientIP(r *http.Request) net.IP {
 	// Fall back to RemoteAddr
 	host, _, _ := net.SplitHostPort(r.RemoteAddr)
 	return net.ParseIP(host)
+}
+
+// prepareMLE prepares an MLE cache insert blob for the enclave.
+// Called on cache miss when enclave public key is provided.
+// This performs:
+// 1. Get epoch salt
+// 2. Canonicalize query
+// 3. DeriveMLEKey (Argon2id ~300ms)
+// 4. ComputeMLETag
+// 5. MLEEncrypt response
+// 6. Compute expiry
+// 7. Sign: ComputeMLESignatureInput -> Ed25519
+// 8. Build insert blob
+// 9. HPKE encrypt for enclave
+// 10. Set header: X-MLE-Insert-Blob
+func (t *odohTarget) prepareMLE(w http.ResponseWriter, pubKeyBytes []byte, dnsQuery *dns.Msg, response []byte, ttl uint32) {
+	// 1. Get epoch salt
+	if t.saltManager == nil {
+		log.Warning("MLE: salt manager not initialized")
+		return
+	}
+	epoch, salt, _ := t.saltManager.GetCurrentSalt()
+
+	// 2. Canonicalize query
+	if len(dnsQuery.Question) == 0 {
+		log.Warning("MLE: no question in DNS query")
+		return
+	}
+	q := dnsQuery.Question[0]
+	canonicalQuery := fmt.Sprintf("%s:%d", strings.ToLower(q.Name), q.Qtype)
+
+	// 3. DeriveMLEKey (Argon2id - expensive, ~300ms)
+	mleKey := DeriveMLEKey(canonicalQuery, salt)
+
+	// 4. ComputeMLETag
+	mleTag := ComputeMLETag(mleKey)
+
+	// 5. MLEEncrypt response
+	ciphertext, err := MLEEncrypt(mleKey, response)
+	if err != nil {
+		log.Warningf("MLE: encryption failed: %v", err)
+		return
+	}
+
+	// 6. Compute expiry (current time + TTL)
+	exp := time.Now().Unix() + int64(ttl)
+
+	// 7. Sign: ComputeMLESignatureInput -> Ed25519
+	var signature []byte
+	if t.signingKey != nil {
+		toSign := ComputeMLESignatureInput(uint32(epoch), mleTag, exp, ciphertext)
+		signature = t.signingKey.Sign(toSign)
+	} else {
+		// No signing key - use zeros (enclave will skip verification)
+		signature = make([]byte, 64)
+	}
+
+	// 8. Build insert blob
+	insertBlob := BuildMLEInsertBlob(uint32(epoch), mleTag, exp, signature, ciphertext)
+
+	// 9. HPKE encrypt for enclave
+	encrypted, err := EncryptForEnclave(pubKeyBytes, insertBlob)
+	if err != nil {
+		log.Warningf("MLE: HPKE encryption failed: %v", err)
+		return
+	}
+
+	// 10. Set header
+	w.Header().Set("X-MLE-Insert-Blob", base64.StdEncoding.EncodeToString(encrypted))
+	log.Debugf("MLE: prepared insert blob for tag=%x epoch=%d exp=%d", mleTag[:8], epoch, exp)
 }
