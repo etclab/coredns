@@ -11,9 +11,9 @@ import (
 )
 
 // EnclaveClient communicates with the SGX enclave over Unix socket.
+// Each IPC call opens a new per-request connection (~50µs for Unix socket).
 type EnclaveClient struct {
 	socketPath string
-	conn       net.Conn
 	mu         sync.Mutex
 	healthy    bool
 }
@@ -24,11 +24,6 @@ const (
 	msgTypeStoreEncrypted = "store_encrypted"
 	msgTypeGetPubKey      = "get_pubkey"
 	msgTypeHealth         = "health"
-	msgTypeReady          = "ready" // Returns provisioning status
-
-	// MLE message types
-	msgTypeMLELookup = "mle_lookup"
-	msgTypeMLEStore  = "mle_store"
 )
 
 // IPC Response Status
@@ -41,31 +36,18 @@ const (
 
 // EnclaveRequest is the IPC request to the enclave.
 type EnclaveRequest struct {
-	Type              string `json:"type"`
-	BlobB             string `json:"blob_b,omitempty"`
-	ClientIP          string `json:"client_ip,omitempty"`
-	Query             string `json:"query,omitempty"`
-	Response          string `json:"response,omitempty"`
-	EncryptedResponse string `json:"encrypted_response,omitempty"`
-	Signature         string `json:"signature,omitempty"` // Base64 Ed25519 signature
-	TTL               int    `json:"ttl,omitempty"`
-
-	// MLE fields
-	MLEInsertBlob string `json:"mle_insert_blob,omitempty"` // Base64 HPKE-encrypted MLE insert blob
+	Type          string `json:"type"`
+	QE            string `json:"qe,omitempty"`             // base64 Q_E for process
+	EncryptedBlob string `json:"encrypted_blob,omitempty"` // base64 HPKE-encrypted cache-insert blob
+	Signature     string `json:"signature,omitempty"`       // base64 Ed25519 signature
 }
 
 // EnclaveResponse is the IPC response from the enclave.
 type EnclaveResponse struct {
 	Status   string `json:"status"`
-	Response string `json:"response,omitempty"`
-	Query    string `json:"query,omitempty"`
-	Kc       string `json:"kc,omitempty"`
+	Response string `json:"response,omitempty"` // base64, encrypted response blob (hit or dummy)
 	Error    string `json:"error,omitempty"`
-	PubKey   string `json:"pubkey,omitempty"`
-	Ready    bool   `json:"ready,omitempty"` // For ready check (provisioning status)
-
-	// MLE fields
-	Exp int64 `json:"exp,omitempty"` // Expiry timestamp for MLE cache hit
+	PubKey   string `json:"pubkey,omitempty"` // base64, for get_pubkey
 }
 
 // NewEnclaveClient creates a new enclave client.
@@ -76,45 +58,18 @@ func NewEnclaveClient(socketPath string) *EnclaveClient {
 	}
 }
 
-// Connect establishes a connection to the enclave.
-func (c *EnclaveClient) Connect() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.conn != nil {
-		c.conn.Close()
-	}
-
-	conn, err := net.DialTimeout("unix", c.socketPath, 5*time.Second)
-	if err != nil {
-		c.healthy = false
-		return fmt.Errorf("connect to enclave: %w", err)
-	}
-
-	c.conn = conn
-	c.healthy = true
-	return nil
-}
-
-// Close closes the connection.
-func (c *EnclaveClient) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.conn != nil {
-		err := c.conn.Close()
-		c.conn = nil
-		c.healthy = false
-		return err
-	}
-	return nil
-}
-
-// IsHealthy returns whether the enclave connection is healthy.
+// IsHealthy returns whether the enclave is reachable.
 func (c *EnclaveClient) IsHealthy() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.healthy
+}
+
+// setHealthy updates the health status.
+func (c *EnclaveClient) setHealthy(h bool) {
+	c.mu.Lock()
+	c.healthy = h
+	c.mu.Unlock()
 }
 
 // GetPublicKey retrieves the enclave's HPKE public key.
@@ -129,50 +84,28 @@ func (c *EnclaveClient) GetPublicKey() (string, error) {
 	return resp.PubKey, nil
 }
 
-// ProcessRequest sends a blob B to the enclave for processing.
-// Returns the response from the enclave.
-func (c *EnclaveClient) ProcessRequest(blobB, clientIP string) (*EnclaveResponse, error) {
+// ProcessQE sends a Q_E to the enclave for HPKE decryption + cache lookup.
+// Returns the enclave response (hit with encrypted cached response, or miss with dummy).
+func (c *EnclaveClient) ProcessQE(qe string) (*EnclaveResponse, error) {
 	return c.sendRequest(&EnclaveRequest{
-		Type:     msgTypeProcess,
-		BlobB:    blobB,
-		ClientIP: clientIP,
+		Type: msgTypeProcess,
+		QE:   qe,
 	})
 }
 
-// StoreEncrypted stores an HPKE-encrypted DNS response in the enclave cache.
-// The enclave will decrypt it using its private key before storing.
-func (c *EnclaveClient) StoreEncrypted(query, encryptedResponse string, ttl int) error {
+// StoreCacheInsert sends an HPKE-encrypted cache-insert bundle + signature to the enclave.
+// Fire-and-forget: caller doesn't need to check the response.
+func (c *EnclaveClient) StoreCacheInsert(encryptedBlob, signature string) error {
 	resp, err := c.sendRequest(&EnclaveRequest{
-		Type:              msgTypeStoreEncrypted,
-		Query:             query,
-		EncryptedResponse: encryptedResponse,
-		TTL:               ttl,
+		Type:          msgTypeStoreEncrypted,
+		EncryptedBlob: encryptedBlob,
+		Signature:     signature,
 	})
 	if err != nil {
 		return err
 	}
 	if resp.Status != statusOK {
-		return fmt.Errorf("store encrypted failed: %s", resp.Error)
-	}
-	return nil
-}
-
-// StoreEncryptedWithSig stores an HPKE-encrypted DNS response with signature verification.
-// The enclave will verify the signature before storing.
-func (c *EnclaveClient) StoreEncryptedWithSig(query, encryptedResponse, signature, blobB string, ttl int) error {
-	resp, err := c.sendRequest(&EnclaveRequest{
-		Type:              msgTypeStoreEncrypted,
-		Query:             query,
-		EncryptedResponse: encryptedResponse,
-		Signature:         signature,
-		BlobB:             blobB,
-		TTL:               ttl,
-	})
-	if err != nil {
-		return err
-	}
-	if resp.Status != statusOK {
-		return fmt.Errorf("store encrypted with sig failed: %s", resp.Error)
+		return fmt.Errorf("store cache insert failed: %s", resp.Error)
 	}
 	return nil
 }
@@ -181,72 +114,27 @@ func (c *EnclaveClient) StoreEncryptedWithSig(query, encryptedResponse, signatur
 func (c *EnclaveClient) CheckHealth() error {
 	resp, err := c.sendRequest(&EnclaveRequest{Type: msgTypeHealth})
 	if err != nil {
-		c.mu.Lock()
-		c.healthy = false
-		c.mu.Unlock()
+		c.setHealthy(false)
 		return err
 	}
 	if resp.Status != statusOK {
-		c.mu.Lock()
-		c.healthy = false
-		c.mu.Unlock()
+		c.setHealthy(false)
 		return fmt.Errorf("health check failed: %s", resp.Error)
 	}
-	c.mu.Lock()
-	c.healthy = true
-	c.mu.Unlock()
+	c.setHealthy(true)
 	return nil
 }
 
-// CheckReady checks if the enclave has been provisioned and is ready.
-func (c *EnclaveClient) CheckReady() (bool, error) {
-	resp, err := c.sendRequest(&EnclaveRequest{Type: msgTypeReady})
-	if err != nil {
-		return false, err
-	}
-	if resp.Status != statusOK {
-		return false, fmt.Errorf("ready check failed: %s", resp.Error)
-	}
-	return resp.Ready, nil
-}
-
-// MLELookup sends an MLE lookup request to the enclave.
-// blobB is the base64-encoded HPKE-encrypted BlobBv2.
-func (c *EnclaveClient) MLELookup(blobB, clientIP string) (*EnclaveResponse, error) {
-	return c.sendRequest(&EnclaveRequest{
-		Type:     msgTypeMLELookup,
-		BlobB:    blobB,
-		ClientIP: clientIP,
-	})
-}
-
-// MLEStore sends an MLE store request to the enclave.
-// mleInsertBlob is the base64-encoded HPKE-encrypted MLEInsertBlob from target.
-func (c *EnclaveClient) MLEStore(mleInsertBlob string) error {
-	resp, err := c.sendRequest(&EnclaveRequest{
-		Type:          msgTypeMLEStore,
-		MLEInsertBlob: mleInsertBlob,
-	})
-	if err != nil {
-		return err
-	}
-	if resp.Status != statusOK {
-		return fmt.Errorf("MLE store failed: %s", resp.Error)
-	}
-	return nil
-}
-
-// sendRequest sends a request to the enclave and returns the response.
+// sendRequest opens a new Unix socket connection, sends the request, reads the response, and closes.
 func (c *EnclaveClient) sendRequest(req *EnclaveRequest) (*EnclaveResponse, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.conn == nil {
-		return nil, fmt.Errorf("not connected to enclave")
+	conn, err := net.DialTimeout("unix", c.socketPath, 5*time.Second)
+	if err != nil {
+		c.setHealthy(false)
+		return nil, fmt.Errorf("connect to enclave: %w", err)
 	}
+	defer conn.Close()
 
-	// Set deadline
-	c.conn.SetDeadline(time.Now().Add(10 * time.Second))
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
 
 	// Marshal request
 	payload, err := json.Marshal(req)
@@ -255,40 +143,39 @@ func (c *EnclaveClient) sendRequest(req *EnclaveRequest) (*EnclaveResponse, erro
 	}
 
 	// Write length prefix + payload
-	if err := binary.Write(c.conn, binary.BigEndian, uint32(len(payload))); err != nil {
-		c.healthy = false
+	if err := binary.Write(conn, binary.BigEndian, uint32(len(payload))); err != nil {
+		c.setHealthy(false)
 		return nil, fmt.Errorf("write length: %w", err)
 	}
-	if _, err := c.conn.Write(payload); err != nil {
-		c.healthy = false
+	if _, err := conn.Write(payload); err != nil {
+		c.setHealthy(false)
 		return nil, fmt.Errorf("write payload: %w", err)
 	}
 
 	// Read response length
 	var length uint32
-	if err := binary.Read(c.conn, binary.BigEndian, &length); err != nil {
-		c.healthy = false
+	if err := binary.Read(conn, binary.BigEndian, &length); err != nil {
+		c.setHealthy(false)
 		return nil, fmt.Errorf("read length: %w", err)
 	}
 
-	// Sanity check
 	if length > 1<<20 {
-		c.healthy = false
+		c.setHealthy(false)
 		return nil, fmt.Errorf("response too large: %d", length)
 	}
 
 	// Read response payload
 	respPayload := make([]byte, length)
-	if _, err := io.ReadFull(c.conn, respPayload); err != nil {
-		c.healthy = false
+	if _, err := io.ReadFull(conn, respPayload); err != nil {
+		c.setHealthy(false)
 		return nil, fmt.Errorf("read payload: %w", err)
 	}
 
-	// Unmarshal response
 	var resp EnclaveResponse
 	if err := json.Unmarshal(respPayload, &resp); err != nil {
 		return nil, fmt.Errorf("unmarshal response: %w", err)
 	}
 
+	c.setHealthy(true)
 	return &resp, nil
 }

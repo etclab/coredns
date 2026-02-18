@@ -13,7 +13,7 @@
         epoch_duration 1h
         rate_limit 10000  # High limit for benchmarking
         master_secret dev-master-secret.txt
-
+        signing_key /tmp/target-signing.pem
         log_queries true
     }
 

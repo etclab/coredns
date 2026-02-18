@@ -3,7 +3,6 @@ package codohtarget
 import (
 	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/pem"
 	"errors"
 	"os"
@@ -84,11 +83,3 @@ func (s *SigningKey) PublicKeyBytes() []byte {
 	return s.PublicKey
 }
 
-// ComputeSignatureInput computes H(response || query || blobB) for signing.
-func ComputeSignatureInput(response []byte, query, blobB string) []byte {
-	h := sha256.New()
-	h.Write(response)
-	h.Write([]byte(query))
-	h.Write([]byte(blobB))
-	return h.Sum(nil)
-}

@@ -2,7 +2,6 @@ package enclave
 
 import (
 	"container/list"
-	"log"
 	"sync"
 	"time"
 )
@@ -10,8 +9,7 @@ import (
 // CacheEntry holds a cached DNS response.
 type CacheEntry struct {
 	Query     string    // Canonicalized query key
-	Response  []byte    // Encrypted DNS response (under k_c)
-	Kc        []byte    // Client's ephemeral key for decryption
+	Response  []byte    // Plaintext DNS response
 	ExpiresAt time.Time // TTL expiry
 }
 
@@ -22,7 +20,7 @@ type LRUCache struct {
 	lru      *list.List               // front = most recent, back = least recent
 	mu       sync.RWMutex
 
-	// Stochastic defenses
+	// Stochastic defenses (churn only after Sprint 1)
 	stochastic StochasticConfig
 	rng        *SecureRNG
 }
@@ -44,56 +42,39 @@ func NewLRUCacheWithStochastic(capacity int, stochastic StochasticConfig) *LRUCa
 }
 
 // Get retrieves a cached response for the given query.
-// Returns the response bytes and k_c if found and not expired.
-// Returns nil, nil, false if not found or expired.
-func (c *LRUCache) Get(query string) ([]byte, []byte, bool) {
+// Returns the plaintext response if found and not expired.
+func (c *LRUCache) Get(query string) ([]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	elem, ok := c.cache[query]
 	if !ok {
-		return nil, nil, false
+		return nil, false
 	}
 
 	entry := elem.Value.(*CacheEntry)
 
 	// Check TTL
 	if time.Now().After(entry.ExpiresAt) {
-		// Expired, remove from cache
 		c.removeElement(elem)
-		return nil, nil, false
-	}
-
-	// Apply stochastic hit suppression
-	if c.stochastic.ShouldSuppressHit(c.rng) {
-		log.Printf("LRUCache: suppressing hit (p_fn=%.2f)", c.stochastic.HitSuppressionProb)
-		return nil, nil, false
+		return nil, false
 	}
 
 	// Move to front (most recently used)
 	c.lru.MoveToFront(elem)
 
-	return entry.Response, entry.Kc, true
+	return entry.Response, true
 }
 
-// Put stores a response in the cache.
-// The response is stored with the provided k_c for later retrieval.
-func (c *LRUCache) Put(query string, response, kc []byte, ttl time.Duration) {
+// Put stores a plaintext DNS response in the cache.
+func (c *LRUCache) Put(query string, response []byte, ttl time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Apply stochastic non-insertion
-	if !c.stochastic.ShouldInsert(c.rng) {
-		log.Printf("LRUCache: skipping insert (p_ins=%.2f)", c.stochastic.InsertProb)
-		return
-	}
-
 	// Check if already exists
 	if elem, ok := c.cache[query]; ok {
-		// Update existing entry
 		entry := elem.Value.(*CacheEntry)
 		entry.Response = response
-		entry.Kc = kc
 		entry.ExpiresAt = time.Now().Add(ttl)
 		c.lru.MoveToFront(elem)
 		return
@@ -104,11 +85,9 @@ func (c *LRUCache) Put(query string, response, kc []byte, ttl time.Duration) {
 		c.evictOldest()
 	}
 
-	// Add new entry
 	entry := &CacheEntry{
 		Query:     query,
 		Response:  response,
-		Kc:        kc,
 		ExpiresAt: time.Now().Add(ttl),
 	}
 	elem := c.lru.PushFront(entry)
@@ -116,7 +95,6 @@ func (c *LRUCache) Put(query string, response, kc []byte, ttl time.Duration) {
 }
 
 // evictOldest removes the least recently used entry.
-// Must be called with lock held.
 func (c *LRUCache) evictOldest() {
 	elem := c.lru.Back()
 	if elem != nil {
@@ -125,7 +103,6 @@ func (c *LRUCache) evictOldest() {
 }
 
 // removeElement removes an element from the cache.
-// Must be called with lock held.
 func (c *LRUCache) removeElement(elem *list.Element) {
 	entry := elem.Value.(*CacheEntry)
 	delete(c.cache, entry.Query)
@@ -151,7 +128,6 @@ func (c *LRUCache) Clear() {
 var _ Cache = (*LRUCache)(nil)
 
 // CleanExpired removes all expired entries from the cache.
-// Returns the number of entries removed.
 func (c *LRUCache) CleanExpired() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -159,7 +135,6 @@ func (c *LRUCache) CleanExpired() int {
 	now := time.Now()
 	removed := 0
 
-	// Iterate from back (oldest) to front
 	for elem := c.lru.Back(); elem != nil; {
 		entry := elem.Value.(*CacheEntry)
 		prev := elem.Prev()

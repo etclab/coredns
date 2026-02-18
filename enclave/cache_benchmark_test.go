@@ -14,7 +14,7 @@ func BenchmarkLRUCache_Put(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		query := fmt.Sprintf("query%d.com.", i%10000)
-		cache.Put(query, data, nil, ttl)
+		cache.Put(query, data, ttl)
 	}
 }
 
@@ -26,7 +26,7 @@ func BenchmarkLRUCache_Get(b *testing.B) {
 	// Pre-populate
 	for i := 0; i < 10000; i++ {
 		query := fmt.Sprintf("query%d.com.", i)
-		cache.Put(query, data, nil, ttl)
+		cache.Put(query, data, ttl)
 	}
 
 	b.ResetTimer()
@@ -53,7 +53,7 @@ func BenchmarkORAMCache_Put(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		query := fmt.Sprintf("query%d.com.", i%10000)
-		cache.Put(query, data, nil, ttl)
+		cache.Put(query, data, ttl)
 	}
 }
 
@@ -74,7 +74,7 @@ func BenchmarkORAMCache_Get(b *testing.B) {
 	// Pre-populate
 	for i := 0; i < 1000; i++ {
 		query := fmt.Sprintf("query%d.com.", i)
-		cache.Put(query, data, nil, ttl)
+		cache.Put(query, data, ttl)
 	}
 
 	b.ResetTimer()
@@ -101,7 +101,7 @@ func BenchmarkORAMCache_ConstantTime_Put(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		query := fmt.Sprintf("query%d.com.", i%10000)
-		cache.Put(query, data, nil, ttl)
+		cache.Put(query, data, ttl)
 	}
 }
 
@@ -122,7 +122,7 @@ func BenchmarkORAMCache_ConstantTime_Get(b *testing.B) {
 	// Pre-populate
 	for i := 0; i < 1000; i++ {
 		query := fmt.Sprintf("query%d.com.", i)
-		cache.Put(query, data, nil, ttl)
+		cache.Put(query, data, ttl)
 	}
 
 	b.ResetTimer()

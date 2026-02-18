@@ -1,4 +1,6 @@
-// Package codohproxy implements a stateless ODoH proxy/relay per RFC 9230.
+// Package codohproxy implements the CODoH proxy/relay.
+// It fans out Q_E to the enclave and Q_T to the target in parallel,
+// then streams a two-chunk response: [2-byte len][chunk1][chunk2].
 package codohproxy
 
 import (
@@ -6,11 +8,11 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"strconv"
 	"time"
 
 	clog "github.com/coredns/coredns/plugin/pkg/log"
@@ -21,6 +23,7 @@ import (
 var log = clog.NewWithPlugin("codohproxy")
 
 const odohContentType = "application/oblivious-dns-message"
+const codohResponseContentType = "application/codoh-response"
 
 type odohProxy struct {
 	targetURL          string // https://target:8443/dns-query
@@ -28,13 +31,12 @@ type odohProxy struct {
 	tlsCert            string
 	tlsKey             string
 	insecureSkipVerify bool
-	verifyURL          string // https://target:8443/verify
 
 	// Enclave configuration
-	enclaveEnabled       bool
-	enclaveSocketPath    string
-	enclaveBypassOnFail  bool
-	enclaveClient        *EnclaveClient
+	enclaveEnabled      bool
+	enclaveSocketPath   string
+	enclaveBypassOnFail bool
+	enclaveClient       *EnclaveClient
 
 	client  *http.Client
 	ln      net.Listener
@@ -77,27 +79,19 @@ func (p *odohProxy) OnStartup() error {
 	// Initialize enclave client if enabled
 	if p.enclaveEnabled {
 		p.enclaveClient = NewEnclaveClient(p.enclaveSocketPath)
-		if err := p.enclaveClient.Connect(); err != nil {
+		// Probe health to set initial healthy status
+		if err := p.enclaveClient.CheckHealth(); err != nil {
 			if p.enclaveBypassOnFail {
-				log.Warningf("Enclave connection failed (bypass enabled): %v", err)
+				log.Warningf("Enclave not reachable (bypass enabled): %v", err)
 			} else {
-				return fmt.Errorf("enclave connection failed: %w", err)
+				return fmt.Errorf("enclave not reachable: %w", err)
 			}
 		} else {
-			log.Infof("Connected to enclave at %s", p.enclaveSocketPath)
-
-			// Wait for enclave to be ready (provisioned)
-			if err := p.waitForEnclaveReady(30 * time.Second); err != nil {
-				if p.enclaveBypassOnFail {
-					log.Warningf("Enclave not ready (bypass enabled): %v", err)
-				} else {
-					return fmt.Errorf("enclave not ready: %w", err)
-				}
-			}
+			log.Infof("Enclave reachable at %s", p.enclaveSocketPath)
 		}
 	}
 
-	// Setup HTTP routes (consistent with Cloudflare odoh-client-go)
+	// Setup HTTP routes
 	p.mux = http.NewServeMux()
 	p.mux.HandleFunc("/proxy", p.proxyHandler)
 	p.mux.HandleFunc("/health", p.healthHandler)
@@ -122,7 +116,7 @@ func (p *odohProxy) OnStartup() error {
 		}
 	}()
 
-	log.Infof("ODoH proxy listening on %s, target: %s", p.addr, p.targetURL)
+	log.Infof("CODoH proxy listening on %s, target: %s", p.addr, p.targetURL)
 	return nil
 }
 
@@ -130,11 +124,6 @@ func (p *odohProxy) OnFinalShutdown() error {
 	if !p.lnSetup {
 		return nil
 	}
-
-	if p.enclaveClient != nil {
-		p.enclaveClient.Close()
-	}
-
 	p.stop()
 	p.srv.Close()
 	p.lnSetup = false
@@ -146,13 +135,9 @@ func (p *odohProxy) healthHandler(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, "OK")
 }
 
-const codohCachedContentType = "application/codoh-cached"
-const codohMLECachedContentType = "application/codoh-mle-cached"
-
 func (p *odohProxy) proxyHandler(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
-	// Validate method and content type
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		proxyRequestsTotal.WithLabelValues("error").Inc()
@@ -164,331 +149,165 @@ func (p *odohProxy) proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Enclave-first flow
-	if p.enclaveEnabled && p.enclaveClient != nil && p.enclaveClient.IsHealthy() {
-		p.handleEnclaveFlow(w, r, start)
+	// Read Q_E from header
+	qeHeader := r.Header.Get("X-CoDOH-Query")
+
+	// If no Q_E or enclave not available, degrade to standard ODoH relay
+	if qeHeader == "" || !p.enclaveEnabled || p.enclaveClient == nil || !p.enclaveClient.IsHealthy() {
+		p.forwardToTarget(w, r, start)
 		return
 	}
 
-	// Bypass mode: Token verification via target
-	if p.enclaveEnabled && !p.enclaveBypassOnFail {
-		http.Error(w, `{"error":"enclave_unavailable"}`, http.StatusServiceUnavailable)
-		proxyRequestsTotal.WithLabelValues("enclave_down").Inc()
+	// Read Q_T from body
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read body", http.StatusBadRequest)
+		proxyRequestsTotal.WithLabelValues("error").Inc()
 		return
 	}
+	defer r.Body.Close()
 
-	// Token verification fallback
-	if p.verifyURL != "" {
-		token := r.Header.Get("X-ODoH-Token")
-		if token == "" {
-			http.Error(w, `{"error":"token_required"}`, http.StatusBadRequest)
-			proxyRequestsTotal.WithLabelValues("token_missing").Inc()
-			return
-		}
+	// Build target URL
+	targetURL := p.resolveTargetURL(r)
 
-		tokenBytes, err := decodeToken(token)
-		if err != nil {
-			http.Error(w, `{"error":"malformed_token"}`, http.StatusBadRequest)
-			proxyRequestsTotal.WithLabelValues("token_invalid").Inc()
-			return
-		}
-
-		verifyReq, err := http.NewRequest(http.MethodPost, p.verifyURL, bytes.NewReader(tokenBytes))
-		if err != nil {
-			http.Error(w, `{"error":"internal_error"}`, http.StatusInternalServerError)
-			proxyRequestsTotal.WithLabelValues("error").Inc()
-			return
-		}
-		verifyReq.Header.Set("Content-Type", "application/octet-stream")
-
-		verifyResp, err := p.client.Do(verifyReq)
-		if err != nil {
-			log.Errorf("Token verification request failed: %v", err)
-			http.Error(w, `{"error":"verification_failed"}`, http.StatusBadGateway)
-			proxyRequestsTotal.WithLabelValues("verify_error").Inc()
-			return
-		}
-		verifyResp.Body.Close()
-
-		if verifyResp.StatusCode != http.StatusOK {
-			http.Error(w, `{"error":"token_invalid"}`, http.StatusForbidden)
-			proxyRequestsTotal.WithLabelValues("token_rejected").Inc()
-			return
-		}
+	// Parallel fan-out: goroutine A → enclave, goroutine B → target
+	type enclaveResult struct {
+		resp *EnclaveResponse
+		err  error
+	}
+	type targetResult struct {
+		resp *http.Response
+		body []byte
+		err  error
 	}
 
-	// Forward to target (bypass mode)
-	p.forwardToTarget(w, r, start)
-}
+	enclaveCh := make(chan enclaveResult, 1)
+	targetCh := make(chan targetResult, 1)
 
-// handleEnclaveFlow processes requests through the enclave.
-func (p *odohProxy) handleEnclaveFlow(w http.ResponseWriter, r *http.Request, start time.Time) {
-	// Extract blob B from header
-	blobB := r.Header.Get("X-ODoH-Blob")
-	if blobB == "" {
-		// No blob, fall back to bypass if enabled
-		if p.enclaveBypassOnFail {
-			log.Debug("No X-ODoH-Blob header, bypassing enclave")
-			p.forwardToTarget(w, r, start)
+	// Goroutine A: send Q_E to enclave (~1ms)
+	go func() {
+		resp, err := p.enclaveClient.ProcessQE(qeHeader)
+		enclaveCh <- enclaveResult{resp, err}
+	}()
+
+	// Goroutine B: forward Q_T to target (~25ms)
+	go func() {
+		req, err := http.NewRequest(http.MethodPost, targetURL, bytes.NewReader(body))
+		if err != nil {
+			targetCh <- targetResult{err: err}
 			return
 		}
-		http.Error(w, `{"error":"blob_required"}`, http.StatusBadRequest)
-		proxyRequestsTotal.WithLabelValues("blob_missing").Inc()
-		return
-	}
+		req.Header.Set("Content-Type", odohContentType)
 
-	// Get client IP
-	clientIP := getClientIP(r)
+		// Include enclave public key for cache-insert encryption
+		if pk, err := p.enclaveClient.GetPublicKey(); err == nil && pk != "" {
+			req.Header.Set("X-Enclave-PubKey", pk)
+		}
 
-	// Check for MLE mode (BlobBv2 uses mle_lookup)
-	mleMode := r.Header.Get("X-MLE-Mode") == "true"
+		resp, err := p.client.Do(req)
+		if err != nil {
+			targetCh <- targetResult{err: err}
+			return
+		}
+		defer resp.Body.Close()
+		respBody, err := io.ReadAll(resp.Body)
+		targetCh <- targetResult{resp: resp, body: respBody, err: err}
+	}()
 
-	// Send to enclave
-	var enclaveResp *EnclaveResponse
-	var err error
-	if mleMode {
-		enclaveResp, err = p.enclaveClient.MLELookup(blobB, clientIP)
+	// Wait for enclave (fast leg)
+	enclaveRes := <-enclaveCh
+
+	var enclaveBlob []byte
+	var enclaveError string
+
+	if enclaveRes.err != nil {
+		log.Errorf("Enclave IPC error: %v", enclaveRes.err)
+		enclaveError = "enclave_unavailable"
+		// Reactive pk_E refresh
+		go p.refreshEnclavePubKey()
+	} else if enclaveRes.resp.Status == statusError && enclaveRes.resp.Error == "hpke_error" {
+		enclaveError = "key_mismatch"
+		// Reactive pk_E refresh on HPKE error
+		go p.refreshEnclavePubKey()
+	} else if enclaveRes.resp.Status == statusError {
+		enclaveError = enclaveRes.resp.Error
 	} else {
-		enclaveResp, err = p.enclaveClient.ProcessRequest(blobB, clientIP)
-	}
-	if err != nil {
-		log.Errorf("Enclave process error: %v", err)
-		if p.enclaveBypassOnFail {
-			log.Warning("Enclave error, bypassing to target")
-			p.forwardToTarget(w, r, start)
-			return
-		}
-		http.Error(w, `{"error":"enclave_error"}`, http.StatusBadGateway)
-		proxyRequestsTotal.WithLabelValues("enclave_error").Inc()
-		return
-	}
-
-	switch enclaveResp.Status {
-	case statusHit:
-		// Cache hit - return encrypted response
-		respBytes, err := base64.StdEncoding.DecodeString(enclaveResp.Response)
+		// Decode enclave blob (hit or dummy — opaque to proxy)
+		enclaveBlob, err = base64.StdEncoding.DecodeString(enclaveRes.resp.Response)
 		if err != nil {
-			http.Error(w, `{"error":"internal_error"}`, http.StatusInternalServerError)
-			proxyRequestsTotal.WithLabelValues("error").Inc()
-			return
+			log.Errorf("Enclave response decode error: %v", err)
+			enclaveError = "decode_error"
 		}
-		contentType := codohCachedContentType
-		if mleMode {
-			contentType = codohMLECachedContentType
+	}
+
+	// Wait for target (slow leg)
+	targetRes := <-targetCh
+
+	if targetRes.err != nil {
+		// Target failed. If we have an enclave blob, write it as a single chunk.
+		// Client can use cache hit if present; otherwise it's an error.
+		if enclaveError == "" && len(enclaveBlob) > 0 {
+			// Can't do two-chunk without target response. Degrade.
+			log.Errorf("Target request failed (have enclave blob, but no target response): %v", targetRes.err)
 		}
-		w.Header().Set("Content-Type", contentType)
+		http.Error(w, "Target request failed", http.StatusBadGateway)
+		proxyRequestsTotal.WithLabelValues("error").Inc()
+		return
+	}
+
+	// Fire-and-forget cache-insert if headers present
+	if enclaveCache := targetRes.resp.Header.Get("X-Enclave-Cache"); enclaveCache != "" {
+		sig := targetRes.resp.Header.Get("X-Enclave-Cache-Sig")
+		go func() {
+			if err := p.enclaveClient.StoreCacheInsert(enclaveCache, sig); err != nil {
+				log.Errorf("Async cache-insert failed: %v", err)
+			}
+		}()
+	}
+
+	// Write response
+	if enclaveError == "" && len(enclaveBlob) > 0 {
+		// Two-chunk response: [2-byte len][chunk1 (enclave blob)][chunk2 (ODoH response)]
+		w.Header().Set("Content-Type", codohResponseContentType)
 		w.WriteHeader(http.StatusOK)
-		w.Write(respBytes)
-		if mleMode {
-			proxyRequestsTotal.WithLabelValues("mle_cache_hit").Inc()
-		} else {
+
+		// Write chunk1 length prefix (big-endian uint16)
+		var lenBuf [2]byte
+		binary.BigEndian.PutUint16(lenBuf[:], uint16(len(enclaveBlob)))
+		w.Write(lenBuf[:])
+
+		// Write chunk1 (enclave blob)
+		w.Write(enclaveBlob)
+
+		// Flush so client can start processing chunk1 immediately
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+
+		// Write chunk2 (ODoH response)
+		w.Write(targetRes.body)
+
+		if enclaveRes.resp != nil && enclaveRes.resp.Status == statusHit {
 			proxyRequestsTotal.WithLabelValues("cache_hit").Inc()
-		}
-		proxyLatencySeconds.Observe(time.Since(start).Seconds())
-		return
-
-	case statusMiss:
-		// Cache miss - forward to target, then store in cache
-		if mleMode {
-			p.handleMLECacheMiss(w, r, enclaveResp, start)
 		} else {
-			p.handleCacheMiss(w, r, enclaveResp, start)
+			proxyRequestsTotal.WithLabelValues("cache_miss").Inc()
 		}
-		return
-
-	case statusError:
-		// Token error
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, enclaveResp.Error), http.StatusForbidden)
-		proxyRequestsTotal.WithLabelValues("token_" + enclaveResp.Error).Inc()
-		return
-
-	default:
-		http.Error(w, `{"error":"unknown_enclave_status"}`, http.StatusInternalServerError)
-		proxyRequestsTotal.WithLabelValues("error").Inc()
-	}
-}
-
-// handleCacheMiss forwards the request to target and stores the response in cache.
-func (p *odohProxy) handleCacheMiss(w http.ResponseWriter, r *http.Request, enclaveResp *EnclaveResponse, start time.Time) {
-	// Read ODoH query body
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "Failed to read body", http.StatusBadRequest)
-		proxyRequestsTotal.WithLabelValues("error").Inc()
-		return
-	}
-	defer r.Body.Close()
-
-	// Build target URL
-	targetURL := p.targetURL
-	if targetHost := r.URL.Query().Get("targethost"); targetHost != "" {
-		targetPath := r.URL.Query().Get("targetpath")
-		if targetPath == "" {
-			targetPath = "/dns-query"
+	} else {
+		// Degraded: standard ODoH response
+		w.Header().Set("Content-Type", odohContentType)
+		if enclaveError != "" {
+			w.Header().Set("X-CoDOH-Enclave-Error", enclaveError)
 		}
-		targetURL = "https://" + targetHost + targetPath
+		w.WriteHeader(http.StatusOK)
+		w.Write(targetRes.body)
+
+		proxyRequestsTotal.WithLabelValues("degraded").Inc()
 	}
 
-	// Forward to target
-	req, err := http.NewRequest(http.MethodPost, targetURL, bytes.NewReader(body))
-	if err != nil {
-		http.Error(w, "Failed to create request", http.StatusInternalServerError)
-		proxyRequestsTotal.WithLabelValues("error").Inc()
-		return
-	}
-	req.Header.Set("Content-Type", odohContentType)
-
-	// Forward blob B to target for signature binding
-	if blobB := r.Header.Get("X-ODoH-Blob"); blobB != "" {
-		req.Header.Set("X-ODoH-Blob", blobB)
-	}
-
-	// Include enclave public key for cache encryption
-	var enclavePubKey string
-	if p.enclaveClient != nil {
-		enclavePubKey, _ = p.enclaveClient.GetPublicKey()
-		if enclavePubKey != "" {
-			req.Header.Set("X-Enclave-PubKey", enclavePubKey)
-		}
-	}
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		http.Error(w, "Target request failed", http.StatusBadGateway)
-		proxyRequestsTotal.WithLabelValues("error").Inc()
-		return
-	}
-	defer resp.Body.Close()
-
-	// Read target response
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		http.Error(w, "Failed to read target response", http.StatusBadGateway)
-		proxyRequestsTotal.WithLabelValues("error").Inc()
-		return
-	}
-
-	// Store encrypted cache data from target
-	if enclaveCache := resp.Header.Get("X-Enclave-Cache"); enclaveCache != "" {
-		// Get signature and query from response headers
-		sig := resp.Header.Get("X-Enclave-Cache-Sig")
-		query := resp.Header.Get("X-Enclave-Cache-Query")
-		blobB := r.Header.Get("X-ODoH-Blob")
-
-		// Fall back to enclave's canonical query if target didn't provide one
-		if query == "" {
-			query = enclaveResp.Query
-		}
-
-		// Parse TTL from response header, default to 300
-		ttl := 300
-		if ttlStr := resp.Header.Get("X-Enclave-Cache-TTL"); ttlStr != "" {
-			if parsedTTL, err := strconv.Atoi(ttlStr); err == nil && parsedTTL > 0 {
-				ttl = parsedTTL
-			}
-		}
-
-		// Target encrypted raw DNS under enclave's public key
-		go func() {
-			if err := p.enclaveClient.StoreEncryptedWithSig(query, enclaveCache, sig, blobB, ttl); err != nil {
-				log.Errorf("Failed to store encrypted cache: %v", err)
-			}
-		}()
-	}
-
-	// Relay response back to client
-	w.Header().Set("Content-Type", odohContentType)
-	w.WriteHeader(resp.StatusCode)
-	w.Write(respBody)
-
-	proxyRequestsTotal.WithLabelValues("cache_miss").Inc()
 	proxyLatencySeconds.Observe(time.Since(start).Seconds())
 }
 
-// handleMLECacheMiss forwards the request to target and stores the MLE response in cache.
-func (p *odohProxy) handleMLECacheMiss(w http.ResponseWriter, r *http.Request, enclaveResp *EnclaveResponse, start time.Time) {
-	// Read ODoH query body
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "Failed to read body", http.StatusBadRequest)
-		proxyRequestsTotal.WithLabelValues("error").Inc()
-		return
-	}
-	defer r.Body.Close()
-
-	// Build target URL
-	targetURL := p.targetURL
-	if targetHost := r.URL.Query().Get("targethost"); targetHost != "" {
-		targetPath := r.URL.Query().Get("targetpath")
-		if targetPath == "" {
-			targetPath = "/dns-query"
-		}
-		targetURL = "https://" + targetHost + targetPath
-	}
-
-	// Forward to target
-	req, err := http.NewRequest(http.MethodPost, targetURL, bytes.NewReader(body))
-	if err != nil {
-		http.Error(w, "Failed to create request", http.StatusInternalServerError)
-		proxyRequestsTotal.WithLabelValues("error").Inc()
-		return
-	}
-	req.Header.Set("Content-Type", odohContentType)
-
-	// Forward blob B to target for signature binding
-	if blobB := r.Header.Get("X-ODoH-Blob"); blobB != "" {
-		req.Header.Set("X-ODoH-Blob", blobB)
-	}
-
-	// Forward MLE mode indicator so target prepares MLE insert blob
-	req.Header.Set("X-MLE-Mode", "true")
-
-	// Include enclave public key for MLE cache encryption
-	var enclavePubKey string
-	if p.enclaveClient != nil {
-		enclavePubKey, _ = p.enclaveClient.GetPublicKey()
-		if enclavePubKey != "" {
-			req.Header.Set("X-Enclave-PubKey", enclavePubKey)
-		}
-	}
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		http.Error(w, "Target request failed", http.StatusBadGateway)
-		proxyRequestsTotal.WithLabelValues("error").Inc()
-		return
-	}
-	defer resp.Body.Close()
-
-	// Read target response
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		http.Error(w, "Failed to read target response", http.StatusBadGateway)
-		proxyRequestsTotal.WithLabelValues("error").Inc()
-		return
-	}
-
-	// Store MLE insert blob from target
-	if mleInsertBlob := resp.Header.Get("X-MLE-Insert-Blob"); mleInsertBlob != "" {
-		go func() {
-			if err := p.enclaveClient.MLEStore(mleInsertBlob); err != nil {
-				log.Errorf("Failed to store MLE cache entry: %v", err)
-			} else {
-				log.Debug("Stored MLE cache entry")
-			}
-		}()
-	}
-
-	// Relay response back to client
-	w.Header().Set("Content-Type", odohContentType)
-	w.WriteHeader(resp.StatusCode)
-	w.Write(respBody)
-
-	proxyRequestsTotal.WithLabelValues("mle_cache_miss").Inc()
-	proxyLatencySeconds.Observe(time.Since(start).Seconds())
-}
-
-// forwardToTarget forwards the request directly to the target (bypass mode).
+// forwardToTarget forwards the request directly to the target (standard ODoH relay).
 func (p *odohProxy) forwardToTarget(w http.ResponseWriter, r *http.Request, start time.Time) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -498,14 +317,7 @@ func (p *odohProxy) forwardToTarget(w http.ResponseWriter, r *http.Request, star
 	}
 	defer r.Body.Close()
 
-	targetURL := p.targetURL
-	if targetHost := r.URL.Query().Get("targethost"); targetHost != "" {
-		targetPath := r.URL.Query().Get("targetpath")
-		if targetPath == "" {
-			targetPath = "/dns-query"
-		}
-		targetURL = "https://" + targetHost + targetPath
-	}
+	targetURL := p.resolveTargetURL(r)
 
 	req, err := http.NewRequest(http.MethodPost, targetURL, bytes.NewReader(body))
 	if err != nil {
@@ -552,49 +364,26 @@ func (p *odohProxy) enclaveKeysHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Return base64-encoded public key
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusOK)
 	io.WriteString(w, pubKey)
 }
 
-// getClientIP extracts the client IP from the request.
-func getClientIP(r *http.Request) string {
-	// Check X-Forwarded-For header first
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// Take the first IP in the chain
-		if idx := bytes.IndexByte([]byte(xff), ','); idx > 0 {
-			return xff[:idx]
+// resolveTargetURL builds the target URL from query parameters or default.
+func (p *odohProxy) resolveTargetURL(r *http.Request) string {
+	if targetHost := r.URL.Query().Get("targethost"); targetHost != "" {
+		targetPath := r.URL.Query().Get("targetpath")
+		if targetPath == "" {
+			targetPath = "/dns-query"
 		}
-		return xff
+		return "https://" + targetHost + targetPath
 	}
-
-	// Fall back to RemoteAddr
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
+	return p.targetURL
 }
 
-// decodeToken decodes a base64-encoded token from the X-ODoH-Token header.
-func decodeToken(token string) ([]byte, error) {
-	return base64.StdEncoding.DecodeString(token)
-}
-
-// waitForEnclaveReady polls the enclave until it reports ready (provisioned).
-func (p *odohProxy) waitForEnclaveReady(timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		ready, err := p.enclaveClient.CheckReady()
-		if err == nil && ready {
-			log.Info("Enclave is ready (provisioned)")
-			return nil
-		}
-		if err != nil {
-			log.Debugf("Enclave ready check: %v", err)
-		}
-		time.Sleep(1 * time.Second)
+// refreshEnclavePubKey re-fetches the enclave public key (reactive refresh on error).
+func (p *odohProxy) refreshEnclavePubKey() {
+	if _, err := p.enclaveClient.GetPublicKey(); err != nil {
+		log.Errorf("pk_E refresh failed: %v", err)
 	}
-	return fmt.Errorf("timeout waiting for enclave ready after %v", timeout)
 }

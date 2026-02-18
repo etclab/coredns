@@ -31,13 +31,11 @@ type AttestResponse struct {
 
 // ProvisionRequest is sent to the /provision endpoint.
 type ProvisionRequest struct {
-	EncryptedSecret  string `json:"encrypted_secret"`         // Base64-encoded HPKE-encrypted master secret
-	SigningPublicKey string `json:"signing_pubkey,omitempty"` // Base64-encoded Ed25519 public key for target response verification
+	SigningPublicKey string `json:"signing_pubkey"` // Base64-encoded Ed25519 public key for target response verification
 }
 
 // ProvisionData is the data sent through the provisioning channel.
 type ProvisionData struct {
-	MasterSecret     []byte
 	SigningPublicKey []byte
 }
 
@@ -136,7 +134,7 @@ func (s *AttestationServer) attestHandler(w http.ResponseWriter, r *http.Request
 	json.NewEncoder(w).Encode(resp)
 }
 
-// provisionHandler receives the encrypted master secret.
+// provisionHandler receives the target's Ed25519 signing public key.
 // POST /provision
 func (s *AttestationServer) provisionHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -165,28 +163,7 @@ func (s *AttestationServer) provisionHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Decode encrypted secret
-	encryptedSecret, err := base64.StdEncoding.DecodeString(req.EncryptedSecret)
-	if err != nil {
-		http.Error(w, "Invalid base64 encoding", http.StatusBadRequest)
-		return
-	}
-
-	// Decrypt using enclave's private key
-	masterSecret, err := s.keypair.Decrypt(encryptedSecret)
-	if err != nil {
-		log.Printf("Failed to decrypt provisioned secret: %v", err)
-		http.Error(w, "Decryption failed", http.StatusBadRequest)
-		return
-	}
-
-	// Validate master secret length
-	if len(masterSecret) != 32 {
-		http.Error(w, "Invalid secret length", http.StatusBadRequest)
-		return
-	}
-
-	// Decode signing public key (optional)
+	// Decode signing public key
 	var signingPubKey []byte
 	if req.SigningPublicKey != "" {
 		signingPubKey, err = base64.StdEncoding.DecodeString(req.SigningPublicKey)
@@ -200,9 +177,7 @@ func (s *AttestationServer) provisionHandler(w http.ResponseWriter, r *http.Requ
 		}
 	}
 
-	// Send to provisioning channel (non-blocking)
 	provData := ProvisionData{
-		MasterSecret:     masterSecret,
 		SigningPublicKey: signingPubKey,
 	}
 	select {
@@ -210,11 +185,7 @@ func (s *AttestationServer) provisionHandler(w http.ResponseWriter, r *http.Requ
 		s.mu.Lock()
 		s.ready = true
 		s.mu.Unlock()
-		if len(signingPubKey) > 0 {
-			log.Println("Master secret and signing pubkey provisioned successfully")
-		} else {
-			log.Println("Master secret provisioned successfully (no signing key)")
-		}
+		log.Println("Signing pubkey provisioned successfully")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"status":"ok"}`))
 	default:

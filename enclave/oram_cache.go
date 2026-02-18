@@ -13,14 +13,14 @@ import (
 // ORAMCache wraps PathORAM to implement the Cache interface.
 // Provides access-pattern hiding at the cost of performance.
 type ORAMCache struct {
-	oram      *pathoram.PathORAM
-	cfg       ORAMCacheConfig
-	mu        sync.Mutex
+	oram *pathoram.PathORAM
+	cfg  ORAMCacheConfig
+	mu   sync.Mutex
 
 	// Track which block IDs are in use (for Size())
 	used map[int]bool
 
-	// Stochastic defenses
+	// Stochastic defenses (churn only after Sprint 1)
 	stochastic StochasticConfig
 	rng        *SecureRNG
 	stopChurn  chan struct{}
@@ -28,9 +28,9 @@ type ORAMCache struct {
 
 // ORAMCacheConfig configures the ORAM cache.
 type ORAMCacheConfig struct {
-	Capacity     int // Number of cache entries
-	BlockSize    int // Block size in bytes (must fit serialized entry)
-	BucketSize   int // Blocks per bucket (Z parameter)
+	Capacity     int  // Number of cache entries
+	BlockSize    int  // Block size in bytes (must fit serialized entry)
+	BucketSize   int  // Blocks per bucket (Z parameter)
 	ConstantTime bool // Enable constant-time operations for TEE
 }
 
@@ -40,7 +40,7 @@ func DefaultORAMCacheConfig() ORAMCacheConfig {
 		Capacity:     10000,
 		BlockSize:    4096, // 4KB blocks
 		BucketSize:   4,
-		ConstantTime: true, // Default to constant-time for enclave
+		ConstantTime: true,
 	}
 }
 
@@ -79,8 +79,8 @@ func NewORAMCacheWithStochastic(cfg ORAMCacheConfig, stochastic StochasticConfig
 	return cache, nil
 }
 
-// Get retrieves a cached response for the given query.
-func (c *ORAMCache) Get(query string) ([]byte, []byte, bool) {
+// Get retrieves a cached plaintext response for the given query.
+func (c *ORAMCache) Get(query string) ([]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -88,45 +88,31 @@ func (c *ORAMCache) Get(query string) ([]byte, []byte, bool) {
 	data, err := c.oram.Read(blockID)
 	if err != nil {
 		log.Printf("ORAMCache.Get: read error: %v", err)
-		return nil, nil, false
+		return nil, false
 	}
 
 	entry, ok := c.deserialize(data)
 	if !ok || entry.Query != query {
-		// Empty block or hash collision
-		return nil, nil, false
+		return nil, false
 	}
 
 	// Check TTL
 	if time.Now().After(entry.ExpiresAt) {
-		return nil, nil, false
+		return nil, false
 	}
 
-	// Apply stochastic hit suppression
-	if c.stochastic.ShouldSuppressHit(c.rng) {
-		log.Printf("ORAMCache: suppressing hit (p_fn=%.2f)", c.stochastic.HitSuppressionProb)
-		return nil, nil, false
-	}
-
-	return entry.Response, entry.Kc, true
+	return entry.Response, true
 }
 
-// Put stores a response in the cache.
-func (c *ORAMCache) Put(query string, response, kc []byte, ttl time.Duration) {
+// Put stores a plaintext DNS response in the cache.
+func (c *ORAMCache) Put(query string, response []byte, ttl time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	// Apply stochastic non-insertion
-	if !c.stochastic.ShouldInsert(c.rng) {
-		log.Printf("ORAMCache: skipping insert (p_ins=%.2f)", c.stochastic.InsertProb)
-		return
-	}
 
 	blockID := c.queryToBlockID(query)
 	entry := &CacheEntry{
 		Query:     query,
 		Response:  response,
-		Kc:        kc,
 		ExpiresAt: time.Now().Add(ttl),
 	}
 
@@ -193,7 +179,7 @@ func (c *ORAMCache) queryToBlockID(query string) int {
 }
 
 // serialize encodes a CacheEntry into a fixed-size block.
-// Format: [queryLen:2][query][respLen:2][resp][kcLen:2][kc][expiresUnix:8][valid:1]
+// Format: [queryLen:2][query][respLen:2][resp][expiresUnix:8][valid:1]
 func (c *ORAMCache) serialize(entry *CacheEntry) ([]byte, bool) {
 	buf := make([]byte, c.cfg.BlockSize)
 	offset := 0
@@ -223,19 +209,6 @@ func (c *ORAMCache) serialize(entry *CacheEntry) ([]byte, bool) {
 	}
 	copy(buf[offset:], entry.Response)
 	offset += int(respLen)
-
-	// Kc length + data
-	if len(entry.Kc) > 65535 {
-		return nil, false
-	}
-	kcLen := uint16(len(entry.Kc))
-	binary.LittleEndian.PutUint16(buf[offset:], kcLen)
-	offset += 2
-	if offset+int(kcLen) > c.cfg.BlockSize {
-		return nil, false
-	}
-	copy(buf[offset:], entry.Kc)
-	offset += int(kcLen)
 
 	// Expires timestamp (Unix nanos)
 	if offset+8 > c.cfg.BlockSize {
@@ -298,19 +271,6 @@ func (c *ORAMCache) deserialize(data []byte) (*CacheEntry, bool) {
 	copy(response, data[offset:offset+int(respLen)])
 	offset += int(respLen)
 
-	// Kc
-	if offset+2 > len(data) {
-		return nil, false
-	}
-	kcLen := binary.LittleEndian.Uint16(data[offset:])
-	offset += 2
-	if offset+int(kcLen) > len(data) {
-		return nil, false
-	}
-	kc := make([]byte, kcLen)
-	copy(kc, data[offset:offset+int(kcLen)])
-	offset += int(kcLen)
-
 	// Expires
 	if offset+8 > len(data) {
 		return nil, false
@@ -326,7 +286,6 @@ func (c *ORAMCache) deserialize(data []byte) (*CacheEntry, bool) {
 	return &CacheEntry{
 		Query:     query,
 		Response:  response,
-		Kc:        kc,
 		ExpiresAt: time.Unix(0, int64(expiresNano)),
 	}, true
 }
@@ -355,7 +314,6 @@ func (c *ORAMCache) churnOnce() {
 		return
 	}
 
-	// Pick a random block to evict
 	blockID := int(c.rng.Float64() * float64(c.cfg.Capacity))
 	emptyBlock := make([]byte, c.cfg.BlockSize)
 	if _, err := c.oram.Write(blockID, emptyBlock); err != nil {
@@ -363,8 +321,6 @@ func (c *ORAMCache) churnOnce() {
 		return
 	}
 	delete(c.used, blockID)
-
-	log.Printf("ORAMCache: churned block %d, size=%d", blockID, len(c.used))
 }
 
 // StopChurn stops the churn loop.

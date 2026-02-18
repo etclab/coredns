@@ -16,15 +16,10 @@ type IPCServer struct {
 
 // RequestHandler processes incoming IPC requests.
 type RequestHandler interface {
-	HandleProcess(blobB, clientIP string) *Response
-	HandleStoreEncrypted(query, encryptedResponse, signature, blobB string, ttl int) *Response
+	HandleProcess(qe string) *Response
+	HandleStoreEncrypted(encryptedBlob, signature string) *Response
 	HandleGetPubKey() *Response
 	HandleHealth() *Response
-	HandleReady() *Response // Returns provisioning status
-
-	// MLE handlers
-	HandleMLELookup(blobB, clientIP string) *Response
-	HandleMLEStore(mleInsertBlob string) *Response
 }
 
 // NewIPCServer creates a new IPC server on the given socket path.
@@ -77,19 +72,13 @@ func (s *IPCServer) handleConnection(conn net.Conn) {
 func (s *IPCServer) dispatch(req *Request) *Response {
 	switch req.Type {
 	case MsgTypeProcess:
-		return s.handler.HandleProcess(req.BlobB, req.ClientIP)
+		return s.handler.HandleProcess(req.QE)
 	case MsgTypeStoreEncrypted:
-		return s.handler.HandleStoreEncrypted(req.Query, req.EncryptedResponse, req.Signature, req.BlobB, req.TTL)
+		return s.handler.HandleStoreEncrypted(req.EncryptedBlob, req.Signature)
 	case MsgTypeGetPubKey:
 		return s.handler.HandleGetPubKey()
 	case MsgTypeHealth:
 		return s.handler.HandleHealth()
-	case MsgTypeReady:
-		return s.handler.HandleReady()
-	case MsgTypeMLELookup:
-		return s.handler.HandleMLELookup(req.BlobB, req.ClientIP)
-	case MsgTypeMLEStore:
-		return s.handler.HandleMLEStore(req.MLEInsertBlob)
 	default:
 		return &Response{
 			Status: StatusError,
@@ -101,18 +90,15 @@ func (s *IPCServer) dispatch(req *Request) *Response {
 // Wire format: [4 bytes: length][JSON payload]
 
 func readMessage(r io.Reader) (*Request, error) {
-	// Read length prefix
 	var length uint32
 	if err := binary.Read(r, binary.BigEndian, &length); err != nil {
 		return nil, err
 	}
 
-	// Sanity check
 	if length > 1<<20 { // 1MB max
 		return nil, fmt.Errorf("message too large: %d", length)
 	}
 
-	// Read payload
 	payload := make([]byte, length)
 	if _, err := io.ReadFull(r, payload); err != nil {
 		return nil, err
@@ -132,12 +118,10 @@ func writeMessage(w io.Writer, resp *Response) error {
 		return fmt.Errorf("marshal: %w", err)
 	}
 
-	// Write length prefix
 	if err := binary.Write(w, binary.BigEndian, uint32(len(payload))); err != nil {
 		return err
 	}
 
-	// Write payload
 	_, err = w.Write(payload)
 	return err
 }

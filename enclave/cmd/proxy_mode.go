@@ -158,7 +158,7 @@ func (s *ProxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Cache lookup
-	if cachedResp, _, ok := s.cache.Get(query); ok {
+	if cachedResp, ok := s.cache.Get(query); ok {
 		// Cache hit — encrypt with client's kc and return
 		encrypted, err := enclave.EncryptResponse(kc, cachedResp)
 		if err != nil {
@@ -248,7 +248,7 @@ func (s *ProxyServer) storeCacheEntry(query, encCacheB64, ttlStr string) {
 		}
 	}
 
-	s.cache.Put(query, plaintext, nil, ttl)
+	s.cache.Put(query, plaintext, ttl)
 	log.Printf("Cached response for %s (TTL: %v, cache_size: %d)", query, ttl, s.cache.Size())
 }
 

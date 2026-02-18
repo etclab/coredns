@@ -2,8 +2,6 @@ package codohtarget
 
 import (
 	"encoding/hex"
-	"strconv"
-	"time"
 
 	"github.com/coredns/caddy"
 	"github.com/coredns/coredns/plugin"
@@ -20,17 +18,14 @@ func setup(c *caddy.Controller) error {
 	c.OnStartup(t.OnStartup)
 	c.OnFinalShutdown(t.OnFinalShutdown)
 
-	// Don't call AddPlugin - this is an HTTP server, not a DNS handler
 	return nil
 }
 
 func parse(c *caddy.Controller) (*odohTarget, error) {
 	t := &odohTarget{
-		addr:          ":8443",
-		upstream:      "8.8.8.8:53",
-		logQueries:    false,
-		epochDuration: time.Hour, // Default: 1 hour epochs
-		rateLimit:     10,        // Default: 10 tokens per IP per epoch
+		addr:       ":8443",
+		upstream:   "8.8.8.8:53",
+		logQueries: false,
 	}
 
 	for c.Next() {
@@ -61,50 +56,19 @@ func parse(c *caddy.Controller) (*odohTarget, error) {
 				}
 				t.upstream = args[0]
 			case "cipher_suite":
-				// Ignored for now - use odoh-go defaults
 				c.RemainingArgs()
 			case "log_queries":
 				args := c.RemainingArgs()
 				if len(args) == 1 && args[0] == "true" {
 					t.logQueries = true
 				}
-			case "token_enabled":
-				t.tokenEnabled = true
-			case "epoch_duration":
-				args := c.RemainingArgs()
-				if len(args) != 1 {
-					return nil, c.ArgErr()
-				}
-				dur, err := time.ParseDuration(args[0])
-				if err != nil {
-					return nil, c.Errf("invalid epoch_duration: %v", err)
-				}
-				t.epochDuration = dur
-			case "rate_limit":
-				args := c.RemainingArgs()
-				if len(args) != 1 {
-					return nil, c.ArgErr()
-				}
-				limit, err := strconv.Atoi(args[0])
-				if err != nil || limit <= 0 {
-					return nil, c.Errf("invalid rate_limit: must be positive integer")
-				}
-				t.rateLimit = limit
-			case "master_secret":
-				args := c.RemainingArgs()
-				if len(args) != 1 {
-					return nil, c.ArgErr()
-				}
-				t.masterSecretFile = args[0]
 			case "enclave_url":
-				// URL of enclave's attestation endpoint (e.g., https://proxy:8444)
 				args := c.RemainingArgs()
 				if len(args) != 1 {
 					return nil, c.ArgErr()
 				}
 				t.enclaveURL = args[0]
 			case "enclave_mrsigner":
-				// Expected MRSIGNER (hex, 32 bytes = 64 hex chars)
 				args := c.RemainingArgs()
 				if len(args) != 1 {
 					return nil, c.ArgErr()
@@ -118,7 +82,6 @@ func parse(c *caddy.Controller) (*odohTarget, error) {
 				}
 				t.expectedMRSigner = mrsigner
 			case "signing_key":
-				// Path to Ed25519 signing key (auto-generates if missing)
 				args := c.RemainingArgs()
 				if len(args) != 1 {
 					return nil, c.ArgErr()
@@ -130,7 +93,6 @@ func parse(c *caddy.Controller) (*odohTarget, error) {
 		}
 	}
 
-	// Validate required fields
 	if t.tlsCert == "" || t.tlsKey == "" {
 		return nil, c.Errf("tls_cert and tls_key are required")
 	}
