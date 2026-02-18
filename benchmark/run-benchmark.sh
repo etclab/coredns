@@ -1,6 +1,6 @@
 #!/bin/bash
 # CODoH Benchmark Script
-# Compares ODoH (baseline) vs CODoH latency with real domain dataset
+# Compares DoH vs ODoH vs CODoH latency with real domain dataset
 # Usage: ./benchmark/run-benchmark.sh [--sgx] [--oram] [iterations]
 #   --sgx       Include SGX hardware enclave benchmark (requires SGX device access)
 #   --oram      Use ORAM cache instead of LRU cache (for access pattern hiding)
@@ -52,7 +52,7 @@ cleanup() {
     # Kill any processes on our test ports
     # fuser -k 8080/tcp 8443/tcp 9080/tcp 9443/tcp 18080/tcp 18443/tcp 18444/tcp 2>/dev/null || true
     # With (cross-platform):
-    for port in 8080 8443 9080 9443 18080 18443 18444; do
+    for port in 7443 8080 8443 9080 9443 18080 18443 18444; do
         lsof -ti :$port | xargs kill -9 2>/dev/null || true
     done
     rm -f /tmp/codoh-enclave.sock /tmp/codoh-sgx-enclave.sock 2>/dev/null || true
@@ -64,6 +64,7 @@ trap cleanup EXIT
 echo "Building binaries..."
 go build -o coredns-test . 2>/dev/null
 go build -o enclave-sim ./enclave/cmd 2>/dev/null
+(cd "$(dirname "$ROOT_DIR")/codoh-client" && go build -o odoh-client ./cmd 2>/dev/null)
 if $SGX_MODE; then
     echo "Building SGX enclave..."
     (cd enclave && ego-go build -tags ego -o enclave ./cmd) 2>/dev/null
@@ -74,8 +75,35 @@ echo "Build complete."
 echo ""
 
 #######################################
+# DoH Baseline Benchmark
+#######################################
+echo "=== Starting DoH Baseline Benchmark ==="
+
+cleanup
+
+# Start DoH server (port 7443)
+echo "Starting DoH server..."
+./coredns-test -conf "$SCRIPT_DIR/Corefile.doh" > /tmp/doh.log 2>&1 &
+sleep 2
+
+# Health check
+curl -sk https://127.0.0.1:7443/health > /dev/null && echo "DoH server: OK" || echo "DoH server: FAILED"
+
+echo "Running DoH benchmark (sequential)..."
+$CLIENT_PATH latency \
+    --protocol doh \
+    --distribution sequential \
+    --iterations $ITERATIONS \
+    --target 127.0.0.1:7443 \
+    --customcert $CERT_PATH \
+    --domains $DOMAINS_PATH \
+    --output "$OUTPUT_DIR/doh.csv" \
+    --summary "$OUTPUT_DIR/doh.json"
+
+#######################################
 # ODoH Baseline Benchmark
 #######################################
+echo ""
 echo "=== Starting ODoH Baseline Benchmark ==="
 
 cleanup
@@ -327,6 +355,9 @@ ls -la "$OUTPUT_DIR"/
 
 echo ""
 echo "=== Quick Comparison ==="
+echo "DoH (baseline):"
+cat "$OUTPUT_DIR/doh.json" | grep -E '"(mean|p50|p95|p99|cache_hit_rate)"' | head -5
+echo ""
 echo "ODoH (baseline):"
 cat "$OUTPUT_DIR/odoh.json" | grep -E '"(mean|p50|p95|p99|cache_hit_rate)"' | head -5
 

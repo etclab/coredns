@@ -23,6 +23,10 @@ func main() {
 	socketPath := flag.String("socket", "/tmp/codoh-enclave.sock", "Unix socket path")
 	secretFile := flag.String("secret", "", "Path to master secret file (hex-encoded, for simulation mode)")
 	httpsPort := flag.Int("https-port", 8444, "HTTPS port for attestation server")
+	mode := flag.String("mode", "ipc", "Operating mode: 'ipc' (default, 3-process CODoH) or 'proxy' (2-process CODoH-base)")
+	tlsCert := flag.String("tls-cert", "", "TLS certificate file (proxy mode)")
+	tlsKey := flag.String("tls-key", "", "TLS key file (proxy mode)")
+	targetURL := flag.String("target", "", "Target URL (proxy mode, e.g., 'https://127.0.0.1:10444')")
 	flag.Parse()
 
 	log.Println("CODoH Enclave starting...")
@@ -35,6 +39,42 @@ func main() {
 
 	pubBytes, _ := keypair.PublicKeyBytes()
 	log.Printf("Public key: %s", base64.StdEncoding.EncodeToString(pubBytes))
+
+	// Proxy mode: lightweight 2-process architecture for CODoH-base (Config 3)
+	if *mode == "proxy" {
+		if *tlsCert == "" || *tlsKey == "" {
+			log.Fatal("Proxy mode requires -tls-cert and -tls-key flags")
+		}
+		if *targetURL == "" {
+			log.Fatal("Proxy mode requires -target flag (e.g., 'https://127.0.0.1:10444')")
+		}
+
+		// Load cache config from environment
+		cfg := enclave.DefaultConfig()
+		loadOptionalEnvSettings(cfg)
+
+		// Create simple LRU cache (no stochastic defenses for CODoH-base)
+		cache := enclave.NewLRUCache(cfg.CacheSize)
+		log.Printf("Proxy mode: LRU cache capacity=%d", cfg.CacheSize)
+
+		server := NewProxyServer(keypair, cache, *targetURL, *tlsCert, *tlsKey, *httpsPort)
+
+		// Handle shutdown
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			<-sigCh
+			log.Println("Shutting down proxy...")
+			os.Exit(0)
+		}()
+
+		if err := server.Start(); err != nil {
+			log.Fatalf("Proxy server error: %v", err)
+		}
+		return
+	}
+
+	// IPC mode: full 3-process CODoH architecture (Configs 4-7)
 
 	// Channel for receiving provisioned data
 	provisionCh := make(chan enclave.ProvisionData, 1)

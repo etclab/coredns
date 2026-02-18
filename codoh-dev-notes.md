@@ -292,6 +292,69 @@ codohtarget {
 
 ## What's Implemented
 
+### CODoH-base (Proxy Mode, Config 3)
+
+Minimal upgrade from ODoH: adds enclave-based LRU caching with a simplified blob, no tokens, no signatures, no IPC. 2-process architecture.
+
+```
+Client → Enclave-Proxy (HTTPS) → ODoH Target → Upstream DNS
+```
+
+**Processes:**
+
+1. **ODoH Target** (`codohtarget` plugin, port 10444) — standard ODoH target, returns `X-Enclave-Cache` header with HPKE-encrypted raw DNS response
+2. **Enclave-Proxy** (`enclave-sim -mode proxy`, port 10443) — HTTPS server with LRU cache, HPKE keypair, blob decryption
+
+**Simplified Blob B format:** `kc (32 bytes) || canonical_query (variable)`
+- No token, no epoch — client just encrypts kc + query under enclave's HPKE public key
+- Enclave decrypts, looks up cache by query, encrypts cached response with kc on hit
+
+**Flow (miss):**
+1. Client fetches enclave public key from `/enclave-keys`
+2. Client encrypts blob B (kc + query) under enclave pubkey
+3. Client sends ODoH request to proxy `/proxy` with `X-ODoH-Blob` header
+4. Proxy decrypts blob, cache miss → forwards ODoH body to target `/dns-query`
+5. Target returns ODoH response + `X-Enclave-Cache` (HPKE-encrypted DNS response) + `X-Enclave-Cache-TTL`
+6. Proxy decrypts cache entry with its private key, stores in LRU cache
+7. Proxy returns ODoH response to client
+
+**Flow (hit):**
+1-3 same as above, but at step 4 proxy finds cache entry, encrypts with client's kc, returns `application/codoh-cached`
+
+**Endpoints (Enclave-Proxy :10443):**
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/proxy` | POST | Main relay — decrypts blob, checks cache, forwards on miss |
+| `/enclave-keys` | GET | Base64 HPKE public key |
+| `/.well-known/odohconfigs` | GET | Proxied from target |
+| `/health` | GET | Health check |
+
+**Running manually:**
+
+```bash
+# 1. Start target
+./coredns-test -conf benchmark/Corefile.codoh-base-target
+
+# 2. Start enclave-proxy (simulation)
+./enclave-sim -mode proxy -https-port 10443 \
+    -tls-cert localhost.pem -tls-key localhost-key.pem \
+    -target https://127.0.0.1:10444
+
+# 3. Query via client
+../codoh-client/odoh-client latency \
+    --protocol codoh-base \
+    --target 127.0.0.1:10444 \
+    --proxy 127.0.0.1:10443 \
+    --iterations 10 --domains benchmark/top-1m.csv \
+    --distribution zipf \
+    --customcert localhost.pem
+```
+
+**E2E test:** `./scripts/test-codoh-base-e2e.sh [--sgx]`
+
+---
+
 ### Phase 1: VOPRF Token Issuance
 - Target issues blind tokens via `/token` endpoint
 - Tokens bound to epoch for rate limiting
