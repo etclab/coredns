@@ -104,12 +104,6 @@ func main() {
 	cfg.SocketPath = *socketPath
 	loadOptionalEnvSettings(cfg)
 
-	// Build stochastic config (churn only)
-	stochasticCfg := enclave.StochasticConfig{
-		ChurnInterval: cfg.ChurnInterval,
-		ChurnEnabled:  cfg.ChurnEnabled,
-	}
-
 	// Initialize cache
 	var cache enclave.Cache
 	var oramCache *enclave.ORAMCache
@@ -121,15 +115,15 @@ func main() {
 			ConstantTime: true,
 		}
 		var err error
-		oramCache, err = enclave.NewORAMCacheWithStochastic(oramCfg, stochasticCfg)
+		oramCache, err = enclave.NewORAMCache(oramCfg)
 		if err != nil {
 			log.Fatalf("Failed to create ORAM cache: %v", err)
 		}
 		cache = oramCache
-		log.Printf("ORAM cache: capacity=%d, churn=%v", cfg.CacheSize, stochasticCfg.ChurnEnabled)
+		log.Printf("ORAM cache: capacity=%d", cfg.CacheSize)
 	} else {
-		cache = enclave.NewLRUCacheWithStochastic(cfg.CacheSize, stochasticCfg)
-		log.Printf("LRU cache: capacity=%d, churn=%v", cfg.CacheSize, stochasticCfg.ChurnEnabled)
+		cache = enclave.NewLRUCache(cfg.CacheSize)
+		log.Printf("LRU cache: capacity=%d", cfg.CacheSize)
 	}
 
 	// Remove stale socket
@@ -190,14 +184,6 @@ func loadOptionalEnvSettings(cfg *enclave.Config) {
 		if n, err := strconv.Atoi(padSize); err == nil {
 			cfg.DefaultPadSize = n
 		}
-	}
-	if interval := os.Getenv("CODOH_CHURN_INTERVAL_SECS"); interval != "" {
-		if secs, err := strconv.Atoi(interval); err == nil {
-			cfg.ChurnInterval = time.Duration(secs) * time.Second
-		}
-	}
-	if churn := os.Getenv("CODOH_CHURN_ENABLED"); churn == "true" || churn == "1" {
-		cfg.ChurnEnabled = true
 	}
 }
 

@@ -1,7 +1,7 @@
 #!/bin/bash
-# Config 7: CODoH-full with stochastic cache defenses
+# Config 7: CODoH IPC with ORAM cache
 # Architecture: Same as Config 4 (3-process IPC)
-# Adds: Stochastic hit suppression, probabilistic insertion, background churn
+# Adds: ORAM cache for access-pattern hiding
 
 CONFIG_NAME="codoh-full"
 CONFIG_NUM=7
@@ -10,15 +10,9 @@ CONFIG_PROTOCOL="codoh"
 start_config() {
     local root_dir=$1 cert_path=$2 output_dir=$3
 
-    # Start enclave (simulation mode, LRU cache + stochastic defenses)
-    echo "Starting enclave (simulation, stochastic defenses)..."
-    local secret_hex
-    secret_hex=$(cat "$root_dir/dev-master-secret.txt")
-    CODOH_MASTER_SECRET=$secret_hex \
-    CODOH_HIT_SUPPRESSION_PROB=0.05 \
-    CODOH_INSERT_PROB=0.95 \
-    CODOH_CHURN_ENABLED=true \
-    CODOH_CHURN_INTERVAL_SECS=60 \
+    # Start enclave (simulation mode, ORAM cache)
+    echo "Starting enclave (simulation, ORAM)..."
+    CODOH_USE_ORAM=true \
         "$root_dir/enclave-sim" \
         > "$output_dir/enclave.log" 2>&1 &
     sleep 2

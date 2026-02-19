@@ -23,10 +23,6 @@ var (
 	ExportLabel = []byte("codoh response")
 	// ExportKeyLen is the length of k_r in bytes (AES-128 key).
 	ExportKeyLen uint = 16
-
-	// DefaultPadSize is the default dummy response size in bytes.
-	// Configurable via CODOH_DEFAULT_PAD_SIZE env var.
-	DefaultPadSize = 512
 )
 
 // EnclaveKeypair holds the HPKE keypair for the enclave.

@@ -103,14 +103,6 @@ func (s *AttestationServer) Start() error {
 	return s.server.ListenAndServeTLS("", "") // Certs are in TLSConfig
 }
 
-// Stop gracefully stops the attestation server.
-func (s *AttestationServer) Stop() error {
-	if s.server != nil {
-		return s.server.Close()
-	}
-	return nil
-}
-
 // attestHandler returns the SGX quote and public key.
 // GET /attest
 func (s *AttestationServer) attestHandler(w http.ResponseWriter, r *http.Request) {
@@ -210,9 +202,3 @@ func (s *AttestationServer) healthHandler(w http.ResponseWriter, r *http.Request
 	}
 }
 
-// IsReady returns whether the enclave has been provisioned.
-func (s *AttestationServer) IsReady() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.ready
-}

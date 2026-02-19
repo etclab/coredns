@@ -1,10 +1,10 @@
 #!/bin/bash
-# Config 4: CODoH with VOPRF tokens (3-process IPC architecture)
+# Config 4: CODoH IPC with LRU cache (3-process architecture)
 # Architecture: Client → CODoH Proxy (port 8080) ↔ Enclave (IPC) → CODoH Target (port 8443)
-# Adds: VOPRF tokens, epoch verification, spent set, IPC
+# HPKE-export key derivation, parallel fan-out, two-chunk response
 # Uses LRU cache (default)
 
-CONFIG_NAME="codoh-token"
+CONFIG_NAME="codoh-ipc"
 CONFIG_NUM=4
 CONFIG_PROTOCOL="codoh"
 
@@ -13,10 +13,7 @@ start_config() {
 
     # Start enclave (simulation mode, LRU cache)
     echo "Starting enclave (simulation, LRU cache)..."
-    local secret_hex
-    secret_hex=$(cat "$root_dir/dev-master-secret.txt")
-    CODOH_MASTER_SECRET=$secret_hex \
-        "$root_dir/enclave-sim" \
+    "$root_dir/enclave-sim" \
         > "$output_dir/enclave.log" 2>&1 &
     sleep 2
 

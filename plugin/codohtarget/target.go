@@ -301,15 +301,3 @@ func extractMinimalTTL(msg *dns.Msg) uint32 {
 	ttl := dnsutil.MinimalTTL(msg, responseType)
 	return uint32(ttl.Seconds())
 }
-
-// getClientIP extracts client IP from request.
-func getClientIP(r *http.Request) net.IP {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if ip := net.ParseIP(xff); ip != nil {
-			return ip
-		}
-	}
-
-	host, _, _ := net.SplitHostPort(r.RemoteAddr)
-	return net.ParseIP(host)
-}

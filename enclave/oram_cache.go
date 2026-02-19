@@ -19,11 +19,6 @@ type ORAMCache struct {
 
 	// Track which block IDs are in use (for Size())
 	used map[int]bool
-
-	// Stochastic defenses (churn only after Sprint 1)
-	stochastic StochasticConfig
-	rng        *SecureRNG
-	stopChurn  chan struct{}
 }
 
 // ORAMCacheConfig configures the ORAM cache.
@@ -34,23 +29,8 @@ type ORAMCacheConfig struct {
 	ConstantTime bool // Enable constant-time operations for TEE
 }
 
-// DefaultORAMCacheConfig returns default ORAM cache configuration.
-func DefaultORAMCacheConfig() ORAMCacheConfig {
-	return ORAMCacheConfig{
-		Capacity:     10000,
-		BlockSize:    4096, // 4KB blocks
-		BucketSize:   4,
-		ConstantTime: true,
-	}
-}
-
 // NewORAMCache creates a new ORAM-backed cache.
 func NewORAMCache(cfg ORAMCacheConfig) (*ORAMCache, error) {
-	return NewORAMCacheWithStochastic(cfg, DefaultStochasticConfig())
-}
-
-// NewORAMCacheWithStochastic creates a new ORAM-backed cache with stochastic defenses.
-func NewORAMCacheWithStochastic(cfg ORAMCacheConfig, stochastic StochasticConfig) (*ORAMCache, error) {
 	oramCfg := pathoram.Config{
 		NumBlocks:    cfg.Capacity,
 		BlockSize:    cfg.BlockSize,
@@ -64,16 +44,9 @@ func NewORAMCacheWithStochastic(cfg ORAMCacheConfig, stochastic StochasticConfig
 	}
 
 	cache := &ORAMCache{
-		oram:       oram,
-		cfg:        cfg,
-		used:       make(map[int]bool),
-		stochastic: stochastic,
-		rng:        NewSecureRNG(),
-		stopChurn:  make(chan struct{}),
-	}
-
-	if stochastic.ChurnEnabled && stochastic.ChurnInterval > 0 {
-		go cache.churnLoop()
+		oram: oram,
+		cfg:  cfg,
+		used: make(map[int]bool),
 	}
 
 	return cache, nil
@@ -288,46 +261,6 @@ func (c *ORAMCache) deserialize(data []byte) (*CacheEntry, bool) {
 		Response:  response,
 		ExpiresAt: time.Unix(0, int64(expiresNano)),
 	}, true
-}
-
-// churnLoop periodically evicts a random cache entry.
-func (c *ORAMCache) churnLoop() {
-	ticker := time.NewTicker(c.stochastic.ChurnInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			c.churnOnce()
-		case <-c.stopChurn:
-			return
-		}
-	}
-}
-
-// churnOnce evicts a random cache entry.
-func (c *ORAMCache) churnOnce() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if len(c.used) == 0 {
-		return
-	}
-
-	blockID := int(c.rng.Float64() * float64(c.cfg.Capacity))
-	emptyBlock := make([]byte, c.cfg.BlockSize)
-	if _, err := c.oram.Write(blockID, emptyBlock); err != nil {
-		log.Printf("ORAMCache: churn write error: %v", err)
-		return
-	}
-	delete(c.used, blockID)
-}
-
-// StopChurn stops the churn loop.
-func (c *ORAMCache) StopChurn() {
-	if c.stopChurn != nil {
-		close(c.stopChurn)
-	}
 }
 
 // Compile-time interface check

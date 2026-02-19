@@ -19,25 +19,14 @@ type LRUCache struct {
 	cache    map[string]*list.Element // query -> list element
 	lru      *list.List               // front = most recent, back = least recent
 	mu       sync.RWMutex
-
-	// Stochastic defenses (churn only after Sprint 1)
-	stochastic StochasticConfig
-	rng        *SecureRNG
 }
 
 // NewLRUCache creates a new LRU cache with the given capacity.
 func NewLRUCache(capacity int) *LRUCache {
-	return NewLRUCacheWithStochastic(capacity, DefaultStochasticConfig())
-}
-
-// NewLRUCacheWithStochastic creates a new LRU cache with stochastic defenses.
-func NewLRUCacheWithStochastic(capacity int, stochastic StochasticConfig) *LRUCache {
 	return &LRUCache{
-		capacity:   capacity,
-		cache:      make(map[string]*list.Element),
-		lru:        list.New(),
-		stochastic: stochastic,
-		rng:        NewSecureRNG(),
+		capacity: capacity,
+		cache:    make(map[string]*list.Element),
+		lru:      list.New(),
 	}
 }
 

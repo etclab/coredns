@@ -55,8 +55,6 @@ func parse(c *caddy.Controller) (*odohTarget, error) {
 					return nil, c.ArgErr()
 				}
 				t.upstream = args[0]
-			case "cipher_suite":
-				c.RemainingArgs()
 			case "log_queries":
 				args := c.RemainingArgs()
 				if len(args) == 1 && args[0] == "true" {

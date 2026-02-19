@@ -46,19 +46,4 @@ var (
 		Help:      "Total end-to-end latency for ODoH target requests.",
 		Buckets:   prometheus.DefBuckets,
 	})
-
-	// Token metrics
-	tokensIssuedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Namespace: plugin.Namespace,
-		Subsystem: "codoh_target",
-		Name:      "tokens_issued_total",
-		Help:      "Total number of VOPRF tokens issued.",
-	}, []string{"status"}) // success, rate_limited, error
-
-	tokensVerifiedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Namespace: plugin.Namespace,
-		Subsystem: "codoh_target",
-		Name:      "tokens_verified_total",
-		Help:      "Total number of token verifications.",
-	}, []string{"status"}) // valid, invalid, expired, error
 )

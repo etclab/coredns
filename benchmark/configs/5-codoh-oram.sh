@@ -1,5 +1,5 @@
 #!/bin/bash
-# Config 5: CODoH with ORAM cache
+# Config 5: CODoH IPC with ORAM cache
 # Architecture: Same as Config 4 (3-process IPC)
 # Adds: ORAM-backed cache for access pattern hiding
 
@@ -12,9 +12,7 @@ start_config() {
 
     # Start enclave (simulation mode, ORAM cache)
     echo "Starting enclave (simulation, ORAM cache)..."
-    local secret_hex
-    secret_hex=$(cat "$root_dir/dev-master-secret.txt")
-    CODOH_MASTER_SECRET=$secret_hex CODOH_USE_ORAM=true \
+    CODOH_USE_ORAM=true \
         "$root_dir/enclave-sim" \
         > "$output_dir/enclave.log" 2>&1 &
     sleep 2

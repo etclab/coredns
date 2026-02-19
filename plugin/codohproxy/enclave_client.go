@@ -29,7 +29,6 @@ const (
 // IPC Response Status
 const (
 	statusHit   = "hit"
-	statusMiss  = "miss"
 	statusError = "error"
 	statusOK    = "ok"
 )
