@@ -13,8 +13,10 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/coredns/coredns/enclave"
 )
@@ -139,7 +141,14 @@ func main() {
 		defaultPadSize:      cfg.DefaultPadSize,
 		replayDelta:         cfg.ReplayDelta,
 		// tLatest zero-initialized by atomic.Int64 default
+		defensiveMode:      true, // always start in defensive mode (warm-up)
+		outstandingQueries: make(map[string]int64),
+		warmupThreshold:    cfg.WarmupThreshold,
+		omissionThreshold:  cfg.OmissionThreshold,
+		outstandingTTLSecs: cfg.OutstandingTTLSecs,
+		startedAt:          time.Now().Format(time.RFC3339),
 	}
+	log.Printf("Defensive mode: ACTIVE (warmup threshold=%d)", cfg.WarmupThreshold)
 	if len(provData.SigningPublicKey) > 0 {
 		log.Printf("Target signing pubkey registered (%d bytes)", len(provData.SigningPublicKey))
 	}
@@ -193,6 +202,21 @@ func loadOptionalEnvSettings(cfg *enclave.Config) {
 			cfg.ReplayDelta = f
 		}
 	}
+	if threshold := os.Getenv("CODOH_WARMUP_THRESHOLD"); threshold != "" {
+		if n, err := strconv.Atoi(threshold); err == nil && n > 0 {
+			cfg.WarmupThreshold = n
+		}
+	}
+	if threshold := os.Getenv("CODOH_OMISSION_THRESHOLD"); threshold != "" {
+		if n, err := strconv.Atoi(threshold); err == nil && n > 0 {
+			cfg.OmissionThreshold = n
+		}
+	}
+	if ttl := os.Getenv("CODOH_OUTSTANDING_TTL_SECS"); ttl != "" {
+		if n, err := strconv.Atoi(ttl); err == nil && n > 0 {
+			cfg.OutstandingTTLSecs = n
+		}
+	}
 }
 
 // loadSimSigningPubKey loads the target's Ed25519 signing pubkey from env for simulation mode.
@@ -222,6 +246,15 @@ type EnclaveHandler struct {
 	defaultPadSize      int
 	tLatest             atomic.Int64 // monotonic logical clock (unix seconds)
 	replayDelta         float64      // δ in seconds
+
+	// Defensive mode (Sprint 3)
+	mu                 sync.Mutex
+	defensiveMode      bool             // true on boot + on omission detection
+	outstandingQueries map[string]int64 // canonical_query -> tLatest at time of miss
+	warmupThreshold    int              // cache entries needed to exit defensive mode
+	omissionThreshold  int              // outstanding queries to trigger defensive mode
+	outstandingTTLSecs int              // logical-time window in seconds for outstanding entry eviction
+	startedAt          string           // RFC3339 timestamp of handler construction
 }
 
 // HandleProcess decrypts Q_E, looks up cache, returns encrypted response or dummy.
@@ -236,12 +269,29 @@ func (h *EnclaveHandler) HandleProcess(qe string) *enclave.Response {
 	}
 
 	// Decrypt Q_E and derive session key k_r
+	// Key rotation takes priority: if HPKE decryption fails (wrong key or corrupted),
+	// return key_rotated so the client re-attests.
 	query, kr, err := h.keypair.DecryptQueryE(qeBytes)
 	if err != nil {
-		log.Printf("DecryptQueryE failed: %v", err)
+		log.Printf("DecryptQueryE failed (key rotation?): %v", err)
 		return &enclave.Response{
-			Status: enclave.StatusError,
-			Error:  enclave.ErrHPKEError,
+			Status: enclave.StatusKeyRotated,
+		}
+	}
+
+	h.mu.Lock()
+	inDefensiveMode := h.defensiveMode
+	h.mu.Unlock()
+
+	// Defensive mode: decrypt succeeded (needed for protocol), but return dummy.
+	// Indistinguishable from a normal cache miss to the proxy.
+	if inDefensiveMode {
+		_ = kr // kr derived but not used — defensive mode returns dummy
+		dummy := enclave.GenerateDummyResponse(h.defaultPadSize)
+		h.logCacheOp("miss(defensive)", string(query))
+		return &enclave.Response{
+			Status:   enclave.StatusMiss,
+			Response: base64.StdEncoding.EncodeToString(dummy),
 		}
 	}
 
@@ -264,7 +314,21 @@ func (h *EnclaveHandler) HandleProcess(qe string) *enclave.Response {
 		}
 	}
 
-	// Cache miss — return dummy (indistinguishable from hit)
+	// Cache miss — track outstanding query for omission detection
+	h.mu.Lock()
+	if _, exists := h.outstandingQueries[canonicalQuery]; !exists {
+		h.outstandingQueries[canonicalQuery] = tLatest
+	}
+	if len(h.outstandingQueries) > h.omissionThreshold {
+		log.Printf("Omission threshold exceeded (%d > %d) — entering defensive mode",
+			len(h.outstandingQueries), h.omissionThreshold)
+		h.cache.Clear()
+		h.outstandingQueries = make(map[string]int64)
+		h.defensiveMode = true
+	}
+	h.mu.Unlock()
+
+	// Return dummy (indistinguishable from hit)
 	dummy := enclave.GenerateDummyResponse(h.defaultPadSize)
 	h.logCacheOp("miss", canonicalQuery)
 	return &enclave.Response{
@@ -344,6 +408,28 @@ func (h *EnclaveHandler) HandleStoreEncrypted(encryptedBlob, signature string) *
 	h.cache.Put(bundle.CanonicalQuery, bundle.DNSResponse, bundle.Timestamp, bundle.TTL)
 	h.logCacheOp("store", bundle.CanonicalQuery)
 
+	// Outstanding query tracking + warmup check
+	h.mu.Lock()
+	// Remove from outstanding if present
+	delete(h.outstandingQueries, bundle.CanonicalQuery)
+
+	// Inline cleanup: evict outstanding entries older than TTL window
+	currentTLatest := h.tLatest.Load()
+	ttlWindow := int64(h.outstandingTTLSecs)
+	for q, entryT := range h.outstandingQueries {
+		if entryT < currentTLatest-ttlWindow {
+			delete(h.outstandingQueries, q)
+		}
+	}
+
+	// Check warmup threshold: exit defensive mode if cache is sufficiently full
+	if h.defensiveMode && h.cache.Size() >= h.warmupThreshold {
+		h.defensiveMode = false
+		log.Printf("Exiting defensive mode (cache size=%d >= threshold=%d)",
+			h.cache.Size(), h.warmupThreshold)
+	}
+	h.mu.Unlock()
+
 	return &enclave.Response{Status: enclave.StatusOK}
 }
 
@@ -385,7 +471,7 @@ func (h *EnclaveHandler) HandleGetPubKey() *enclave.Response {
 }
 
 func (h *EnclaveHandler) HandleHealth() *enclave.Response {
-	return &enclave.Response{Status: enclave.StatusOK}
+	return &enclave.Response{Status: enclave.StatusOK, StartedAt: h.startedAt}
 }
 
 // logCacheOp logs cache operations with stash size when using ORAM.

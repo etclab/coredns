@@ -11,10 +11,11 @@ const (
 
 // IPC Response Status
 const (
-	StatusHit   = "hit"
-	StatusMiss  = "miss"
-	StatusError = "error"
-	StatusOK    = "ok"
+	StatusHit        = "hit"
+	StatusMiss       = "miss"
+	StatusError      = "error"
+	StatusOK         = "ok"
+	StatusKeyRotated = "key_rotated"
 )
 
 // Request is the incoming IPC message from proxy.
@@ -31,10 +32,11 @@ type Request struct {
 
 // Response is the outgoing IPC message to proxy.
 type Response struct {
-	Status   string `json:"status"`
-	Response string `json:"response,omitempty"` // base64, encrypted response blob (hit or dummy)
-	Error    string `json:"error,omitempty"`    // error description
-	PubKey   string `json:"pubkey,omitempty"`   // base64, for get_pubkey
+	Status    string `json:"status"`
+	Response  string `json:"response,omitempty"`    // base64, encrypted response blob (hit or dummy)
+	Error     string `json:"error,omitempty"`       // error description
+	PubKey    string `json:"pubkey,omitempty"`      // base64, for get_pubkey
+	StartedAt string `json:"started_at,omitempty"` // RFC3339, enclave start time
 }
 
 // Error codes for IPC responses.

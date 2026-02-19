@@ -225,9 +225,9 @@ func (p *odohProxy) proxyHandler(w http.ResponseWriter, r *http.Request) {
 		enclaveError = "enclave_unavailable"
 		// Reactive pk_E refresh
 		go p.refreshEnclavePubKey()
-	} else if enclaveRes.resp.Status == statusError && enclaveRes.resp.Error == "hpke_error" {
-		enclaveError = "key_mismatch"
-		// Reactive pk_E refresh on HPKE error
+	} else if enclaveRes.resp.Status == statusKeyRotated {
+		enclaveError = "key_rotated"
+		log.Infof("Enclave key rotation detected")
 		go p.refreshEnclavePubKey()
 	} else if enclaveRes.resp.Status == statusError {
 		enclaveError = enclaveRes.resp.Error
@@ -297,6 +297,9 @@ func (p *odohProxy) proxyHandler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", odohContentType)
 		if enclaveError != "" {
 			w.Header().Set("X-CoDOH-Enclave-Error", enclaveError)
+		}
+		if enclaveError == "key_rotated" {
+			w.Header().Set("X-CoDOH-Key-Rotated", "true")
 		}
 		w.WriteHeader(http.StatusOK)
 		w.Write(targetRes.body)

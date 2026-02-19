@@ -178,7 +178,7 @@ cd ../codoh-client
 | IPC: `process` | Decrypt Q_E, check cache, return encrypted response or dummy |
 | IPC: `store_encrypted` | Store HPKE-encrypted response with signature verification |
 | IPC: `get_pubkey` | Get enclave's HPKE public key |
-| IPC: `health` | Health check |
+| IPC: `health` | Health check (includes `started_at` for restart detection) |
 | HTTPS: `/attest` | Get SGX quote + public key |
 | HTTPS: `/provision` | Receive signing pubkey for cache-insert verification |
 | HTTPS: `/health` | Health check |
@@ -194,6 +194,8 @@ cd ../codoh-client
 | `X-Enclave-Cache` | Target -> Proxy | Base64-encoded HPKE-encrypted cache-insert bundle |
 | `X-Enclave-Cache-Sig` | Target -> Proxy | Base64-encoded Ed25519 signature |
 | `X-Enclave-Cache-TTL` | Target -> Proxy | TTL in seconds for cache entry |
+| `X-CoDOH-Key-Rotated` | Proxy -> Client | `true` when enclave pk_E has rotated (restart). Client should re-fetch pk_E from `/enclave-keys` |
+| `X-CoDOH-Enclave-Error` | Proxy -> Client | Error code when enclave leg fails (e.g., `key_rotated`, `enclave_unavailable`) |
 
 ---
 
@@ -276,6 +278,9 @@ codohtarget {
 | `CODOH_ORAM_BLOCK_SIZE` | 4096 | ORAM block size in bytes |
 | `CODOH_DEFAULT_PAD_SIZE` | 512 | Dummy response size in bytes |
 | `CODOH_TARGET_SIGNING_PUBKEY` | - | Base64 Ed25519 pubkey (simulation mode only) |
+| `CODOH_WARMUP_THRESHOLD` | 100 | Cache entries needed to exit defensive mode |
+| `CODOH_OMISSION_THRESHOLD` | 50 | Outstanding queries to trigger defensive mode |
+| `CODOH_OUTSTANDING_TTL_SECS` | 300 | Logical-time window (seconds) for outstanding query eviction |
 
 ---
 
@@ -294,7 +299,7 @@ Client → Proxy (codohproxy plugin) → Target (codohtarget plugin) → Upstrea
 
 **Processes:**
 
-1. **Enclave** (`enclave-sim` or SGX `enclave`) — HPKE keypair, cache (LRU or ORAM), Q_E decryption, cache-insert verification
+1. **Enclave** (`enclave-sim` or SGX `enclave`) — HPKE keypair, cache (LRU or ORAM), Q_E decryption, cache-insert verification, defensive mode, omission detection
 2. **Proxy** (`codohproxy` plugin, port 8080) — fans out Q_E to enclave + Q_T to target in parallel
 3. **Target** (`codohtarget` plugin, port 8443) — ODoH resolution, cache-insert bundle construction, Ed25519 signing
 
@@ -312,6 +317,25 @@ Client → Proxy (codohproxy plugin) → Target (codohtarget plugin) → Upstrea
 1-4 same as above, but enclave finds cached response, encrypts under session key k_r (derived via HPKE Export), returns `status: "hit"`
 5. Proxy returns two-chunk response: enclave's encrypted cached response + target's ODoH response
 6. Client decrypts cached response with k_r
+
+**Defensive Mode (Sprint 3):**
+
+The enclave starts in defensive mode on boot and enters it again if it detects cache omission attacks. In defensive mode, all queries return `status:"miss"` with a dummy blob — indistinguishable from a normal cache miss to the proxy.
+
+- **Boot warm-up**: `defensiveMode=true` on start. Exits when `cache.Size() >= WarmupThreshold` (default 100).
+- **Omission detection**: Tracks outstanding queries (misses without corresponding stores). When `len(outstandingQueries) > OmissionThreshold` (default 50), enters defensive mode, clears cache, clears outstanding map. Recovery is the same: fill cache to threshold.
+- **Outstanding TTL**: Entries older than `OutstandingTTLSecs` (default 300s, logical time) are evicted inline during `store_encrypted` handling.
+- **Key rotation**: HPKE decryption failure returns `status:"key_rotated"`. Proxy sets `X-CoDOH-Key-Rotated: true` header. Client re-fetches pk_E from `/enclave-keys`.
+- **Health**: Returns `started_at` (RFC3339) for restart detection.
+
+**IPC Response Statuses:**
+| Status | Meaning |
+|--------|---------|
+| `hit` | Cache hit, encrypted response under k_r |
+| `miss` | Cache miss (or defensive mode), dummy blob |
+| `ok` | Successful store or health check |
+| `error` | Operation failed (see `error` field) |
+| `key_rotated` | HPKE decryption failed, client has stale pk_E |
 
 ### CODoH-base (Proxy Mode, Config 3)
 
@@ -346,6 +370,17 @@ Client → Proxy (HTTPS, built-in cache) → ODoH Target → Upstream DNS
     --distribution zipf \
     --customcert localhost.pem
 ```
+
+---
+
+## Client pk_E Management
+
+The client caches the enclave public key (pk_E) via `EnclaveState` (in `codoh-client/commands/enclave_state.go`):
+
+- **One `EnclaveState` per command invocation** (benchmark loop, latency test, single query)
+- `GetOrFetchPubKey()` returns the cached key; fetches from `/enclave-keys` on first call
+- `RefreshPubKey()` forces a network re-fetch — called when `X-CoDOH-Key-Rotated: true` is received
+- Fetches directly from `/enclave-keys`, bypassing the global TTL cache in `FetchEnclavePublicKey()`
 
 ---
 

@@ -28,9 +28,10 @@ const (
 
 // IPC Response Status
 const (
-	statusHit   = "hit"
-	statusError = "error"
-	statusOK    = "ok"
+	statusHit        = "hit"
+	statusError      = "error"
+	statusOK         = "ok"
+	statusKeyRotated = "key_rotated"
 )
 
 // EnclaveRequest is the IPC request to the enclave.

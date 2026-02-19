@@ -174,12 +174,18 @@ SGX has no trusted clock. The enclave maintains `t_latest` (highest timestamp se
 | IPC message types | enclave/types.go | process, store_encrypted, get_pubkey, health |
 | Proxy mode (CODoH-base) | enclave/cmd/proxy_mode.go | 2-process HTTPS server with LRU cache |
 | Client-side HPKE helpers | enclave/client_crypto.go | EncryptQueryE, DecryptCachedResponse |
+| Defensive mode (restart warm-up) | enclave/cmd/main.go | Starts in defensive mode, exits at WarmupThreshold |
+| Cache omission detection | enclave/cmd/main.go | Outstanding query tracking, enters defensive mode at OmissionThreshold |
+| Outstanding query TTL cleanup | enclave/cmd/main.go | Inline eviction using logical time (tLatest - OutstandingTTLSecs) |
+| Key rotation signaling | enclave/cmd/main.go, enclave/types.go | HPKE failure returns `key_rotated` status |
+| Health with restart metadata | enclave/cmd/main.go | `started_at` (RFC3339) in health response |
 | | | |
 | **Proxy Plugin** | | |
 | Parallel fan-out (enclave + target) | plugin/codohproxy/proxy.go | Concurrent goroutines |
 | /enclave-keys endpoint | plugin/codohproxy/proxy.go | Serves pk_E |
 | /proxy endpoint | plugin/codohproxy/proxy.go | Main CODoH relay |
 | Enclave IPC client | plugin/codohproxy/enclave_client.go | Unix socket client |
+| Key rotation header forwarding | plugin/codohproxy/proxy.go | Sets X-CoDOH-Key-Rotated header on key_rotated status |
 | Bypass mode | plugin/codohproxy/proxy.go | Falls back to plain ODoH |
 | Prometheus metrics | plugin/codohproxy/metrics.go | |
 | Config options | plugin/codohproxy/setup.go | Corefile parsing |
@@ -193,17 +199,28 @@ SGX has no trusted clock. The enclave maintains `t_latest` (highest timestamp se
 | Prometheus metrics | plugin/codohtarget/metrics.go | |
 | Config options | plugin/codohtarget/setup.go | Corefile parsing |
 
-### Not Yet Implemented (from paper design)
+### Paper Defenses Status
 
-| Feature | Paper Section | Description |
-|---------|---------------|-------------|
-| **Cover responses** | Set-difference mitigations | Target returns k cover answers for random domains alongside the real answer |
-| **Batched cache insertions** | Set-difference mitigations | Queue insertions and commit in batches of size B on pseudorandom schedule |
-| **Anonymous tokens** | Rate-limiting | Tokens to bound cache enumeration by untrusted proxy; mechanism TBD (network-level rate limiting + optional PoW) |
-| **Restart warm-up mode** | Restart handling | After restart, disable cache hits until cache refilled to threshold |
-| **Cache omission detection** | Cache omission attack | Track outstanding queries missing responses; enter defensive mode if threshold exceeded |
-| **Session ID (sid)** | Base protocol | Explicit sid field in AAD to bind query ciphertext to key ciphertexts and prevent cross-use |
-| **Dual HPKE key wrapping** | Base protocol | Random symmetric key k encrypted separately to target and enclave (current design encrypts query directly under pk_E) |
+| Defense | Goal | Status | Notes |
+|---------|------|--------|-------|
+| HPKE query encryption (pk_E) | G3 | Done | Query privacy from proxy |
+| Ed25519 cache-insert signing | G1 | Done | Prevents cache poisoning/tampering |
+| Timestamp replay protection | G1 | Done | Monotonic t_latest + δ-window |
+| Hit/miss dummy responses | G2, G3 | Done | Indistinguishable to proxy |
+| ORAM cache | G2 | Done | Path ORAM, optional via config |
+| SGX attestation + provisioning | G1 | Done | DCAP quote, signing key delivery |
+| Restart warm-up mode | G2 | Done | Defensive mode on boot, exits at WarmupThreshold |
+| Cache omission detection | G2 | Done | Outstanding query tracking, enters defensive mode at OmissionThreshold |
+| Cover responses | G2 | Not yet | Target returns k random domains per cache-insert |
+| Batched cache insertions | G2 | Not yet | Queue + pseudorandom commit schedule |
+| Session ID (sid) binding | G3 | Not yet | Explicit sid in AAD to prevent cross-use |
+| Dual HPKE key wrapping | G3 | Not yet | Symmetric key k encrypted separately to target and enclave |
+
+### Implementation-Only Features (not in paper)
+
+| Feature | Notes |
+|---------|-------|
+| Key rotation signaling | `key_rotated` IPC status + `X-CoDOH-Key-Rotated` header. Paper says enclave "returns a key error" on restart but specifies no protocol for it. Key distribution is explicitly out of scope in the paper. |
 
 ---
 
@@ -256,6 +273,9 @@ codohtarget {
 | CODOH_DEFAULT_PAD_SIZE | 512 | Dummy response size in bytes |
 | CODOH_REPLAY_DELTA_SECS | 3.0 | Timestamp replay window (seconds) |
 | CODOH_TARGET_SIGNING_PUBKEY | - | Base64 Ed25519 pubkey (sim mode only) |
+| CODOH_WARMUP_THRESHOLD | 100 | Cache entries needed to exit defensive mode |
+| CODOH_OMISSION_THRESHOLD | 50 | Outstanding queries to trigger defensive mode |
+| CODOH_OUTSTANDING_TTL_SECS | 300 | Logical-time window (seconds) for outstanding query eviction |
 
 ---
 
@@ -268,6 +288,8 @@ codohtarget {
 | X-Enclave-Cache | Target -> Proxy | Base64-encoded HPKE-encrypted cache-insert bundle |
 | X-Enclave-Cache-Sig | Target -> Proxy | Base64-encoded Ed25519 signature |
 | X-Enclave-Cache-TTL | Target -> Proxy | TTL in seconds for cache entry |
+| X-CoDOH-Key-Rotated | Proxy -> Client | `true` when enclave pk_E has rotated; client should re-fetch from `/enclave-keys` |
+| X-CoDOH-Enclave-Error | Proxy -> Client | Error code when enclave leg fails (e.g., `key_rotated`, `enclave_unavailable`) |
 
 ## Content Types
 
@@ -284,7 +306,7 @@ codohtarget {
 Wire format: [4 bytes: length (big-endian)][JSON payload]
 
 Request types:  process, store_encrypted, get_pubkey, health
-Response status: hit, miss, error, ok
+Response status: hit, miss, error, ok, key_rotated
 ```
 
 ---
@@ -360,26 +382,10 @@ coredns/
     └── commands/
         ├── blob.go            # Q_E encryption (HPKE)
         ├── commands.go        # CLI flags (--protocol codoh)
+        ├── enclave_state.go   # pk_E caching + refresh on key rotation
         ├── request.go         # HTTP request construction
         └── latency.go         # Latency benchmarking
 ```
-
----
-
-## Security Properties
-
-| Property | Mechanism | Status |
-|----------|-----------|--------|
-| Query privacy from proxy | Q_E encrypted under pk_E (HPKE) | Implemented |
-| Cache integrity (G1) | Target signs bundles with Ed25519, enclave verifies | Implemented |
-| Freshness (G1) | Timestamp δ-window + monotonic t_latest | Implemented |
-| Hit/miss indistinguishability | Dummy response on miss (same size as hit) | Implemented |
-| Access-pattern hiding (G2) | ORAM cache option (Path ORAM) | Implemented |
-| Secret provisioning | SGX attestation + HPKE encryption | Implemented |
-| Set-difference resistance (G2) | Cover responses + batched insertions | Not yet implemented |
-| Restart resistance (G2) | Warm-up mode (disable hits until refilled) | Not yet implemented |
-| Cache omission resistance (G2) | Outstanding query tracking + defensive mode | Not yet implemented |
-| Query profiling resistance (G3) | Anonymous tokens to rate-limit proxy probing | Not yet implemented |
 
 ---
 
