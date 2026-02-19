@@ -10,4 +10,5 @@ type Cache interface {
 	Size() int
 	Clear()
 	CleanExpired(tLatest int64) int
+	PutBatch(entries []PendingInsert)
 }

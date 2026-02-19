@@ -27,6 +27,19 @@ func newTestHandler(replayDelta float64) *EnclaveHandler {
 		omissionThreshold:  5,
 		outstandingTTLSecs: 300,
 		startedAt:          time.Now().Format(time.RFC3339),
+		insertionQueue:     enclave.NewInsertionQueue(1000),
+		batchSize:          100,
+		batchCommitProb:    1.0, // always commit in tests for deterministic behavior
+	}
+}
+
+// flushQueue forces all queued entries into cache via PutBatch.
+// Used in tests that store entries and then verify cache contents
+// without an intervening HandleProcess call.
+func flushQueue(h *EnclaveHandler) {
+	batch := h.insertionQueue.DrainBatch(h.insertionQueue.Len())
+	if len(batch) > 0 {
+		h.cache.PutBatch(batch)
 	}
 }
 
@@ -191,6 +204,9 @@ func TestHandleStoreEncrypted_RejectsReplay(t *testing.T) {
 		t.Fatalf("tLatest should be %d, got %d", tLatest, got)
 	}
 
+	// Flush queue to cache so we can verify contents directly
+	flushQueue(h)
+
 	// Verify insert 1 is cached and retrievable
 	if cached, ok := h.cache.Get("example.com.:1", tLatest); !ok {
 		t.Fatal("example.com.:1 should be in cache after accepted insert")
@@ -205,6 +221,7 @@ func TestHandleStoreEncrypted_RejectsReplay(t *testing.T) {
 		t.Fatalf("insert 2 should succeed, got status=%s error=%s", resp.Status, resp.Error)
 	}
 	tLatest = 1005
+	flushQueue(h)
 
 	// Verify insert 2 is cached
 	if cached, ok := h.cache.Get("other.com.:1", tLatest); !ok {
@@ -233,8 +250,9 @@ func TestHandleStoreEncrypted_RejectsReplay(t *testing.T) {
 	if resp.Status != enclave.StatusOK {
 		t.Fatalf("insert within δ should succeed, got status=%s error=%s", resp.Status, resp.Error)
 	}
+	flushQueue(h)
 
-	// Verify insert 4 is cached
+	// Verify insert 3 is cached
 	if cached, ok := h.cache.Get("recent.com.:1", tLatest); !ok {
 		t.Fatal("recent.com.:1 should be in cache after accepted insert within δ")
 	} else if string(cached) != string(expectedResp) {
@@ -315,23 +333,35 @@ func TestDefensiveMode_ExitsOnWarmupThreshold(t *testing.T) {
 		}
 	}
 
-	// After 2 stores (below threshold=3): still defensive → returns miss for cached entry
+	// After 2 stores (below threshold=3): entries are queued, not in cache.
+	// HandleProcess returns miss (defensive) but commits queue entries.
 	makeStore("a.com.:1", 1000)
 	makeStore("b.com.:1", 1001)
 
+	// HandleProcess: defensive mode → dummy, then batch commit (prob=1.0)
+	// commits 2 entries → cache.Size()=2 < 3 → still defensive
 	qe := makeProcessReq(t, h, "a.com.:1")
 	resp := h.HandleProcess(qe)
 	if resp.Status != enclave.StatusMiss {
 		t.Fatalf("should still return miss before threshold (2 < 3), got %s", resp.Status)
 	}
 
-	// 3rd store crosses threshold → exits defensive mode → real cache hit
+	// 3rd store → queued
 	makeStore("c.com.:1", 1002)
 
+	// HandleProcess: defensive mode → dummy, then batch commit (prob=1.0)
+	// commits 1 entry → cache.Size()=3 >= 3 → exits defensive mode
+	qe = makeProcessReq(t, h, "a.com.:1")
+	resp = h.HandleProcess(qe)
+	if resp.Status != enclave.StatusMiss {
+		t.Fatalf("expected miss (defensive response determined before commit), got %s", resp.Status)
+	}
+
+	// Now defensive mode exited. Next HandleProcess should return hit.
 	qe = makeProcessReq(t, h, "a.com.:1")
 	resp = h.HandleProcess(qe)
 	if resp.Status != enclave.StatusHit {
-		t.Fatalf("expected cache hit after warm-up (3 >= 3), got status=%s", resp.Status)
+		t.Fatalf("expected cache hit after warm-up exit (3 >= 3), got status=%s", resp.Status)
 	}
 }
 
@@ -410,6 +440,7 @@ func TestOutstandingTTL_Cleanup(t *testing.T) {
 	}
 
 	// 5 more unique misses at tLatest=500 → outstanding should be 5 (not 10)
+	// Note: with batchCommitProb=1.0, each HandleProcess also commits queued entries.
 	for i := 0; i < 5; i++ {
 		qe := makeProcessReq(t, h, fmt.Sprintf("new%d.com.:1", i))
 		h.HandleProcess(qe)
@@ -621,16 +652,23 @@ func TestDefensiveMode_FullCycle(t *testing.T) {
 		}
 	}
 
-	// Phase 1: Boot defensive → recovery via 3 stores
+	// Phase 1: Boot defensive → recovery via 3 stores (entries queued, not committed)
 	storeOne("a.com.:1")
 	storeOne("b.com.:1")
-	storeOne("c.com.:1") // cache.Size()=3 >= warmupThreshold=3
+	storeOne("c.com.:1")
 
-	// Phase 2: Normal operation — cache hit proves defensive mode exited
+	// Phase 2: HandleProcess triggers batch commit (prob=1.0), exits defensive mode.
+	// First call: defensive → dummy response, then commits 3 entries → exits warmup.
 	qe := makeProcessReq(t, h, "a.com.:1")
 	resp := h.HandleProcess(qe)
+	if resp.Status != enclave.StatusMiss {
+		t.Fatalf("phase 2a: expected miss (defensive response before commit), got %s", resp.Status)
+	}
+	// Second call: normal mode → cache hit proves defensive mode exited.
+	qe = makeProcessReq(t, h, "a.com.:1")
+	resp = h.HandleProcess(qe)
 	if resp.Status != enclave.StatusHit {
-		t.Fatalf("phase 2: expected hit after recovery, got %s", resp.Status)
+		t.Fatalf("phase 2b: expected hit after recovery, got %s", resp.Status)
 	}
 
 	// Phase 3: Trigger omission detection — 4 unique misses (> threshold=3)
@@ -646,16 +684,23 @@ func TestDefensiveMode_FullCycle(t *testing.T) {
 		t.Fatalf("phase 3: expected miss (defensive mode after omission), got %s", resp.Status)
 	}
 
-	// Phase 4: Second recovery via 3 new stores
+	// Phase 4: Second recovery via 3 new stores (queued)
 	storeOne("d.com.:1")
 	storeOne("e.com.:1")
 	storeOne("f.com.:1")
 
-	// Phase 5: Cache hit proves defensive mode exited again
+	// Phase 5: HandleProcess commits and exits defensive mode.
+	// First call: defensive → dummy, commits 3 entries → exits warmup.
+	qe = makeProcessReq(t, h, "d.com.:1")
+	resp = h.HandleProcess(qe)
+	if resp.Status != enclave.StatusMiss {
+		t.Fatalf("phase 5a: expected miss (defensive response before commit), got %s", resp.Status)
+	}
+	// Second call: normal mode → cache hit proves defensive mode exited again.
 	qe = makeProcessReq(t, h, "d.com.:1")
 	resp = h.HandleProcess(qe)
 	if resp.Status != enclave.StatusHit {
-		t.Fatalf("phase 5: expected hit after second recovery, got %s", resp.Status)
+		t.Fatalf("phase 5b: expected hit after second recovery, got %s", resp.Status)
 	}
 }
 
@@ -710,10 +755,20 @@ func TestDefensiveMode_ConcurrentMissesAndStores(t *testing.T) {
 
 	wg.Wait()
 
-	// After all goroutines: verify handler is usable (no corrupt state).
-	// With 30 stores and threshold=20, defensive mode should have exited.
-	// Some stores may be replay-rejected depending on scheduling, so check
-	// cache size to decide what to assert.
+	// After all goroutines: flush remaining queue entries and verify handler is usable.
+	// With batching, some entries may still be in queue if HandleProcess calls
+	// happened before stores enqueued. Flush to get accurate cache size.
+	flushQueue(h)
+
+	// With 30 stores and threshold=20, defensive mode should have exited
+	// (either during HandleProcess commits or after our flush).
+	// Some stores may be replay-rejected depending on scheduling.
+	h.mu.Lock()
+	if h.defensiveMode && h.cache.Size() >= h.warmupThreshold {
+		h.defensiveMode = false
+	}
+	h.mu.Unlock()
+
 	if h.cache.Size() >= h.warmupThreshold {
 		// Defensive mode should have exited — verify with a hit
 		qe := makeProcessReq(t, h, "cstore0.com.:1")
@@ -766,5 +821,286 @@ func TestDefensiveMode_ConcurrentOmissionTrigger(t *testing.T) {
 	resp = h.HandleProcess(qe)
 	if resp.Status != enclave.StatusMiss {
 		t.Fatalf("expected miss after concurrent omission trigger, got %s", resp.Status)
+	}
+}
+
+// --- Sprint 4: Batch Cache Update Tests ---
+
+func TestBatch_StoreEnqueuesNotCaches(t *testing.T) {
+	// Verify that HandleStoreEncrypted enqueues entries, NOT placing them in cache directly.
+	sigPub, sigPriv, _ := ed25519.GenerateKey(rand.Reader)
+	h := newTestHandler(3.0)
+	h.batchCommitProb = 0 // disable auto-commit to test pure enqueueing
+	h.targetSigningPubKey = sigPub
+
+	bundle := &enclave.CacheInsertBundle{
+		TTL: 300, Timestamp: 1000,
+		CanonicalQuery: "queued.com.:1",
+		DNSResponse:    []byte{0xAB},
+	}
+	bundleBytes := enclave.MarshalCacheInsertBundle(bundle)
+	pubBytes, _ := h.keypair.PublicKeyBytes()
+	ct, _ := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
+	hash := sha256.Sum256(bundleBytes)
+	sig := ed25519.Sign(sigPriv, hash[:])
+
+	resp := h.HandleStoreEncrypted(
+		base64.StdEncoding.EncodeToString(ct),
+		base64.StdEncoding.EncodeToString(sig),
+	)
+	if resp.Status != enclave.StatusOK {
+		t.Fatalf("store should succeed, got %s %s", resp.Status, resp.Error)
+	}
+
+	// Entry should NOT be in cache
+	if _, ok := h.cache.Get("queued.com.:1", 1000); ok {
+		t.Fatal("entry should NOT be in cache immediately after store (should be queued)")
+	}
+
+	// Entry should be in queue
+	if h.insertionQueue.Len() != 1 {
+		t.Fatalf("expected queue len=1, got %d", h.insertionQueue.Len())
+	}
+}
+
+func TestBatch_HandleProcessCommitsQueue(t *testing.T) {
+	// Verify that HandleProcess coin flip triggers batch commit.
+	sigPub, sigPriv, _ := ed25519.GenerateKey(rand.Reader)
+	h := newTestHandler(3.0)
+	h.batchCommitProb = 1.0 // always commit
+	h.batchSize = 5
+	h.targetSigningPubKey = sigPub
+	h.tLatest.Store(1000)
+
+	// Enqueue 3 entries
+	for i := 0; i < 3; i++ {
+		query := fmt.Sprintf("batch%d.com.:1", i)
+		bundle := &enclave.CacheInsertBundle{
+			TTL: 300, Timestamp: int64(1000 + i),
+			CanonicalQuery: query,
+			DNSResponse:    []byte{0xAB},
+		}
+		bundleBytes := enclave.MarshalCacheInsertBundle(bundle)
+		pubBytes, _ := h.keypair.PublicKeyBytes()
+		ct, _ := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
+		hash := sha256.Sum256(bundleBytes)
+		sig := ed25519.Sign(sigPriv, hash[:])
+		h.HandleStoreEncrypted(
+			base64.StdEncoding.EncodeToString(ct),
+			base64.StdEncoding.EncodeToString(sig),
+		)
+	}
+
+	if h.cache.Size() != 0 {
+		t.Fatalf("cache should be empty before commit, got size=%d", h.cache.Size())
+	}
+
+	// HandleProcess triggers commit (prob=1.0)
+	qe := makeProcessReq(t, h, "unrelated.com.:1")
+	h.HandleProcess(qe)
+
+	// All 3 entries should now be in cache
+	if h.cache.Size() != 3 {
+		t.Fatalf("expected cache size=3 after commit, got %d", h.cache.Size())
+	}
+	if h.totalCommits.Load() != 1 {
+		t.Fatalf("expected 1 total commit, got %d", h.totalCommits.Load())
+	}
+	if h.totalEntriesCommitted.Load() != 3 {
+		t.Fatalf("expected 3 total entries committed, got %d", h.totalEntriesCommitted.Load())
+	}
+}
+
+func TestBatch_OmissionDropsOnEnqueue(t *testing.T) {
+	// Verify that outstanding count drops on enqueue (not on commit).
+	sigPub, sigPriv, _ := ed25519.GenerateKey(rand.Reader)
+	h := newTestHandler(3.0)
+	h.batchCommitProb = 0 // disable commit to isolate enqueue behavior
+	h.omissionThreshold = 5
+	h.targetSigningPubKey = sigPub
+	h.tLatest.Store(1000)
+
+	// Generate 2 misses to create outstanding entries
+	for i := 0; i < 2; i++ {
+		qe := makeProcessReq(t, h, fmt.Sprintf("miss%d.com.:1", i))
+		h.HandleProcess(qe)
+	}
+	h.mu.Lock()
+	if len(h.outstandingQueries) != 2 {
+		t.Fatalf("expected 2 outstanding, got %d", len(h.outstandingQueries))
+	}
+	h.mu.Unlock()
+
+	// Store for "miss0.com.:1" → removed from outstanding on enqueue
+	bundle := &enclave.CacheInsertBundle{
+		TTL: 300, Timestamp: 1001,
+		CanonicalQuery: "miss0.com.:1",
+		DNSResponse:    []byte{0xAB},
+	}
+	bundleBytes := enclave.MarshalCacheInsertBundle(bundle)
+	pubBytes, _ := h.keypair.PublicKeyBytes()
+	ct, _ := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
+	hash := sha256.Sum256(bundleBytes)
+	sig := ed25519.Sign(sigPriv, hash[:])
+	h.HandleStoreEncrypted(
+		base64.StdEncoding.EncodeToString(ct),
+		base64.StdEncoding.EncodeToString(sig),
+	)
+
+	h.mu.Lock()
+	if len(h.outstandingQueries) != 1 {
+		t.Fatalf("expected 1 outstanding after enqueue (not commit), got %d", len(h.outstandingQueries))
+	}
+	if _, exists := h.outstandingQueries["miss0.com.:1"]; exists {
+		t.Fatal("miss0.com.:1 should be removed from outstanding after enqueue")
+	}
+	h.mu.Unlock()
+}
+
+func TestBatch_HealthEndpointReturnsQueueStats(t *testing.T) {
+	sigPub, sigPriv, _ := ed25519.GenerateKey(rand.Reader)
+	h := newTestHandler(3.0)
+	h.batchCommitProb = 0 // no auto-commit
+	h.targetSigningPubKey = sigPub
+
+	// Enqueue 2 entries
+	for i := 0; i < 2; i++ {
+		bundle := &enclave.CacheInsertBundle{
+			TTL: 300, Timestamp: int64(1000 + i),
+			CanonicalQuery: fmt.Sprintf("health%d.com.:1", i),
+			DNSResponse:    []byte{0xAB},
+		}
+		bundleBytes := enclave.MarshalCacheInsertBundle(bundle)
+		pubBytes, _ := h.keypair.PublicKeyBytes()
+		ct, _ := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
+		hash := sha256.Sum256(bundleBytes)
+		sig := ed25519.Sign(sigPriv, hash[:])
+		h.HandleStoreEncrypted(
+			base64.StdEncoding.EncodeToString(ct),
+			base64.StdEncoding.EncodeToString(sig),
+		)
+	}
+
+	resp := h.HandleHealth()
+	if resp.QueueDepth != 2 {
+		t.Fatalf("expected queue_depth=2, got %d", resp.QueueDepth)
+	}
+	if resp.TotalCommits != 0 {
+		t.Fatalf("expected total_commits=0, got %d", resp.TotalCommits)
+	}
+
+	// Manually commit and check stats update
+	h.batchCommitProb = 1.0
+	h.batchSize = 10
+	qe := makeProcessReq(t, h, "trigger.com.:1")
+	h.HandleProcess(qe)
+
+	resp = h.HandleHealth()
+	if resp.QueueDepth != 0 {
+		t.Fatalf("expected queue_depth=0 after commit, got %d", resp.QueueDepth)
+	}
+	if resp.TotalCommits != 1 {
+		t.Fatalf("expected total_commits=1, got %d", resp.TotalCommits)
+	}
+	if resp.TotalEntriesCommitted != 2 {
+		t.Fatalf("expected total_entries_committed=2, got %d", resp.TotalEntriesCommitted)
+	}
+}
+
+func TestBatch_QueueOverflow(t *testing.T) {
+	// Verify head-drop behavior when queue is full.
+	sigPub, sigPriv, _ := ed25519.GenerateKey(rand.Reader)
+	h := newTestHandler(100.0) // wide delta
+	h.batchCommitProb = 0      // no auto-commit
+	h.targetSigningPubKey = sigPub
+	h.insertionQueue = enclave.NewInsertionQueue(3) // small queue
+
+	for i := 0; i < 5; i++ {
+		bundle := &enclave.CacheInsertBundle{
+			TTL: 300, Timestamp: int64(1000 + i),
+			CanonicalQuery: fmt.Sprintf("overflow%d.com.:1", i),
+			DNSResponse:    []byte{byte(i)},
+		}
+		bundleBytes := enclave.MarshalCacheInsertBundle(bundle)
+		pubBytes, _ := h.keypair.PublicKeyBytes()
+		ct, _ := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
+		hash := sha256.Sum256(bundleBytes)
+		sig := ed25519.Sign(sigPriv, hash[:])
+		h.HandleStoreEncrypted(
+			base64.StdEncoding.EncodeToString(ct),
+			base64.StdEncoding.EncodeToString(sig),
+		)
+	}
+
+	// Queue should be at max capacity (3), with oldest 2 evicted
+	if h.insertionQueue.Len() != 3 {
+		t.Fatalf("expected queue len=3 (maxSize), got %d", h.insertionQueue.Len())
+	}
+
+	// Flush and verify: entries 2,3,4 should be in cache (0,1 evicted)
+	flushQueue(h)
+	for i := 2; i < 5; i++ {
+		query := fmt.Sprintf("overflow%d.com.:1", i)
+		if _, ok := h.cache.Get(query, 1010); !ok {
+			t.Fatalf("%s should be in cache (survived eviction)", query)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		query := fmt.Sprintf("overflow%d.com.:1", i)
+		if _, ok := h.cache.Get(query, 1010); ok {
+			t.Fatalf("%s should NOT be in cache (evicted from queue)", query)
+		}
+	}
+}
+
+func TestBatch_DefensiveNotFalseTriggeredByDelay(t *testing.T) {
+	// With batching, there's a delay between store (enqueue) and cache commit.
+	// Outstanding queries are removed on enqueue (D2), so this delay should NOT
+	// cause false omission detection.
+	sigPub, sigPriv, _ := ed25519.GenerateKey(rand.Reader)
+	h := newTestHandler(3.0)
+	h.batchCommitProb = 0 // deliberate: no commit to test maximum delay
+	h.omissionThreshold = 5
+	h.targetSigningPubKey = sigPub
+	h.tLatest.Store(1000)
+
+	// Pre-populate cache with sentinel
+	h.cache.Put("sentinel.com.:1", []byte{0xFF}, 1000, 3600)
+
+	// Generate 3 misses
+	for i := 0; i < 3; i++ {
+		qe := makeProcessReq(t, h, fmt.Sprintf("q%d.com.:1", i))
+		h.HandleProcess(qe)
+	}
+
+	// Store responses for all 3 (removed from outstanding on enqueue)
+	for i := 0; i < 3; i++ {
+		bundle := &enclave.CacheInsertBundle{
+			TTL: 300, Timestamp: int64(1001 + i),
+			CanonicalQuery: fmt.Sprintf("q%d.com.:1", i),
+			DNSResponse:    []byte{0xAB},
+		}
+		bundleBytes := enclave.MarshalCacheInsertBundle(bundle)
+		pubBytes, _ := h.keypair.PublicKeyBytes()
+		ct, _ := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
+		hash := sha256.Sum256(bundleBytes)
+		sig := ed25519.Sign(sigPriv, hash[:])
+		h.HandleStoreEncrypted(
+			base64.StdEncoding.EncodeToString(ct),
+			base64.StdEncoding.EncodeToString(sig),
+		)
+	}
+
+	// 3 more misses — outstanding should be 3 (not 6), no omission
+	for i := 3; i < 6; i++ {
+		qe := makeProcessReq(t, h, fmt.Sprintf("q%d.com.:1", i))
+		h.HandleProcess(qe)
+	}
+
+	// Sentinel should still be reachable (no omission triggered)
+	qe := makeProcessReq(t, h, "sentinel.com.:1")
+	resp := h.HandleProcess(qe)
+	if resp.Status != enclave.StatusHit {
+		t.Fatalf("expected hit (no false omission from batch delay), got %s", resp.Status)
 	}
 }

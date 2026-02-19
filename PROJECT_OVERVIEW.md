@@ -104,7 +104,7 @@ Client              Proxy                 Enclave              Target
    |                   |-- store_encrypted ->| Verify Ed25519 sig |
    |                   |   (async, on miss)  | Validate timestamp |
    |                   |                     | Decrypt bundle     |
-   |                   |                     | cache.Put(q, resp) |
+   |                   |                     | Enqueue for batch  |
    |                   |                     |                    |
    |<-- response ------|                     |                    |
    |  (hit: cached via k_r; miss: ODoH)     |                    |
@@ -127,7 +127,7 @@ Encrypted: HPKE.Seal(pk_E, info="codoh-enclave-v2", bundle)
 Signature: Ed25519.Sign(target_sk, SHA-256(bundle))
 ```
 
-The enclave verifies the signature, validates the timestamp against a monotonic logical clock (`t_latest`), decrypts the bundle, and stores the plaintext DNS response in the cache.
+The enclave verifies the signature, validates the timestamp against a monotonic logical clock (`t_latest`), decrypts the bundle, and enqueues the plaintext DNS response for batched cache commit. Queued entries are committed to the cache probabilistically during `HandleProcess` calls (coin flip per query, `crypto/rand`).
 
 ### Replay Protection
 
@@ -179,6 +179,7 @@ SGX has no trusted clock. The enclave maintains `t_latest` (highest timestamp se
 | Outstanding query TTL cleanup | enclave/cmd/main.go | Inline eviction using logical time (tLatest - OutstandingTTLSecs) |
 | Key rotation signaling | enclave/cmd/main.go, enclave/types.go | HPKE failure returns `key_rotated` status |
 | Health with restart metadata | enclave/cmd/main.go | `started_at` (RFC3339) in health response |
+| Batched cache updates | enclave/insertion_queue.go, enclave/cmd/main.go | Bounded FIFO queue, pseudorandom batch commit on query path (crypto/rand), PutBatch on Cache interface |
 | | | |
 | **Proxy Plugin** | | |
 | Parallel fan-out (enclave + target) | plugin/codohproxy/proxy.go | Concurrent goroutines |
@@ -212,7 +213,7 @@ SGX has no trusted clock. The enclave maintains `t_latest` (highest timestamp se
 | Restart warm-up mode | G2 | Done | Defensive mode on boot, exits at WarmupThreshold |
 | Cache omission detection | G2 | Done | Outstanding query tracking, enters defensive mode at OmissionThreshold |
 | Cover responses | G2 | Not yet | Target returns k random domains per cache-insert |
-| Batched cache insertions | G2 | Not yet | Queue + pseudorandom commit schedule |
+| Batched cache insertions | G2 | Done | InsertionQueue + pseudorandom commit via crypto/rand coin flip on query path |
 | Session ID (sid) binding | G3 | Not yet | Explicit sid in AAD to prevent cross-use |
 | Dual HPKE key wrapping | G3 | Not yet | Symmetric key k encrypted separately to target and enclave |
 
@@ -276,6 +277,9 @@ codohtarget {
 | CODOH_WARMUP_THRESHOLD | 100 | Cache entries needed to exit defensive mode |
 | CODOH_OMISSION_THRESHOLD | 50 | Outstanding queries to trigger defensive mode |
 | CODOH_OUTSTANDING_TTL_SECS | 300 | Logical-time window (seconds) for outstanding query eviction |
+| CODOH_BATCH_SIZE | 10 | Entries per batch commit |
+| CODOH_BATCH_COMMIT_PROB | 0.1 | Probability of batch commit per HandleProcess call |
+| CODOH_QUEUE_MAX_SIZE | 1000 | Max pending inserts in the insertion queue |
 
 ---
 
@@ -346,8 +350,9 @@ coredns/
 │   ├── bundle.go              # CacheInsertBundle marshal/parse
 │   ├── ipc.go                 # Unix socket server
 │   ├── cache.go               # LRU cache with logical-time TTL
-│   ├── cache_interface.go     # Cache interface
+│   ├── cache_interface.go     # Cache interface (Get/Put/PutBatch/Size/Clear/CleanExpired)
 │   ├── oram_cache.go          # Path ORAM cache (access-pattern hiding)
+│   ├── insertion_queue.go     # Bounded FIFO queue for batched cache inserts
 │   ├── query.go               # Query canonicalization
 │   ├── config.go              # Configuration loading (env vars)
 │   ├── types.go               # IPC message types

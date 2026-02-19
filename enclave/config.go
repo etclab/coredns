@@ -13,6 +13,11 @@ type Config struct {
 	WarmupThreshold    int     // Cache entries needed to exit defensive mode (default: 100)
 	OmissionThreshold  int     // Outstanding queries to trigger defensive mode (default: 50)
 	OutstandingTTLSecs int // Logical-time window in seconds for outstanding entry eviction (default: 300)
+
+	// Batched cache updates (Sprint 4)
+	BatchSize       int     // Entries per batch commit (default: 10)
+	BatchCommitProb float64 // Probability of commit per HandleProcess (default: 0.1)
+	QueueMaxSize    int     // Max pending inserts in queue (default: 1000)
 }
 
 // DefaultConfig returns configuration with default values.
@@ -27,6 +32,9 @@ func DefaultConfig() *Config {
 		WarmupThreshold:    100,
 		OmissionThreshold:  50,
 		OutstandingTTLSecs: 300,
+		BatchSize:          10,
+		BatchCommitProb:    0.1,
+		QueueMaxSize:       1000,
 	}
 }
 

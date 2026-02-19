@@ -116,6 +116,13 @@ func (c *LRUCache) Clear() {
 	c.lru.Init()
 }
 
+// PutBatch stores multiple entries from the insertion queue.
+func (c *LRUCache) PutBatch(entries []PendingInsert) {
+	for _, e := range entries {
+		c.Put(e.Query, e.Response, e.InsertedAt, e.TTL)
+	}
+}
+
 // Compile-time interface check
 var _ Cache = (*LRUCache)(nil)
 

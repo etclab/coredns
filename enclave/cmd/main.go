@@ -5,8 +5,10 @@ package main
 
 import (
 	"crypto/ed25519"
+	crypto_rand "crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"log"
@@ -147,8 +149,13 @@ func main() {
 		omissionThreshold:  cfg.OmissionThreshold,
 		outstandingTTLSecs: cfg.OutstandingTTLSecs,
 		startedAt:          time.Now().Format(time.RFC3339),
+		insertionQueue:     enclave.NewInsertionQueue(cfg.QueueMaxSize),
+		batchSize:          cfg.BatchSize,
+		batchCommitProb:    cfg.BatchCommitProb,
 	}
 	log.Printf("Defensive mode: ACTIVE (warmup threshold=%d)", cfg.WarmupThreshold)
+	log.Printf("Batch config: size=%d, commit_prob=%.2f, queue_max=%d",
+		cfg.BatchSize, cfg.BatchCommitProb, cfg.QueueMaxSize)
 	if len(provData.SigningPublicKey) > 0 {
 		log.Printf("Target signing pubkey registered (%d bytes)", len(provData.SigningPublicKey))
 	}
@@ -217,6 +224,21 @@ func loadOptionalEnvSettings(cfg *enclave.Config) {
 			cfg.OutstandingTTLSecs = n
 		}
 	}
+	if bs := os.Getenv("CODOH_BATCH_SIZE"); bs != "" {
+		if n, err := strconv.Atoi(bs); err == nil && n > 0 {
+			cfg.BatchSize = n
+		}
+	}
+	if prob := os.Getenv("CODOH_BATCH_COMMIT_PROB"); prob != "" {
+		if f, err := strconv.ParseFloat(prob, 64); err == nil && f > 0 && f <= 1 {
+			cfg.BatchCommitProb = f
+		}
+	}
+	if qs := os.Getenv("CODOH_QUEUE_MAX_SIZE"); qs != "" {
+		if n, err := strconv.Atoi(qs); err == nil && n > 0 {
+			cfg.QueueMaxSize = n
+		}
+	}
 }
 
 // loadSimSigningPubKey loads the target's Ed25519 signing pubkey from env for simulation mode.
@@ -255,6 +277,13 @@ type EnclaveHandler struct {
 	omissionThreshold  int              // outstanding queries to trigger defensive mode
 	outstandingTTLSecs int              // logical-time window in seconds for outstanding entry eviction
 	startedAt          string           // RFC3339 timestamp of handler construction
+
+	// Batched cache updates (Sprint 4)
+	insertionQueue        *enclave.InsertionQueue
+	batchSize             int
+	batchCommitProb       float64
+	totalCommits          atomic.Int64
+	totalEntriesCommitted atomic.Int64
 }
 
 // HandleProcess decrypts Q_E, looks up cache, returns encrypted response or dummy.
@@ -283,58 +312,89 @@ func (h *EnclaveHandler) HandleProcess(qe string) *enclave.Response {
 	inDefensiveMode := h.defensiveMode
 	h.mu.Unlock()
 
+	var resp *enclave.Response
+
 	// Defensive mode: decrypt succeeded (needed for protocol), but return dummy.
 	// Indistinguishable from a normal cache miss to the proxy.
 	if inDefensiveMode {
 		_ = kr // kr derived but not used — defensive mode returns dummy
 		dummy := enclave.GenerateDummyResponse(h.defaultPadSize)
 		h.logCacheOp("miss(defensive)", string(query))
-		return &enclave.Response{
+		resp = &enclave.Response{
 			Status:   enclave.StatusMiss,
 			Response: base64.StdEncoding.EncodeToString(dummy),
 		}
-	}
+	} else {
+		canonicalQuery := string(query)
 
-	canonicalQuery := string(query)
+		// Cache lookup with logical time
+		tLatest := h.tLatest.Load()
+		if cachedResp, ok := h.cache.Get(canonicalQuery, tLatest); ok {
+			// Cache hit — encrypt under session key k_r
+			encrypted, encErr := enclave.EncryptCachedResponse(kr, cachedResp)
+			if encErr != nil {
+				log.Printf("EncryptCachedResponse failed: %v", encErr)
+				// Fall through to dummy
+			} else {
+				h.logCacheOp("hit", canonicalQuery)
+				resp = &enclave.Response{
+					Status:   enclave.StatusHit,
+					Response: base64.StdEncoding.EncodeToString(encrypted),
+				}
+			}
+		}
 
-	// Cache lookup with logical time
-	tLatest := h.tLatest.Load()
-	if cachedResp, ok := h.cache.Get(canonicalQuery, tLatest); ok {
-		// Cache hit — encrypt under session key k_r
-		encrypted, err := enclave.EncryptCachedResponse(kr, cachedResp)
-		if err != nil {
-			log.Printf("EncryptCachedResponse failed: %v", err)
-			// Fall through to dummy
-		} else {
-			h.logCacheOp("hit", canonicalQuery)
-			return &enclave.Response{
-				Status:   enclave.StatusHit,
-				Response: base64.StdEncoding.EncodeToString(encrypted),
+		if resp == nil {
+			// Cache miss — track outstanding query for omission detection
+			h.mu.Lock()
+			if _, exists := h.outstandingQueries[canonicalQuery]; !exists {
+				h.outstandingQueries[canonicalQuery] = h.tLatest.Load()
+			}
+			if len(h.outstandingQueries) > h.omissionThreshold {
+				log.Printf("Omission threshold exceeded (%d > %d) — entering defensive mode",
+					len(h.outstandingQueries), h.omissionThreshold)
+				h.cache.Clear()
+				h.outstandingQueries = make(map[string]int64)
+				h.defensiveMode = true
+			}
+			h.mu.Unlock()
+
+			// Return dummy (indistinguishable from hit)
+			dummy := enclave.GenerateDummyResponse(h.defaultPadSize)
+			h.logCacheOp("miss", canonicalQuery)
+			resp = &enclave.Response{
+				Status:   enclave.StatusMiss,
+				Response: base64.StdEncoding.EncodeToString(dummy),
 			}
 		}
 	}
 
-	// Cache miss — track outstanding query for omission detection
-	h.mu.Lock()
-	if _, exists := h.outstandingQueries[canonicalQuery]; !exists {
-		h.outstandingQueries[canonicalQuery] = tLatest
-	}
-	if len(h.outstandingQueries) > h.omissionThreshold {
-		log.Printf("Omission threshold exceeded (%d > %d) — entering defensive mode",
-			len(h.outstandingQueries), h.omissionThreshold)
-		h.cache.Clear()
-		h.outstandingQueries = make(map[string]int64)
-		h.defensiveMode = true
-	}
-	h.mu.Unlock()
+	// Pseudorandom batch commit (D1: commits only on query path, D7: synchronous)
+	if cryptoRandFloat64() < h.batchCommitProb {
+		if n := h.insertionQueue.Len(); n > 0 {
+			commitSize := h.batchSize
+			if commitSize > n {
+				commitSize = n
+			}
+			batch := h.insertionQueue.DrainBatch(commitSize)
+			if len(batch) > 0 {
+				h.cache.PutBatch(batch)
+				h.totalCommits.Add(1)
+				h.totalEntriesCommitted.Add(int64(len(batch)))
 
-	// Return dummy (indistinguishable from hit)
-	dummy := enclave.GenerateDummyResponse(h.defaultPadSize)
-	h.logCacheOp("miss", canonicalQuery)
-	return &enclave.Response{
-		Status:   enclave.StatusMiss,
-		Response: base64.StdEncoding.EncodeToString(dummy),
+				// Re-check warm-up threshold after commit
+				h.mu.Lock()
+				if h.defensiveMode && h.cache.Size() >= h.warmupThreshold {
+					h.defensiveMode = false
+					log.Printf("[enclave] warm-up complete: cache size %d >= threshold %d",
+						h.cache.Size(), h.warmupThreshold)
+				}
+				h.mu.Unlock()
+			}
+		}
 	}
+
+	return resp
 }
 
 // HandleStoreEncrypted decrypts cache-insert bundle, verifies signature, stores in cache.
@@ -404,13 +464,17 @@ func (h *EnclaveHandler) HandleStoreEncrypted(encryptedBlob, signature string) *
 		}
 	}
 
-	// Store in cache
-	h.cache.Put(bundle.CanonicalQuery, bundle.DNSResponse, bundle.Timestamp, bundle.TTL)
-	h.logCacheOp("store", bundle.CanonicalQuery)
+	// Enqueue for batched commit (D1: commits happen on query path, not store path)
+	h.insertionQueue.Enqueue(enclave.PendingInsert{
+		Query:      bundle.CanonicalQuery,
+		Response:   bundle.DNSResponse,
+		TTL:        bundle.TTL,
+		InsertedAt: bundle.Timestamp,
+	})
+	h.logCacheOp("enqueue", bundle.CanonicalQuery)
 
-	// Outstanding query tracking + warmup check
+	// Outstanding query tracking (D2: remove on enqueue, not on commit)
 	h.mu.Lock()
-	// Remove from outstanding if present
 	delete(h.outstandingQueries, bundle.CanonicalQuery)
 
 	// Inline cleanup: evict outstanding entries older than TTL window
@@ -420,13 +484,6 @@ func (h *EnclaveHandler) HandleStoreEncrypted(encryptedBlob, signature string) *
 		if entryT < currentTLatest-ttlWindow {
 			delete(h.outstandingQueries, q)
 		}
-	}
-
-	// Check warmup threshold: exit defensive mode if cache is sufficiently full
-	if h.defensiveMode && h.cache.Size() >= h.warmupThreshold {
-		h.defensiveMode = false
-		log.Printf("Exiting defensive mode (cache size=%d >= threshold=%d)",
-			h.cache.Size(), h.warmupThreshold)
 	}
 	h.mu.Unlock()
 
@@ -471,7 +528,20 @@ func (h *EnclaveHandler) HandleGetPubKey() *enclave.Response {
 }
 
 func (h *EnclaveHandler) HandleHealth() *enclave.Response {
-	return &enclave.Response{Status: enclave.StatusOK, StartedAt: h.startedAt}
+	return &enclave.Response{
+		Status:                enclave.StatusOK,
+		StartedAt:             h.startedAt,
+		QueueDepth:            h.insertionQueue.Len(),
+		TotalCommits:          h.totalCommits.Load(),
+		TotalEntriesCommitted: h.totalEntriesCommitted.Load(),
+	}
+}
+
+// cryptoRandFloat64 returns a uniform random float64 in [0, 1) using crypto/rand.
+func cryptoRandFloat64() float64 {
+	var buf [8]byte
+	crypto_rand.Read(buf[:])
+	return float64(binary.LittleEndian.Uint64(buf[:])>>11) / (1 << 53)
 }
 
 // logCacheOp logs cache operations with stash size when using ORAM.

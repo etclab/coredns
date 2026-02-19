@@ -37,6 +37,11 @@ type Response struct {
 	Error     string `json:"error,omitempty"`       // error description
 	PubKey    string `json:"pubkey,omitempty"`      // base64, for get_pubkey
 	StartedAt string `json:"started_at,omitempty"` // RFC3339, enclave start time
+
+	// Batch queue stats (health endpoint)
+	QueueDepth            int   `json:"queue_depth,omitempty"`
+	TotalCommits          int64 `json:"total_commits,omitempty"`
+	TotalEntriesCommitted int64 `json:"total_entries_committed,omitempty"`
 }
 
 // Error codes for IPC responses.

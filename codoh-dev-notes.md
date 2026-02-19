@@ -176,9 +176,9 @@ cd ../codoh-client
 | Endpoint | Description |
 |----------|-------------|
 | IPC: `process` | Decrypt Q_E, check cache, return encrypted response or dummy |
-| IPC: `store_encrypted` | Store HPKE-encrypted response with signature verification |
+| IPC: `store_encrypted` | Enqueue HPKE-encrypted response for batched cache commit |
 | IPC: `get_pubkey` | Get enclave's HPKE public key |
-| IPC: `health` | Health check (includes `started_at` for restart detection) |
+| IPC: `health` | Health check (`started_at`, `queue_depth`, `total_commits`, `total_entries_committed`) |
 | HTTPS: `/attest` | Get SGX quote + public key |
 | HTTPS: `/provision` | Receive signing pubkey for cache-insert verification |
 | HTTPS: `/health` | Health check |
@@ -281,6 +281,9 @@ codohtarget {
 | `CODOH_WARMUP_THRESHOLD` | 100 | Cache entries needed to exit defensive mode |
 | `CODOH_OMISSION_THRESHOLD` | 50 | Outstanding queries to trigger defensive mode |
 | `CODOH_OUTSTANDING_TTL_SECS` | 300 | Logical-time window (seconds) for outstanding query eviction |
+| `CODOH_BATCH_SIZE` | 10 | Entries per batch commit |
+| `CODOH_BATCH_COMMIT_PROB` | 0.1 | Probability of batch commit per HandleProcess call |
+| `CODOH_QUEUE_MAX_SIZE` | 1000 | Max pending inserts in the insertion queue |
 
 ---
 
@@ -299,7 +302,7 @@ Client → Proxy (codohproxy plugin) → Target (codohtarget plugin) → Upstrea
 
 **Processes:**
 
-1. **Enclave** (`enclave-sim` or SGX `enclave`) — HPKE keypair, cache (LRU or ORAM), Q_E decryption, cache-insert verification, defensive mode, omission detection
+1. **Enclave** (`enclave-sim` or SGX `enclave`) — HPKE keypair, cache (LRU or ORAM), Q_E decryption, cache-insert verification, batched cache updates, defensive mode, omission detection
 2. **Proxy** (`codohproxy` plugin, port 8080) — fans out Q_E to enclave + Q_T to target in parallel
 3. **Target** (`codohtarget` plugin, port 8443) — ODoH resolution, cache-insert bundle construction, Ed25519 signing
 
@@ -310,7 +313,7 @@ Client → Proxy (codohproxy plugin) → Target (codohtarget plugin) → Upstrea
 4. Proxy fans out: sends Q_E to enclave (IPC) and Q_T to target (HTTPS) in parallel
 5. Enclave decrypts Q_E, cache miss → returns dummy (indistinguishable from hit)
 6. Target resolves DNS, builds cache-insert bundle, encrypts under enclave pubkey, signs with Ed25519
-7. Proxy fires async `store_encrypted` IPC to enclave with encrypted bundle + signature
+7. Proxy fires async `store_encrypted` IPC to enclave with encrypted bundle + signature. Enclave enqueues entry for batched commit.
 8. Proxy returns ODoH response to client
 
 **Flow (hit):**
@@ -326,7 +329,18 @@ The enclave starts in defensive mode on boot and enters it again if it detects c
 - **Omission detection**: Tracks outstanding queries (misses without corresponding stores). When `len(outstandingQueries) > OmissionThreshold` (default 50), enters defensive mode, clears cache, clears outstanding map. Recovery is the same: fill cache to threshold.
 - **Outstanding TTL**: Entries older than `OutstandingTTLSecs` (default 300s, logical time) are evicted inline during `store_encrypted` handling.
 - **Key rotation**: HPKE decryption failure returns `status:"key_rotated"`. Proxy sets `X-CoDOH-Key-Rotated: true` header. Client re-fetches pk_E from `/enclave-keys`.
-- **Health**: Returns `started_at` (RFC3339) for restart detection.
+- **Health**: Returns `started_at` (RFC3339) for restart detection, plus `queue_depth`, `total_commits`, and `total_entries_committed` batch stats.
+
+**Batched Cache Updates (Sprint 4):**
+
+Cache inserts are not applied immediately. `HandleStoreEncrypted` enqueues entries into a bounded FIFO (`InsertionQueue`). Batch commits fire probabilistically at the end of each `HandleProcess` call via a `crypto/rand` coin flip.
+
+- **Commit trigger**: Only on the query path (`HandleProcess`), never on the store path. Prevents the proxy from controlling commit timing (G2).
+- **Queue overflow**: Head-drop (oldest evicted). No force-commit on overflow — keeps commits on the pseudorandom schedule.
+- **Omission detection**: Outstanding queries are removed on enqueue (not on commit), so batching delay does not cause false omission detection.
+- **Warm-up interaction**: Cache fills via batch commits, so warm-up exit is delayed by batching latency. At defaults (~100 QPS), the queue is in equilibrium.
+- **Defaults**: `BatchSize=10`, `BatchCommitProb=0.1`, `QueueMaxSize=1000`. At 100 QPS this yields ~100 entries/sec committed with a steady-state queue depth of ~100.
+- **Testing tip**: Set `CODOH_BATCH_COMMIT_PROB=1.0` for deterministic commit behavior in manual tests.
 
 **IPC Response Statuses:**
 | Status | Meaning |

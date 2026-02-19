@@ -279,5 +279,14 @@ func (c *ORAMCache) deserialize(data []byte) (*CacheEntry, bool) {
 	}, true
 }
 
+// PutBatch stores multiple entries from the insertion queue.
+// Phase 1: sequential puts (correct but not optimized).
+// TODO: coalesce ORAM path accesses for batch optimization.
+func (c *ORAMCache) PutBatch(entries []PendingInsert) {
+	for _, e := range entries {
+		c.Put(e.Query, e.Response, e.InsertedAt, e.TTL)
+	}
+}
+
 // Compile-time interface check
 var _ Cache = (*ORAMCache)(nil)
