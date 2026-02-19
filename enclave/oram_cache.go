@@ -5,7 +5,6 @@ import (
 	"hash/fnv"
 	"log"
 	"sync"
-	"time"
 
 	"github.com/etclab/pathoram-go"
 )
@@ -53,7 +52,8 @@ func NewORAMCache(cfg ORAMCacheConfig) (*ORAMCache, error) {
 }
 
 // Get retrieves a cached plaintext response for the given query.
-func (c *ORAMCache) Get(query string) ([]byte, bool) {
+// Expiry uses logical time: InsertedAt + TTLSeconds < tLatest → expired.
+func (c *ORAMCache) Get(query string, tLatest int64) ([]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -69,8 +69,8 @@ func (c *ORAMCache) Get(query string) ([]byte, bool) {
 		return nil, false
 	}
 
-	// Check TTL
-	if time.Now().After(entry.ExpiresAt) {
+	// Logical time expiry
+	if entry.InsertedAt+int64(entry.TTLSeconds) < tLatest {
 		return nil, false
 	}
 
@@ -78,15 +78,16 @@ func (c *ORAMCache) Get(query string) ([]byte, bool) {
 }
 
 // Put stores a plaintext DNS response in the cache.
-func (c *ORAMCache) Put(query string, response []byte, ttl time.Duration) {
+func (c *ORAMCache) Put(query string, response []byte, insertedAt int64, ttlSecs uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	blockID := c.queryToBlockID(query)
 	entry := &CacheEntry{
-		Query:     query,
-		Response:  response,
-		ExpiresAt: time.Now().Add(ttl),
+		Query:      query,
+		Response:   response,
+		InsertedAt: insertedAt,
+		TTLSeconds: ttlSecs,
 	}
 
 	data, ok := c.serialize(entry)
@@ -132,8 +133,8 @@ func (c *ORAMCache) Clear() {
 	c.used = make(map[int]bool)
 }
 
-// CleanExpired is a no-op for ORAM cache (entries expire on access).
-func (c *ORAMCache) CleanExpired() int {
+// CleanExpired is a no-op for ORAM cache (entries expire lazily on Get).
+func (c *ORAMCache) CleanExpired(tLatest int64) int {
 	return 0
 }
 
@@ -152,7 +153,7 @@ func (c *ORAMCache) queryToBlockID(query string) int {
 }
 
 // serialize encodes a CacheEntry into a fixed-size block.
-// Format: [queryLen:2][query][respLen:2][resp][expiresUnix:8][valid:1]
+// Format: [queryLen:2][query][respLen:2][resp][insertedAt:8][ttlSeconds:4][valid:1]
 func (c *ORAMCache) serialize(entry *CacheEntry) ([]byte, bool) {
 	buf := make([]byte, c.cfg.BlockSize)
 	offset := 0
@@ -183,12 +184,19 @@ func (c *ORAMCache) serialize(entry *CacheEntry) ([]byte, bool) {
 	copy(buf[offset:], entry.Response)
 	offset += int(respLen)
 
-	// Expires timestamp (Unix nanos)
+	// InsertedAt (unix seconds)
 	if offset+8 > c.cfg.BlockSize {
 		return nil, false
 	}
-	binary.LittleEndian.PutUint64(buf[offset:], uint64(entry.ExpiresAt.UnixNano()))
+	binary.LittleEndian.PutUint64(buf[offset:], uint64(entry.InsertedAt))
 	offset += 8
+
+	// TTLSeconds
+	if offset+4 > c.cfg.BlockSize {
+		return nil, false
+	}
+	binary.LittleEndian.PutUint32(buf[offset:], entry.TTLSeconds)
+	offset += 4
 
 	// Valid marker
 	if offset+1 > c.cfg.BlockSize {
@@ -244,12 +252,19 @@ func (c *ORAMCache) deserialize(data []byte) (*CacheEntry, bool) {
 	copy(response, data[offset:offset+int(respLen)])
 	offset += int(respLen)
 
-	// Expires
+	// InsertedAt
 	if offset+8 > len(data) {
 		return nil, false
 	}
-	expiresNano := binary.LittleEndian.Uint64(data[offset:])
+	insertedAt := int64(binary.LittleEndian.Uint64(data[offset:]))
 	offset += 8
+
+	// TTLSeconds
+	if offset+4 > len(data) {
+		return nil, false
+	}
+	ttlSeconds := binary.LittleEndian.Uint32(data[offset:])
+	offset += 4
 
 	// Valid marker
 	if offset+1 > len(data) || data[offset] != 1 {
@@ -257,9 +272,10 @@ func (c *ORAMCache) deserialize(data []byte) (*CacheEntry, bool) {
 	}
 
 	return &CacheEntry{
-		Query:     query,
-		Response:  response,
-		ExpiresAt: time.Unix(0, int64(expiresNano)),
+		Query:      query,
+		Response:   response,
+		InsertedAt: insertedAt,
+		TTLSeconds: ttlSeconds,
 	}, true
 }
 

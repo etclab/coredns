@@ -52,8 +52,8 @@ func TestFullFlow(t *testing.T) {
 		t.Fatal("k_r mismatch between client and enclave on first request")
 	}
 
-	// Cache lookup — should miss
-	if _, ok := cache.Get(string(query1)); ok {
+	// Cache lookup — should miss (tLatest=0 at startup)
+	if _, ok := cache.Get(string(query1), 0); ok {
 		t.Fatal("expected cache miss on first request")
 	}
 
@@ -118,7 +118,7 @@ func TestFullFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseCacheInsertBundle: %v", err)
 	}
-	cache.Put(parsedBundle.CanonicalQuery, parsedBundle.DNSResponse, time.Duration(parsedBundle.TTL)*time.Second)
+	cache.Put(parsedBundle.CanonicalQuery, parsedBundle.DNSResponse, parsedBundle.Timestamp, parsedBundle.TTL)
 
 	// --- Step 5: Client encrypts Q_E (second request — should hit) ---
 	qe2, kr2, err := EncryptQueryE(pkE, []byte(canonicalQuery))
@@ -138,8 +138,8 @@ func TestFullFlow(t *testing.T) {
 		t.Fatal("k_r mismatch on second request")
 	}
 
-	// Cache hit
-	cachedResp, ok := cache.Get(string(query2))
+	// Cache hit (use bundle timestamp as tLatest — entry was just inserted)
+	cachedResp, ok := cache.Get(string(query2), parsedBundle.Timestamp)
 	if !ok {
 		t.Fatal("expected cache hit on second request")
 	}

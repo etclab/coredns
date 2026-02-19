@@ -43,5 +43,6 @@ const (
 	ErrDecryptFailed    = "decrypt_failed"
 	ErrHPKEError        = "hpke_error"
 	ErrInvalidSignature = "invalid_signature"
+	ErrStaleTimestamp   = "stale_timestamp"
 	ErrInternal         = "internal_error"
 )

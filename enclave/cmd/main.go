@@ -8,12 +8,13 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"strconv"
+	"sync/atomic"
 	"syscall"
-	"time"
 
 	"github.com/coredns/coredns/enclave"
 )
@@ -136,6 +137,8 @@ func main() {
 		oramCache:           oramCache,
 		targetSigningPubKey: provData.SigningPublicKey,
 		defaultPadSize:      cfg.DefaultPadSize,
+		replayDelta:         cfg.ReplayDelta,
+		// tLatest zero-initialized by atomic.Int64 default
 	}
 	if len(provData.SigningPublicKey) > 0 {
 		log.Printf("Target signing pubkey registered (%d bytes)", len(provData.SigningPublicKey))
@@ -185,6 +188,11 @@ func loadOptionalEnvSettings(cfg *enclave.Config) {
 			cfg.DefaultPadSize = n
 		}
 	}
+	if delta := os.Getenv("CODOH_REPLAY_DELTA_SECS"); delta != "" {
+		if f, err := strconv.ParseFloat(delta, 64); err == nil && f >= 0 {
+			cfg.ReplayDelta = f
+		}
+	}
 }
 
 // loadSimSigningPubKey loads the target's Ed25519 signing pubkey from env for simulation mode.
@@ -209,9 +217,11 @@ func loadSimSigningPubKey() []byte {
 type EnclaveHandler struct {
 	keypair             *enclave.EnclaveKeypair
 	cache               enclave.Cache
-	oramCache           *enclave.ORAMCache       // nil if not using ORAM (for stash monitoring)
-	targetSigningPubKey ed25519.PublicKey         // Target's Ed25519 public key
+	oramCache           *enclave.ORAMCache // nil if not using ORAM (for stash monitoring)
+	targetSigningPubKey ed25519.PublicKey   // Target's Ed25519 public key
 	defaultPadSize      int
+	tLatest             atomic.Int64 // monotonic logical clock (unix seconds)
+	replayDelta         float64      // δ in seconds
 }
 
 // HandleProcess decrypts Q_E, looks up cache, returns encrypted response or dummy.
@@ -237,8 +247,9 @@ func (h *EnclaveHandler) HandleProcess(qe string) *enclave.Response {
 
 	canonicalQuery := string(query)
 
-	// Cache lookup
-	if cachedResp, ok := h.cache.Get(canonicalQuery); ok {
+	// Cache lookup with logical time
+	tLatest := h.tLatest.Load()
+	if cachedResp, ok := h.cache.Get(canonicalQuery, tLatest); ok {
 		// Cache hit — encrypt under session key k_r
 		encrypted, err := enclave.EncryptCachedResponse(kr, cachedResp)
 		if err != nil {
@@ -321,12 +332,42 @@ func (h *EnclaveHandler) HandleStoreEncrypted(encryptedBlob, signature string) *
 		}
 	}
 
+	// Validate timestamp (δ-window check + advance t_latest)
+	if err := h.validateTimestamp(bundle.Timestamp); err != nil {
+		return &enclave.Response{
+			Status: enclave.StatusError,
+			Error:  enclave.ErrStaleTimestamp,
+		}
+	}
+
 	// Store in cache
-	ttlDuration := time.Duration(bundle.TTL) * time.Second
-	h.cache.Put(bundle.CanonicalQuery, bundle.DNSResponse, ttlDuration)
+	h.cache.Put(bundle.CanonicalQuery, bundle.DNSResponse, bundle.Timestamp, bundle.TTL)
 	h.logCacheOp("store", bundle.CanonicalQuery)
 
 	return &enclave.Response{Status: enclave.StatusOK}
+}
+
+// validateTimestamp checks the timestamp against the δ-window and advances tLatest.
+func (h *EnclaveHandler) validateTimestamp(ts int64) error {
+	tLatest := h.tLatest.Load()
+	deltaSeconds := int64(h.replayDelta)
+
+	if ts < tLatest-deltaSeconds {
+		log.Printf("[REPLAY] rejected stale insert: ts=%d tLatest=%d delta=%v", ts, tLatest, h.replayDelta)
+		return fmt.Errorf(enclave.ErrStaleTimestamp)
+	}
+
+	// CAS loop: advance tLatest = max(tLatest, ts)
+	for {
+		old := h.tLatest.Load()
+		if ts <= old {
+			break
+		}
+		if h.tLatest.CompareAndSwap(old, ts) {
+			break
+		}
+	}
+	return nil
 }
 
 func (h *EnclaveHandler) HandleGetPubKey() *enclave.Response {

@@ -3,14 +3,14 @@ package enclave
 import (
 	"container/list"
 	"sync"
-	"time"
 )
 
 // CacheEntry holds a cached DNS response.
 type CacheEntry struct {
-	Query     string    // Canonicalized query key
-	Response  []byte    // Plaintext DNS response
-	ExpiresAt time.Time // TTL expiry
+	Query      string // Canonicalized query key
+	Response   []byte // Plaintext DNS response
+	InsertedAt int64  // Resolver timestamp (unix seconds, logical time)
+	TTLSeconds uint32 // TTL in seconds
 }
 
 // LRUCache implements an LRU cache with TTL for DNS responses.
@@ -32,7 +32,8 @@ func NewLRUCache(capacity int) *LRUCache {
 
 // Get retrieves a cached response for the given query.
 // Returns the plaintext response if found and not expired.
-func (c *LRUCache) Get(query string) ([]byte, bool) {
+// Expiry uses logical time: InsertedAt + TTLSeconds < tLatest → expired.
+func (c *LRUCache) Get(query string, tLatest int64) ([]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -43,8 +44,8 @@ func (c *LRUCache) Get(query string) ([]byte, bool) {
 
 	entry := elem.Value.(*CacheEntry)
 
-	// Check TTL
-	if time.Now().After(entry.ExpiresAt) {
+	// Logical time expiry
+	if entry.InsertedAt+int64(entry.TTLSeconds) < tLatest {
 		c.removeElement(elem)
 		return nil, false
 	}
@@ -56,7 +57,7 @@ func (c *LRUCache) Get(query string) ([]byte, bool) {
 }
 
 // Put stores a plaintext DNS response in the cache.
-func (c *LRUCache) Put(query string, response []byte, ttl time.Duration) {
+func (c *LRUCache) Put(query string, response []byte, insertedAt int64, ttlSecs uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -64,7 +65,8 @@ func (c *LRUCache) Put(query string, response []byte, ttl time.Duration) {
 	if elem, ok := c.cache[query]; ok {
 		entry := elem.Value.(*CacheEntry)
 		entry.Response = response
-		entry.ExpiresAt = time.Now().Add(ttl)
+		entry.InsertedAt = insertedAt
+		entry.TTLSeconds = ttlSecs
 		c.lru.MoveToFront(elem)
 		return
 	}
@@ -75,9 +77,10 @@ func (c *LRUCache) Put(query string, response []byte, ttl time.Duration) {
 	}
 
 	entry := &CacheEntry{
-		Query:     query,
-		Response:  response,
-		ExpiresAt: time.Now().Add(ttl),
+		Query:      query,
+		Response:   response,
+		InsertedAt: insertedAt,
+		TTLSeconds: ttlSecs,
 	}
 	elem := c.lru.PushFront(entry)
 	c.cache[query] = elem
@@ -117,18 +120,17 @@ func (c *LRUCache) Clear() {
 var _ Cache = (*LRUCache)(nil)
 
 // CleanExpired removes all expired entries from the cache.
-func (c *LRUCache) CleanExpired() int {
+func (c *LRUCache) CleanExpired(tLatest int64) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	now := time.Now()
 	removed := 0
 
 	for elem := c.lru.Back(); elem != nil; {
 		entry := elem.Value.(*CacheEntry)
 		prev := elem.Prev()
 
-		if now.After(entry.ExpiresAt) {
+		if entry.InsertedAt+int64(entry.TTLSeconds) < tLatest {
 			c.removeElement(elem)
 			removed++
 		}

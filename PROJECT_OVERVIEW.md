@@ -2,171 +2,136 @@
 
 ## Goal
 
-**CODoH (Cached Oblivious DNS over HTTPS)** extends ODoH (RFC 9230) with proxy-side caching while preserving privacy guarantees. The key insight: use VOPRF-based blind tokens to enable caching without revealing query patterns to the proxy.
+**CODoH (Cached Oblivious DNS over HTTPS)** extends ODoH (RFC 9230) with privacy-preserving proxy-side caching. The cache lives inside an SGX enclave co-located with the proxy, using ORAM for access-pattern hiding and cover responses + batched insertions to resist set-difference attacks.
 
-**Problem**: Standard ODoH uses per-query ephemeral keys, preventing caching at the proxy. Every query hits the target.
+**Problem**: Standard ODoH uses per-query ephemeral keys, preventing caching at the proxy. Every query hits the target, negating the latency benefits of caching.
 
-**Solution**: Clients obtain blind tokens from target, include them in an encrypted blob to the enclave, which verifies tokens and serves cached responses.
+**Solution**: The client encrypts the query under both the target's and enclave's HPKE public keys. The enclave decrypts its copy to check the cache. On a miss, the target resolves the query, signs the response, and returns an HPKE-encrypted cache-insert blob for the enclave to store. On subsequent queries for the same domain, the enclave serves the cached response directly.
+
+---
+
+## Security Goals (from paper)
+
+**G1 — Authorized and fresh cached answers**: A malicious proxy must not cause clients to accept DNS answers that the target did not authorize, or that are stale. Prevents cache poisoning, tampering, and stale-answer replay.
+
+**G2 — Cache-state indistinguishability under active probing and scheduling**: The proxy must not learn meaningful information about a client's query by manipulating or comparing cache state across time. Prevents set-difference/bracketing attacks, cache priming, selective withholding, and restart-based reset windows.
+
+**G3 — Query equality and profiling resistance**: The proxy must not determine whether two client requests correspond to the same DNS query, or build per-client/per-group query profiles from cache behavior.
+
+### Primary Attack: Set-Difference (Bracketing)
+
+1. Adversary learns current cache state
+2. Allows exactly one victim query while queuing all other traffic
+3. Re-learns cache state
+4. Computes difference to isolate which entry was added or accessed
+
+### Threat Model
+
+In-scope adversary capabilities (beyond ODoH baseline):
+- Network control at proxy: observe/delay/drop/replay/inject
+- Active proxy deviation: arbitrary protocol deviation to bias cache behavior
+- Scheduling control: manipulate concurrency and queuing to isolate victims
+- Cache lifecycle control: restart enclave to reset cache state
+- Proxy-as-client probing: send probe queries to enumerate cache contents
+- Architectural leakage: page-level access patterns, gross timing differences, message size differences
+
+Out-of-scope:
+- Traffic correlation by a global adversary
+- Website fingerprinting from client behavior patterns
+- Microarchitectural attacks against TEE (Spectre/Meltdown class)
+- Malicious target or proxy-target collusion
 
 ---
 
 ## Architecture
 
 ```
-+---------------------------------------------------------------------------+
-|                              PROXY HOST                                   |
-|                                                                           |
-|   +--------------------+            +-------------------------------+     |
-|   |   Proxy (CoreDNS)  |   Unix     |   Enclave (EGo/SGX)           |     |
-|   |   plugin/codohproxy|   Socket   |   enclave/                    |     |
-|   |                    |<---------->|                               |     |
-|   |   - /proxy         |    IPC     |   - Token verification (VOPRF)|     |
-|   |   - /enclave-keys  |            |   - Spent-set (double-spend)  |     |
-|   |   - TLS termination|            |   - LRU Cache (DNS responses) |     |
-|   |   - Bypass mode    |            |   - HPKE decrypt Blob B       |     |
-|   |                    |            |   - Signature verification    |     |
-|   +---------+----------+            +---------------+---------------+     |
-+-----------+---------------------------------+------+----------------------+
-            | HTTPS                           |
-            v                                 | HTTPS (Attestation)
-    +-------------------+                     |
-    |   Target (CoreDNS)|<--------------------+
-    | plugin/codohtarget|   POST /provision (encrypted master_secret + signing_pubkey)
-    |                   |   GET /attest (quote + pk_E)
-    |   - /dns-query    | ODoH resolution
-    |   - /token        | Batch token issuance (VOPRF)
-    |   - /.well-known/odohconfigs | ODoH public key
-    |   - /verify       | Token verification (fallback)
-    |   - Response signing (Ed25519)
-    +-------------------+
-            |
-            v DNS (UDP)
-        Upstream (8.8.8.8)
+Client ──► Proxy ──► Target ──► Upstream DNS
+              │
+              ▼
+           Enclave (SGX)
+           - HPKE decryption
+           - Response caching (LRU or ORAM)
+           - Cache-insert verification (Ed25519)
+           - Dummy responses (hit/miss indistinguishable)
 ```
 
----
-
-## Components
+### Components
 
 | Component | Location | Technology | Role |
 |-----------|----------|------------|------|
-| **Client** | codoh-client/ | Go CLI | Query originator, token holder, Blob B creator |
-| **Proxy** | plugin/codohproxy | CoreDNS plugin | Network I/O, enclave IPC, bypass fallback |
-| **Enclave** | enclave/ | Go (EGo for SGX) | Token verification, cache, spent-set, signature verification |
-| **Target** | plugin/codohtarget | CoreDNS plugin | Token issuance, DNS resolution, response signing, secret provisioning |
+| **Client** | codoh-client/ | Go CLI | Query originator, Q_E + Q_T encryption |
+| **Proxy** | plugin/codohproxy | CoreDNS plugin | Network I/O, enclave IPC, parallel fan-out |
+| **Enclave** | enclave/ | Go (EGo for SGX) | Cache, HPKE decryption, signature verification |
+| **Target** | plugin/codohtarget | CoreDNS plugin | DNS resolution, cache-insert encryption + signing |
 
 ---
 
 ## Protocol Flow
 
-### Attestation & Provisioning (on startup, SGX mode)
+### Bootstrap (on startup)
 
-```
-Target                         Enclave
-   |                              |
-   |---- GET /attest ------------>|  (request quote + pubkey)
-   |                              |  Generate DCAP quote binding pk_E
-   |<--- {quote, pk_E} -----------|
-   |                              |
-   |  Verify SGX quote            |
-   |  Verify MRSIGNER (optional)  |
-   |                              |
-   |  Encrypt master_secret       |
-   |  under pk_E (HPKE)           |
-   |                              |
-   |-- POST /provision ---------->|  {encrypted_secret, signing_pubkey}
-   |                              |  Decrypt master_secret
-   |                              |  Store signing_pubkey
-   |<--- OK ----------------------|
-   |                              |
-   |  Both now have same          |
-   |  master_secret for VOPRF     |
-```
-
-### Token Issuance (once per epoch)
-
-```
-Client                          Target
-   |                               |
-   |---- POST /token ------------->|  (count + blinded elements)
-   |                               |  Rate limit check (per-IP)
-   |<--- VOPRF evaluations --------|  (evaluated elements)
-   |                               |
-   |  Finalize tokens locally      |
-   |  tokens = [(epoch, input, output), ...]
-```
+1. Enclave generates HPKE keypair `(pk_E, sk_E)` and SGX attestation report binding `pk_E`
+2. In SGX mode: target fetches `/attest` from enclave, verifies quote, POSTs Ed25519 signing pubkey to `/provision`
+3. In simulation mode: enclave reads signing pubkey from `CODOH_TARGET_SIGNING_PUBKEY` env var
+4. Client retrieves `pk_E` from proxy's `/enclave-keys` endpoint
 
 ### Query Flow (per DNS query)
 
 ```
 Client              Proxy                 Enclave              Target
    |                   |                     |                    |
-   |  B = Enc(pk_E, epoch||input||token||k_c||query)              |
+   |  Q_E = HPKE.Seal(pk_E, query)          |                    |
+   |  Q_T = ODoH envelope (standard)        |                    |
    |                   |                     |                    |
-   |-- ODoH + B ------>|                     |                    |
-   |                   |-- Process(B) ------>|                    |
-   |                   |                     | Decrypt B          |
-   |                   |                     | Verify token       |
-   |                   |                     | Mark spent         |
+   |-- Q_T + Q_E ----->|                     |                    |
+   |  (X-CoDOH-Query)  |                     |                    |
+   |                   |== parallel fan-out ==|                    |
+   |                   |-- process(Q_E) ---->|                    |
+   |                   |                     | Decrypt Q_E        |
+   |                   |                     | Derive k_r (Export)|
    |                   |                     | Check cache        |
    |                   |                     |                    |
-   |                   |<-- HIT: Enc(k_c, resp)                   |
-   |<-- cached resp ---|                     |                    |
+   |                   |-- Q_T + pk_E ------>|----> Target ------>|
+   |                   |  (X-Enclave-PubKey) |                    |
    |                   |                     |                    |
-   |   -- OR --        |                     |                    |
-   |                   |<-- MISS ------------|                    |
+   |                   |<-- HIT: Enc(k_r, resp) [or dummy on MISS]|
    |                   |                     |                    |
-   |                   |-- ODoH + X-Enclave-PubKey + X-ODoH-Blob ->|
+   |                   |<-- ODoH response + cache-insert headers -|
+   |                   |    X-Enclave-Cache: HPKE.Seal(pk_E, bundle)
+   |                   |    X-Enclave-Cache-Sig: Ed25519(H(bundle))
    |                   |                     |                    |
-   |                   |<-- ODoH response -------------------------|
-   |                   |    + X-Enclave-Cache: Enc(pk_E, raw_dns)  |
-   |                   |    + X-Enclave-Cache-Sig: Sign(H(resp||query||B))
+   |                   |-- store_encrypted ->| Verify Ed25519 sig |
+   |                   |   (async, on miss)  | Validate timestamp |
+   |                   |                     | Decrypt bundle     |
+   |                   |                     | cache.Put(q, resp) |
    |                   |                     |                    |
-   |                   |-- StoreEncrypted -->| Verify signature   |
-   |                   |   (cache + sig + B) | Decrypt with sk_E  |
-   |                   |                     | Cache raw DNS      |
-   |                   |                     |                    |
-   |<-- ODoH response -|                     |                    |
+   |<-- response ------|                     |                    |
+   |  (hit: cached via k_r; miss: ODoH)     |                    |
 ```
 
----
+**Key properties:**
+- Proxy fans out Q_E to enclave and Q_T to target in parallel
+- On cache miss, enclave returns a dummy response indistinguishable from a hit (same size)
+- Client determines hit vs miss by Content-Type (`application/codoh-cached` vs `application/oblivious-dns-message`)
+- Response key `k_r` is derived via HPKE Export from the Q_E context — implicitly bound to the ephemeral KEM key
 
-## Key Data Structures
+### Cache-Insert Bundle
 
-### Blob B (Client -> Enclave)
-
-```
-B = HPKE.Seal(pk_E, plaintext)
-
-plaintext = epoch (4B) || input (32B) || token (32B) || k_c (32B) || query (var)
-          = 100 + len(query) bytes minimum
-```
-
-### Token Format
+The target constructs and signs a bundle when `X-Enclave-PubKey` is present:
 
 ```
-Token = epoch (4 bytes) || input (32 bytes)
-      = 36 bytes
+CacheInsertBundle = ttl (4B) || timestamp (8B) || query_len (2B) || canonical_query || dns_response
 
-Verification: OPRF.FullEvaluate(epoch_key, input) == output
+Encrypted: HPKE.Seal(pk_E, info="codoh-enclave-v2", bundle)
+Signature: Ed25519.Sign(target_sk, SHA-256(bundle))
 ```
 
-### Cache Response Signature
+The enclave verifies the signature, validates the timestamp against a monotonic logical clock (`t_latest`), decrypts the bundle, and stores the plaintext DNS response in the cache.
 
-```
-signature = Ed25519.Sign(target_sk, H(response || query || blobB))
+### Replay Protection
 
-Verification: Ed25519.Verify(target_pk, H(response || query || blobB), signature)
-```
-
-### IPC Protocol (Unix Socket)
-
-```
-[4 bytes: length (big-endian)][JSON payload]
-
-Request types:  process, store_encrypted, get_pubkey, health, ready
-Response status: hit, miss, error, ok
-```
+SGX has no trusted clock. The enclave maintains `t_latest` (highest timestamp seen) and rejects bundles where `timestamp < t_latest - δ` (default δ = 3 seconds). This provides a grace window for legitimate message reordering while preventing replay of old responses.
 
 ---
 
@@ -174,70 +139,71 @@ Response status: hit, miss, error, ok
 
 | Primitive | Algorithm | Library |
 |-----------|-----------|---------|
-| VOPRF | P-256 (NIST curve) | cloudflare/circl/oprf |
 | HPKE | DHKEM(X25519, HKDF-SHA256) + AES-128-GCM | cloudflare/circl/hpke |
-| Cache encryption | AES-128-GCM | cloudflare/circl/hpke (AEAD) |
-| Key derivation | HKDF-SHA256 (via OPRF.DeriveKey) | cloudflare/circl |
+| Response key derivation | HPKE Export (label: "codoh response", 16 bytes) | cloudflare/circl/hpke |
+| Cache-insert encryption | HPKE to pk_E (info: "codoh-enclave-v2") | cloudflare/circl/hpke |
+| Cached response encryption | AES-128-GCM under k_r (random nonce) | Go stdlib crypto/aes |
 | Response signing | Ed25519 | Go stdlib crypto/ed25519 |
 | SGX attestation | DCAP | edgelesssys/ego |
+| Access-pattern hiding | Path ORAM | etclab/pathoram-go |
 
 ---
 
 ## Implementation Status
 
-### Done (Phase 2a-2f)
+### Implemented
 
-| Component | Files | Status |
-|-----------|-------|--------|
+| Feature | Files | Notes |
+|---------|-------|-------|
 | **Enclave Core** | | |
-| HPKE keypair, encrypt/decrypt | enclave/crypto.go | Done |
-| IPC server (Unix socket) | enclave/ipc.go | Done |
-| Token verification (VOPRF) | enclave/voprf.go | Done |
-| Spent-set (double-spend) | enclave/spentset.go | Done |
-| LRU cache with TTL | enclave/cache.go | Done |
-| ORAM cache (Path ORAM) | enclave/oram_cache.go | Done |
-| Cache interface | enclave/cache_interface.go | Done |
-| Query canonicalization | enclave/query.go | Done |
-| SGX attestation server | enclave/attestation.go | Done |
-| SGX quote generation | enclave/attestation_sgx.go | Done |
-| Simulation fallbacks | enclave/attestation_sim.go | Done |
-| Configuration loading | enclave/config.go | Done |
-| IPC types | enclave/types.go | Done |
-| Main entry point | enclave/cmd/main.go | Done |
+| HPKE keypair + decrypt/encrypt | enclave/crypto.go | Suite: X25519/HKDF-SHA256/AES-128-GCM |
+| HPKE Export key derivation (k_r) | enclave/crypto.go | Label: "codoh response" |
+| IPC server (Unix socket) | enclave/ipc.go | 4-byte length + JSON wire protocol |
+| LRU cache with logical-time TTL | enclave/cache.go | container/list, sync.RWMutex |
+| ORAM cache (Path ORAM) | enclave/oram_cache.go | FNV hash mapping, lazy expiry |
+| Cache interface | enclave/cache_interface.go | Get/Put/Size/Clear/CleanExpired |
+| Cache-insert bundle format | enclave/bundle.go | ttl + timestamp + query + response |
+| Ed25519 signature verification | enclave/cmd/main.go | On cache-insert bundles |
+| Timestamp replay protection | enclave/cmd/main.go | Monotonic t_latest + δ-window |
+| Dummy response generation | enclave/crypto.go | crypto/rand, same size as real |
+| Query canonicalization | enclave/query.go | domain:qtype format |
+| Configuration loading | enclave/config.go | Env vars + defaults |
+| SGX attestation server | enclave/attestation.go | /attest, /provision, /health |
+| SGX quote generation | enclave/attestation_sgx.go | EGo DCAP |
+| Simulation fallbacks | enclave/attestation_sim.go | Self-signed TLS, skip quote |
+| IPC message types | enclave/types.go | process, store_encrypted, get_pubkey, health |
+| Proxy mode (CODoH-base) | enclave/cmd/proxy_mode.go | 2-process HTTPS server with LRU cache |
+| Client-side HPKE helpers | enclave/client_crypto.go | EncryptQueryE, DecryptCachedResponse |
 | | | |
-| **Proxy** | | |
-| Enclave IPC client | plugin/codohproxy/enclave_client.go | Done |
-| Enclave-first flow | plugin/codohproxy/proxy.go | Done |
-| /enclave-keys endpoint | plugin/codohproxy/proxy.go | Done |
-| Bypass mode | plugin/codohproxy/proxy.go | Done |
-| Forward blob B to target | plugin/codohproxy/proxy.go | Done |
-| Forward signature to enclave | plugin/codohproxy/proxy.go | Done |
-| Wait for enclave ready | plugin/codohproxy/proxy.go | Done |
-| Prometheus metrics | plugin/codohproxy/metrics.go | Done |
-| Config options | plugin/codohproxy/setup.go | Done |
+| **Proxy Plugin** | | |
+| Parallel fan-out (enclave + target) | plugin/codohproxy/proxy.go | Concurrent goroutines |
+| /enclave-keys endpoint | plugin/codohproxy/proxy.go | Serves pk_E |
+| /proxy endpoint | plugin/codohproxy/proxy.go | Main CODoH relay |
+| Enclave IPC client | plugin/codohproxy/enclave_client.go | Unix socket client |
+| Bypass mode | plugin/codohproxy/proxy.go | Falls back to plain ODoH |
+| Prometheus metrics | plugin/codohproxy/metrics.go | |
+| Config options | plugin/codohproxy/setup.go | Corefile parsing |
 | | | |
-| **Target** | | |
-| Token issuance (VOPRF) | plugin/codohtarget/voprf.go | Done |
-| Rate limiting (per-IP) | plugin/codohtarget/ratelimit.go | Done |
-| Master secret loading | plugin/codohtarget/target.go | Done |
-| Enclave cache encryption | plugin/codohtarget/enclave_encrypt.go | Done |
-| Ed25519 response signing | plugin/codohtarget/signing.go | Done |
-| SGX quote verification | plugin/codohtarget/attestation_verify_sgx.go | Done |
-| Simulation skip verification | plugin/codohtarget/attestation_verify_sim.go | Done |
-| Secret provisioning | plugin/codohtarget/attestation.go | Done |
-| Prometheus metrics | plugin/codohtarget/metrics.go | Done |
-| Config options | plugin/codohtarget/setup.go | Done |
-| | | |
-| **Client** | | |
-| Blob B encryption | codoh-client/commands/blob.go | Done |
-| --enclave flag | codoh-client/commands/commands.go | Done |
-| X-ODoH-Blob header | codoh-client/commands/request.go | Done |
-| Token management | codoh-client/commands/tokens.go | Done |
-| Latency benchmarking | codoh-client/commands/latency.go | Done |
+| **Target Plugin** | | |
+| ODoH DNS resolution | plugin/codohtarget/target.go | /dns-query endpoint |
+| Cache-insert HPKE encryption | plugin/codohtarget/enclave_encrypt.go | Encrypts bundle to pk_E |
+| Ed25519 response signing | plugin/codohtarget/signing.go | Signs H(plaintext bundle) |
+| SGX quote verification | plugin/codohtarget/attestation_verify_sgx.go | DCAP verification |
+| Signing key provisioning | plugin/codohtarget/attestation.go | POST to /provision |
+| Prometheus metrics | plugin/codohtarget/metrics.go | |
+| Config options | plugin/codohtarget/setup.go | Corefile parsing |
 
-### Deferred
+### Not Yet Implemented (from paper design)
 
-(none) 
+| Feature | Paper Section | Description |
+|---------|---------------|-------------|
+| **Cover responses** | Set-difference mitigations | Target returns k cover answers for random domains alongside the real answer |
+| **Batched cache insertions** | Set-difference mitigations | Queue insertions and commit in batches of size B on pseudorandom schedule |
+| **Anonymous tokens** | Rate-limiting | Tokens to bound cache enumeration by untrusted proxy; mechanism TBD (network-level rate limiting + optional PoW) |
+| **Restart warm-up mode** | Restart handling | After restart, disable cache hits until cache refilled to threshold |
+| **Cache omission detection** | Cache omission attack | Track outstanding queries missing responses; enter defensive mode if threshold exceeded |
+| **Session ID (sid)** | Base protocol | Explicit sid field in AAD to bind query ciphertext to key ciphertexts and prevent cross-use |
+| **Dual HPKE key wrapping** | Base protocol | Random symmetric key k encrypted separately to target and enclave (current design encrypts query directly under pk_E) |
 
 ---
 
@@ -269,12 +235,6 @@ codohtarget {
     tls_key /path/to/key.pem
     upstream 8.8.8.8:53
 
-    # Token issuance
-    token_enabled
-    epoch_duration 1h
-    rate_limit 100
-    master_secret /path/to/master-secret.txt
-
     # Response signing
     signing_key /path/to/signing-key.pem   # Ed25519, auto-generates if missing
 
@@ -282,57 +242,73 @@ codohtarget {
     enclave_url https://localhost:8444
     enclave_mrsigner <expected_mrsigner_hex>   # Optional: verify enclave identity
 
-    log_queries true   # Optional: log DNS queries
+    log_queries true   # Optional
 }
 ```
 
-### Enclave Startup
+### Enclave Environment Variables
 
-```bash
-# Development (no SGX) - uses file/env for master secret
-cd enclave && go build -o enclave-dev ./cmd
-CODOH_MASTER_SECRET=$(cat dev-master-secret.txt) ./enclave-dev --socket /tmp/codoh-enclave.sock
+| Variable | Default | Description |
+|----------|---------|-------------|
+| CODOH_CACHE_SIZE | 10000 | Number of cache entries |
+| CODOH_USE_ORAM | false | Use ORAM cache instead of LRU |
+| CODOH_ORAM_BLOCK_SIZE | 4096 | ORAM block size in bytes |
+| CODOH_DEFAULT_PAD_SIZE | 512 | Dummy response size in bytes |
+| CODOH_REPLAY_DELTA_SECS | 3.0 | Timestamp replay window (seconds) |
+| CODOH_TARGET_SIGNING_PUBKEY | - | Base64 Ed25519 pubkey (sim mode only) |
 
-# Or with file argument
-./enclave-dev --socket /tmp/codoh-enclave.sock --secret dev-master-secret.txt
+---
 
-# Production (SGX) - waits for provisioning from target
-cd enclave && ego-go build -tags ego -o enclave ./cmd && ego sign enclave
-ego run enclave --socket /tmp/codoh-enclave.sock --https-port 8444
-# (blocks until provisioned via /provision endpoint)
+## HTTP Headers
+
+| Header | Direction | Description |
+|--------|-----------|-------------|
+| X-CoDOH-Query | Client -> Proxy | Base64-encoded Q_E (HPKE-encrypted query) |
+| X-Enclave-PubKey | Proxy -> Target | Base64-encoded enclave HPKE public key |
+| X-Enclave-Cache | Target -> Proxy | Base64-encoded HPKE-encrypted cache-insert bundle |
+| X-Enclave-Cache-Sig | Target -> Proxy | Base64-encoded Ed25519 signature |
+| X-Enclave-Cache-TTL | Target -> Proxy | TTL in seconds for cache entry |
+
+## Content Types
+
+| Content-Type | Description |
+|--------------|-------------|
+| application/oblivious-dns-message | Standard ODoH (RFC 9230) |
+| application/codoh-cached | Cached response from enclave (AES-GCM under k_r) |
+
+---
+
+## IPC Protocol (Unix Socket)
+
+```
+Wire format: [4 bytes: length (big-endian)][JSON payload]
+
+Request types:  process, store_encrypted, get_pubkey, health
+Response status: hit, miss, error, ok
 ```
 
-### Environment Variables (Enclave)
+---
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| CODOH_MASTER_SECRET | Hex-encoded 32-byte secret | Required in sim mode |
-| CODOH_EPOCH_DURATION | Epoch duration in seconds | 3600 |
-| CODOH_SOCKET_PATH | Unix socket path | /tmp/codoh-enclave.sock |
-| CODOH_CACHE_SIZE | Cache entries | 10000 |
-| CODOH_USE_ORAM | Enable ORAM cache | false |
-| CODOH_ORAM_BLOCK_SIZE | ORAM block size (bytes) | 4096 |
+## Operating Modes
 
-### Client Usage
+### IPC Mode (Configs 4-7) — 3-process architecture
 
-```bash
-# Single query with enclave caching
-./odoh-client odoh --domain example.com. --dnstype A \
-  --target 127.0.0.1:8443 --proxy 127.0.0.1:8080 \
-  --customcert proxy.pem --enclave
-
-# Latency benchmark
-./odoh-client latency \
-  --protocol codoh \
-  --distribution sequential \
-  --iterations 1000 \
-  --target 127.0.0.1:8443 \
-  --proxy 127.0.0.1:8080 \
-  --customcert localhost.pem \
-  --domains benchmark/top-1m.csv \
-  --output results.csv \
-  --summary results.json
 ```
+Client → Proxy (codohproxy plugin) → Target (codohtarget plugin) → Upstream DNS
+            │
+            ▼
+         Enclave (IPC over Unix socket)
+```
+
+Default mode. Enclave runs as a separate process communicating via Unix socket.
+
+### Proxy Mode (Config 3, CODoH-base) — 2-process architecture
+
+```
+Client → Proxy (HTTPS, built-in cache) → ODoH Target → Upstream DNS
+```
+
+Single HTTPS proxy with HPKE keypair and LRU cache. No IPC, no signatures. Run with `enclave-sim -mode proxy`.
 
 ---
 
@@ -341,16 +317,17 @@ ego run enclave --socket /tmp/codoh-enclave.sock --https-port 8444
 ```
 coredns/
 ├── enclave/                    # SGX enclave code
-│   ├── cmd/main.go            # Entry point, handler implementation
-│   ├── crypto.go              # HPKE keypair, encrypt/decrypt, BlobB parsing
+│   ├── cmd/main.go            # Entry point, EnclaveHandler, mode routing
+│   ├── cmd/proxy_mode.go      # ProxyServer for CODoH-base
+│   ├── crypto.go              # HPKE keypair, decrypt, encrypt, k_r derivation, dummy response
+│   ├── client_crypto.go       # Client-side HPKE helpers (EncryptQueryE, DecryptCachedResponse)
+│   ├── bundle.go              # CacheInsertBundle marshal/parse
 │   ├── ipc.go                 # Unix socket server
-│   ├── voprf.go               # Token verification, epoch keys
-│   ├── spentset.go            # Double-spend tracking
-│   ├── cache.go               # LRU cache with TTL
+│   ├── cache.go               # LRU cache with logical-time TTL
 │   ├── cache_interface.go     # Cache interface
 │   ├── oram_cache.go          # Path ORAM cache (access-pattern hiding)
 │   ├── query.go               # Query canonicalization
-│   ├── config.go              # Configuration loading (env/file)
+│   ├── config.go              # Configuration loading (env vars)
 │   ├── types.go               # IPC message types
 │   ├── attestation.go         # HTTPS attestation server (/attest, /provision)
 │   ├── attestation_sgx.go     # SGX-specific: quote generation, attested TLS
@@ -365,10 +342,8 @@ coredns/
 │   │   └── metrics.go         # Prometheus metrics
 │   │
 │   └── codohtarget/           # Target plugin
-│       ├── target.go          # Main handler, /dns-query, /token, /verify
-│       ├── voprf.go           # Epoch manager, token issuance
-│       ├── ratelimit.go       # Per-IP rate limiting
-│       ├── enclave_encrypt.go # HPKE encryption for cache
+│       ├── target.go          # Main handler, /dns-query
+│       ├── enclave_encrypt.go # HPKE encryption for cache-insert bundles
 │       ├── signing.go         # Ed25519 response signing
 │       ├── attestation.go     # Enclave provisioning client
 │       ├── attestation_verify_sgx.go  # SGX quote verification (DCAP)
@@ -377,17 +352,15 @@ coredns/
 │       └── metrics.go         # Prometheus metrics
 │
 ├── benchmark/                  # Benchmarking tools
-│   ├── run-benchmark.sh       # Main benchmark script
-│   ├── top-1m.csv             # Domain list for benchmarks
-│   ├── Corefile.odoh-proxy    # ODoH baseline proxy config
-│   └── Corefile.odoh-target   # ODoH baseline target config
+│   ├── configs/{1..7}-*.sh    # Config profiles (sourceable)
+│   ├── run-all.sh             # Multi-config orchestrator
+│   └── top-1m.csv             # Domain list
 │
-└── codoh-client/              # Client (separate directory)
+└── codoh-client/              # Client (separate repo)
     └── commands/
-        ├── blob.go            # BlobB struct, HPKE encryption
-        ├── commands.go        # CLI flags (--enclave, --protocol)
+        ├── blob.go            # Q_E encryption (HPKE)
+        ├── commands.go        # CLI flags (--protocol codoh)
         ├── request.go         # HTTP request construction
-        ├── tokens.go          # Token management
         └── latency.go         # Latency benchmarking
 ```
 
@@ -395,17 +368,18 @@ coredns/
 
 ## Security Properties
 
-| Property | Mechanism |
-|----------|-----------|
-| Query privacy from proxy | Blob B encrypted under pk_E |
-| Token unlinkability | VOPRF blind tokens |
-| Rate limiting (issuance) | Per-IP limits at target |
-| Rate limiting (redemption) | Per-token spent-set in enclave |
-| Replay protection | Spent-set marks tokens used |
-| Epoch isolation | Tokens bound to epoch, spent-set cleared on rotation |
-| Cache integrity | Target signs responses with Ed25519, enclave verifies |
-| Request binding | Signature binds response to query and blob B |
-| Secret provisioning | SGX attestation + HPKE encryption |
+| Property | Mechanism | Status |
+|----------|-----------|--------|
+| Query privacy from proxy | Q_E encrypted under pk_E (HPKE) | Implemented |
+| Cache integrity (G1) | Target signs bundles with Ed25519, enclave verifies | Implemented |
+| Freshness (G1) | Timestamp δ-window + monotonic t_latest | Implemented |
+| Hit/miss indistinguishability | Dummy response on miss (same size as hit) | Implemented |
+| Access-pattern hiding (G2) | ORAM cache option (Path ORAM) | Implemented |
+| Secret provisioning | SGX attestation + HPKE encryption | Implemented |
+| Set-difference resistance (G2) | Cover responses + batched insertions | Not yet implemented |
+| Restart resistance (G2) | Warm-up mode (disable hits until refilled) | Not yet implemented |
+| Cache omission resistance (G2) | Outstanding query tracking + defensive mode | Not yet implemented |
+| Query profiling resistance (G3) | Anonymous tokens to rate-limit proxy probing | Not yet implemented |
 
 ---
 
@@ -414,24 +388,28 @@ coredns/
 ### E2E Test (Development)
 
 ```bash
-# Use the test script
 ./scripts/test-attestation-e2e.sh          # Simulation mode
 ./scripts/test-attestation-e2e.sh --sgx    # SGX hardware mode
 ```
 
-### Benchmark
+### Benchmarking
 
 ```bash
-# Run full benchmark suite
-./benchmark/run-benchmark.sh 100           # 100 iterations, simulation
-./benchmark/run-benchmark.sh --sgx 1000    # 1000 iterations, SGX mode
+# Run all configs
+./benchmark/run-all.sh
+
+# Quick mode (100 iterations, cold only)
+./benchmark/run-all.sh --quick
+
+# Specific configs
+./benchmark/run-all.sh --configs 1,3,4,5
 ```
 
 ### Manual Testing
 
 ```bash
 # Terminal 1: Start enclave (simulation)
-CODOH_MASTER_SECRET=$(cat dev-master-secret.txt) ./enclave-sim
+./enclave-sim --socket /tmp/codoh-enclave.sock
 
 # Terminal 2: Start target
 ./coredns -conf Corefile.target
@@ -440,46 +418,9 @@ CODOH_MASTER_SECRET=$(cat dev-master-secret.txt) ./enclave-sim
 ./coredns -conf Corefile.proxy
 
 # Terminal 4: Test
-./odoh-client odoh --domain example.com. --dnstype A \
+cd ../codoh-client
+./odoh-client latency --protocol codoh \
   --target 127.0.0.1:8443 --proxy 127.0.0.1:8080 \
-  --customcert localhost.pem --enclave
+  --customcert ../coredns/localhost.pem \
+  --domains ../coredns/benchmark/top-1m.csv --iterations 10
 ```
-
-### Verify Cache Hit
-
-```bash
-# First query (miss - goes to target)
-./odoh-client odoh --domain example.com. --dnstype A --enclave ...
-
-# Second query with new token (hit - served from enclave cache)
-./odoh-client odoh --domain example.com. --dnstype A --enclave ...
-```
-
----
-
-## HTTP Headers
-
-| Header | Direction | Description |
-|--------|-----------|-------------|
-| X-ODoH-Blob | Client -> Proxy | Base64-encoded encrypted blob B |
-| X-Enclave-PubKey | Proxy -> Target | Base64-encoded enclave HPKE public key |
-| X-Enclave-Cache | Target -> Proxy | Base64-encoded HPKE-encrypted raw DNS response |
-| X-Enclave-Cache-Sig | Target -> Proxy | Base64-encoded Ed25519 signature |
-| X-Enclave-Cache-Query | Target -> Proxy | Canonicalized query string |
-
----
-
-## Content Types
-
-| Content-Type | Description |
-|--------------|-------------|
-| application/oblivious-dns-message | Standard ODoH (RFC 9230) |
-| application/codoh-cached | Cached response from enclave (AES-GCM under k_c) |
-
----
-
-## Next Steps
-
-- MLE ciphertext-only cache (hide plaintext from enclave)
-- Stochastic hit suppression / non-insertion
-- Random churn eviction

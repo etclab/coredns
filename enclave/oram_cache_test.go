@@ -2,7 +2,6 @@ package enclave
 
 import (
 	"testing"
-	"time"
 )
 
 func TestORAMCache_BasicOperations(t *testing.T) {
@@ -19,11 +18,12 @@ func TestORAMCache_BasicOperations(t *testing.T) {
 
 	query := "example.com."
 	response := []byte("dns response data")
-	ttl := 5 * time.Minute
+	insertedAt := int64(1000)
+	ttlSecs := uint32(300)
 
-	cache.Put(query, response, ttl)
+	cache.Put(query, response, insertedAt, ttlSecs)
 
-	gotResp, found := cache.Get(query)
+	gotResp, found := cache.Get(query, 1100) // within TTL (1000+300=1300 > 1100)
 	if !found {
 		t.Fatal("expected to find cached entry")
 	}
@@ -44,7 +44,7 @@ func TestORAMCache_NotFound(t *testing.T) {
 		t.Fatalf("NewORAMCache failed: %v", err)
 	}
 
-	_, found := cache.Get("nonexistent.com.")
+	_, found := cache.Get("nonexistent.com.", 1000)
 	if found {
 		t.Error("expected not to find nonexistent entry")
 	}
@@ -63,13 +63,16 @@ func TestORAMCache_TTLExpiry(t *testing.T) {
 	}
 
 	query := "expire.com."
-	cache.Put(query, []byte("data"), 1*time.Millisecond)
+	cache.Put(query, []byte("data"), 100, 60) // InsertedAt=100, TTL=60s → expires at 160
 
-	time.Sleep(5 * time.Millisecond)
+	// Not expired: tLatest=150 (100+60=160, 160 < 150 is false)
+	if _, found := cache.Get(query, 150); !found {
+		t.Error("expected entry to still be valid at tLatest=150")
+	}
 
-	_, found := cache.Get(query)
-	if found {
-		t.Error("expected entry to be expired")
+	// Expired: tLatest=161 (160 < 161 is true)
+	if _, found := cache.Get(query, 161); found {
+		t.Error("expected entry to be expired at tLatest=161")
 	}
 }
 
@@ -86,10 +89,10 @@ func TestORAMCache_Overwrite(t *testing.T) {
 	}
 
 	query := "update.com."
-	cache.Put(query, []byte("v1"), 5*time.Minute)
-	cache.Put(query, []byte("v2"), 5*time.Minute)
+	cache.Put(query, []byte("v1"), 100, 300)
+	cache.Put(query, []byte("v2"), 200, 300)
 
-	resp, found := cache.Get(query)
+	resp, found := cache.Get(query, 250)
 	if !found {
 		t.Fatal("expected to find entry")
 	}
@@ -116,7 +119,7 @@ func TestORAMCache_StashSize(t *testing.T) {
 	}
 
 	for i := 0; i < 10; i++ {
-		cache.Put("query"+string(rune('a'+i))+".com.", []byte("data"), 5*time.Minute)
+		cache.Put("query"+string(rune('a'+i))+".com.", []byte("data"), 1000, 300)
 	}
 
 	stash = cache.StashSize()
@@ -135,7 +138,7 @@ func TestORAMCache_Clear(t *testing.T) {
 		t.Fatalf("NewORAMCache failed: %v", err)
 	}
 
-	cache.Put("test.com.", []byte("data"), 5*time.Minute)
+	cache.Put("test.com.", []byte("data"), 1000, 300)
 	if cache.Size() != 1 {
 		t.Errorf("expected size 1, got %d", cache.Size())
 	}
@@ -145,7 +148,7 @@ func TestORAMCache_Clear(t *testing.T) {
 		t.Errorf("expected size 0 after clear, got %d", cache.Size())
 	}
 
-	_, found := cache.Get("test.com.")
+	_, found := cache.Get("test.com.", 1000)
 	if found {
 		t.Error("expected not to find entry after clear")
 	}
@@ -165,9 +168,9 @@ func TestORAMCache_LargeEntry(t *testing.T) {
 
 	query := "large.com."
 	largeData := make([]byte, 300)
-	cache.Put(query, largeData, 5*time.Minute)
+	cache.Put(query, largeData, 1000, 300)
 
-	_, found := cache.Get(query)
+	_, found := cache.Get(query, 1000)
 	if found {
 		t.Error("expected large entry to not be stored")
 	}

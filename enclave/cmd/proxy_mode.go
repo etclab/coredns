@@ -158,7 +158,7 @@ func (s *ProxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Cache lookup
-	if cachedResp, ok := s.cache.Get(query); ok {
+	if cachedResp, ok := s.cache.Get(query, 0); ok {
 		// Cache hit — encrypt with client's kc and return
 		encrypted, err := enclave.EncryptResponse(kc, cachedResp)
 		if err != nil {
@@ -241,15 +241,16 @@ func (s *ProxyServer) storeCacheEntry(query, encCacheB64, ttlStr string) {
 		return
 	}
 
-	ttl := 300 * time.Second // default 5 minutes
+	ttlSecs := uint32(300) // default 5 minutes
 	if ttlStr != "" {
 		if secs, err := strconv.Atoi(ttlStr); err == nil && secs > 0 {
-			ttl = time.Duration(secs) * time.Second
+			ttlSecs = uint32(secs)
 		}
 	}
 
-	s.cache.Put(query, plaintext, ttl)
-	log.Printf("Cached response for %s (TTL: %v, cache_size: %d)", query, ttl, s.cache.Size())
+	insertedAt := time.Now().Unix()
+	s.cache.Put(query, plaintext, insertedAt, ttlSecs)
+	log.Printf("Cached response for %s (TTL: %ds, cache_size: %d)", query, ttlSecs, s.cache.Size())
 }
 
 // parseSimpleBlobB parses a simplified blob for CODoH-base.

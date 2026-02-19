@@ -2,6 +2,9 @@ package enclave
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
 	"testing"
 	"time"
 )
@@ -78,5 +81,41 @@ func TestCacheInsertBundle_QueryLenExceedsData(t *testing.T) {
 	_, err := ParseCacheInsertBundle(data)
 	if err == nil {
 		t.Fatal("expected error for corrupt query_len")
+	}
+}
+
+func TestTimestampTamperBreaksSignature(t *testing.T) {
+	// Generate Ed25519 keypair
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+
+	bundle := &CacheInsertBundle{
+		TTL:            300,
+		Timestamp:      time.Now().Unix(),
+		CanonicalQuery: "example.com.:1",
+		DNSResponse:    []byte{0xDE, 0xAD, 0xBE, 0xEF},
+	}
+
+	data := MarshalCacheInsertBundle(bundle)
+
+	// Sign: Sign(H(serialized_bundle))
+	hash := sha256.Sum256(data)
+	sig := ed25519.Sign(priv, hash[:])
+
+	// Verify original passes
+	if !ed25519.Verify(pub, hash[:], sig) {
+		t.Fatal("signature should verify on original data")
+	}
+
+	// Tamper with timestamp bytes (offset 4..11 in the serialized bundle)
+	tampered := make([]byte, len(data))
+	copy(tampered, data)
+	tampered[4] ^= 0xFF // flip a byte in the timestamp
+
+	tamperedHash := sha256.Sum256(tampered)
+	if ed25519.Verify(pub, tamperedHash[:], sig) {
+		t.Fatal("signature should NOT verify after timestamp tampering")
 	}
 }

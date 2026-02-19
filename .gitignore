@@ -12,4 +12,4 @@ enclave-test
 # Enclave binaries and keys
 enclave/enclave
 enclave/enclave-sim
-enclave/*.pem
+enclave/*.pembench-logs.txt
