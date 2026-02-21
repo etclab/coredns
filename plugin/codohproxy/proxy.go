@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -97,7 +98,8 @@ func (p *odohProxy) OnStartup() error {
 	p.mux.HandleFunc("/health", p.healthHandler)
 	if p.enclaveEnabled {
 		p.mux.HandleFunc("/enclave-keys", p.enclaveKeysHandler)
-		log.Infof("Registered /enclave-keys endpoint")
+		p.mux.HandleFunc("/cache-insert", p.cacheInsertHandler)
+		log.Infof("Registered /enclave-keys and /cache-insert endpoints")
 	}
 
 	p.srv = &http.Server{
@@ -255,15 +257,7 @@ func (p *odohProxy) proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Fire-and-forget cache-insert if headers present
-	if enclaveCache := targetRes.resp.Header.Get("X-Enclave-Cache"); enclaveCache != "" {
-		sig := targetRes.resp.Header.Get("X-Enclave-Cache-Sig")
-		go func() {
-			if err := p.enclaveClient.StoreCacheInsert(enclaveCache, sig); err != nil {
-				log.Errorf("Async cache-insert failed: %v", err)
-			}
-		}()
-	}
+	// Cache-insert now arrives via POST /cache-insert (no longer via headers)
 
 	// Write response
 	if enclaveError == "" && len(enclaveBlob) > 0 {
@@ -370,6 +364,52 @@ func (p *odohProxy) enclaveKeysHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusOK)
 	io.WriteString(w, pubKey)
+}
+
+// cacheInsertPayload is the JSON body received from the target's POST /cache-insert.
+type cacheInsertPayload struct {
+	EncryptedBlob string `json:"encrypted_blob"`
+	Signature     string `json:"signature"`
+}
+
+// cacheInsertHandler receives cache-insert bundles from the target and forwards
+// them to the enclave via store_encrypted IPC.
+func (p *odohProxy) cacheInsertHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read body", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	var payload cacheInsertPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	if payload.EncryptedBlob == "" {
+		http.Error(w, "Missing encrypted_blob", http.StatusBadRequest)
+		return
+	}
+
+	if p.enclaveClient == nil {
+		http.Error(w, "Enclave not configured", http.StatusBadGateway)
+		return
+	}
+
+	if err := p.enclaveClient.StoreCacheInsert(payload.EncryptedBlob, payload.Signature); err != nil {
+		log.Errorf("Cache-insert IPC failed: %v", err)
+		http.Error(w, "Enclave IPC failed", http.StatusBadGateway)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
 }
 
 // resolveTargetURL builds the target URL from query parameters or default.

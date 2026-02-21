@@ -53,101 +53,89 @@ go generate && go build
 go build -o enclave-sim ./enclave/cmd
 
 # SGX mode (requires EGo SDK)
-cd enclave && ego-go build -tags ego -o enclave ./cmd && ego sign enclave
+# IMPORTANT: ego-go does NOT auto-set the 'ego' build tag — must pass -tags ego
+# IMPORTANT: go.mod must use go 1.25.1 for ego-go compatibility (ego ships Go 1.25.1)
+cd enclave && ego-go build -tags ego -o enclave ./cmd && ego sign enclave.json
 ```
+
+**enclave.json**: Must list all `CODOH_*` env vars with `"fromHost": true` or they won't be visible inside the enclave. See `enclave/enclave.json` for the current list.
 
 ---
 
 ## Automated Testing
 
-### Full E2E Test (Simulation)
-
-Runs enclave + target + proxy + client query automatically:
+All scripts require SGX hardware and EGo SDK.
 
 ```bash
-./scripts/test-attestation-e2e.sh
-```
-
-### Full E2E Test (SGX Hardware)
-
-Requires SGX hardware, EGo SDK, and PCCS configured:
-
-```bash
-./scripts/test-attestation-e2e.sh --sgx
-```
-
-### Enclave Provisioning Test
-
-Quick test for enclave startup and IPC:
-
-```bash
-./scripts/test-provisioning.sh
+./scripts/test-stack-simple.sh         # Quick Config 4 smoke test (build + run + client)
+./scripts/test-attestation-e2e.sh      # Full attestation flow (quote, provisioning, queries)
+./scripts/test-codoh-base-e2e.sh       # Config 3 proxy mode (2-process)
+./scripts/test-provisioning.sh         # Focused provisioning test (enclave + target only)
 ```
 
 ---
 
 ## Manual Testing
 
-### 1. Start Enclave (Simulation)
+Launch order: **enclave → target → proxy**. In SGX mode, the enclave blocks on provisioning until the target calls `/attest` + `/provision`.
+
+### 1. Start Enclave (SGX)
 
 ```bash
-./enclave-sim --socket /tmp/codoh-enclave.sock
+cd enclave && ego-go build -tags ego -o enclave ./cmd && ego sign enclave.json && cd ..
+
+CODOH_CACHE_SIZE=10000 CODOH_BATCH_SIZE=10 CODOH_BATCH_COMMIT_PROB=1.0 \
+CODOH_WARMUP_THRESHOLD=5 CODOH_REPLAY_DELTA_SECS=30 \
+ego run enclave/enclave --socket /tmp/codoh-enclave.sock
 ```
+
+Wait for "Attestation server listening on https://0.0.0.0:8444" before starting the target.
 
 ### 2. Start Target
 
-Using `Corefile.target`:
+`Corefile.target` must include `enclave_url` for SGX attestation-based provisioning:
 ```
-.:5354 {
+.:5353 {
     codohtarget {
         port 8443
         tls_cert localhost.pem
         tls_key localhost-key.pem
         upstream 8.8.8.8:53
         signing_key /tmp/target-signing.pem
+        enclave_url https://127.0.0.1:8444
         log_queries true
     }
 }
 ```
 
 ```bash
-./coredns -conf Corefile.target
+CODOH_COVER_COUNT=3 \
+CODOH_COVER_DOMAIN_FILE=benchmark/top-1m.csv \
+CODOH_PROXY_CALLBACK_URL=https://127.0.0.1:8080 \
+CODOH_COVER_RESOLVER=8.8.8.8:53 \
+CODOH_COVER_TIMEOUT_MS=2000 \
+./coredns-test -conf Corefile.target
 ```
+
+Without `CODOH_PROXY_CALLBACK_URL`, cache-insert delivery is silently disabled.
 
 ### 3. Start Proxy
 
-Using `Corefile.proxy`:
-```
-.:5353 {
-    codohproxy {
-        target https://127.0.0.1:8443/dns-query
-        port 8080
-        tls_cert localhost.pem
-        tls_key localhost-key.pem
-        insecure_skip_verify true
-        enclave_enabled
-        enclave_socket /tmp/codoh-enclave.sock
-        enclave_bypass_on_failure true
-    }
-}
+```bash
+./coredns-test -conf Corefile.proxy
 ```
 
-```bash
-./coredns -conf Corefile.proxy
-```
+The proxy auto-registers `POST /cache-insert` when `enclave_enabled` is set.
 
 ### 4. Test with odoh-client
 
 ```bash
-cd ../codoh-client
-
-# CODoH latency test (IPC mode)
-./odoh-client latency \
+../codoh-client/odoh-client latency \
     --protocol codoh \
     --target 127.0.0.1:8443 \
     --proxy 127.0.0.1:8080 \
-    --customcert ../coredns/localhost.pem \
-    --domains ../coredns/benchmark/top-1m.csv \
+    --customcert localhost.pem \
+    --domains benchmark/top-1m.csv \
     --iterations 10
 ```
 
@@ -169,6 +157,7 @@ cd ../codoh-client
 |----------|--------|-------------|
 | `/proxy` | POST | CODoH relay endpoint |
 | `/enclave-keys` | GET | Enclave HPKE public key |
+| `/cache-insert` | POST | Receives cache-insert bundles from target (when `enclave_enabled`) |
 | `/health` | GET | Health check |
 
 ### Enclave (IPC + HTTPS in SGX mode)
@@ -191,11 +180,10 @@ cd ../codoh-client
 |--------|-----------|-------------|
 | `X-CoDOH-Query` | Client -> Proxy | Base64-encoded Q_E (HPKE-encrypted query) |
 | `X-Enclave-PubKey` | Proxy -> Target | Base64-encoded enclave HPKE public key |
-| `X-Enclave-Cache` | Target -> Proxy | Base64-encoded HPKE-encrypted cache-insert bundle |
-| `X-Enclave-Cache-Sig` | Target -> Proxy | Base64-encoded Ed25519 signature |
-| `X-Enclave-Cache-TTL` | Target -> Proxy | TTL in seconds for cache entry |
 | `X-CoDOH-Key-Rotated` | Proxy -> Client | `true` when enclave pk_E has rotated (restart). Client should re-fetch pk_E from `/enclave-keys` |
 | `X-CoDOH-Enclave-Error` | Proxy -> Client | Error code when enclave leg fails (e.g., `key_rotated`, `enclave_unavailable`) |
+
+**Note:** Cache-insert bundles are delivered via `POST /cache-insert` (JSON payload with real entry + k covers), not via HTTP headers.
 
 ---
 
@@ -223,10 +211,12 @@ cd ../codoh-client
 
 ```bash
 cd enclave
-ego-go build -tags ego -o enclave ./cmd
-ego sign enclave
+ego-go build -tags ego -o enclave ./cmd   # -tags ego is REQUIRED (not auto-set)
+ego sign enclave.json
 ego run enclave --socket /tmp/codoh-enclave.sock --https-port 8444
 ```
+
+**Cleanup note:** `ego-host` child processes don't die when `ego run` parent is killed. Clean up by port: `lsof -ti :8444 | xargs kill`
 
 ### Target with Enclave Provisioning
 
@@ -234,10 +224,12 @@ ego run enclave --socket /tmp/codoh-enclave.sock --https-port 8444
 codohtarget {
     ...
     signing_key /path/to/signing-key.pem
-    enclave_url https://proxy-host:8444
-    enclave_mrsigner <64 hex chars>  # optional, from: ego signerid private.pem
+    enclave_url https://localhost:8444        # triggers attestation flow
+    enclave_mrsigner <64 hex chars>           # optional, from: ego signerid enclave
 }
 ```
+
+For quote verification on the target side, build with `-tags sgxverify` (requires Open Enclave SDK). Without it, verification is skipped with a warning.
 
 ---
 
@@ -285,6 +277,18 @@ codohtarget {
 | `CODOH_BATCH_COMMIT_PROB` | 0.1 | Probability of batch commit per HandleProcess call |
 | `CODOH_QUEUE_MAX_SIZE` | 1000 | Max pending inserts in the insertion queue |
 
+### Target Environment Variables (Cover Responses)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CODOH_COVER_COUNT` | 3 | Cover domains per cache-insert (0 to disable) |
+| `CODOH_COVER_DOMAIN_FILE` | - | Path to domain list CSV (required when COVER_COUNT > 0) |
+| `CODOH_COVER_POPULAR_CUTOFF` | 10000 | Top-N domains treated as "popular" in sampler |
+| `CODOH_COVER_POPULAR_RATIO` | 0.8 | Fraction of covers drawn from popular tier |
+| `CODOH_COVER_RESOLVER` | 127.0.0.1:53 | DNS resolver for cover domain resolution |
+| `CODOH_COVER_TIMEOUT_MS` | 2000 | Timeout for cover DNS resolution (ms) |
+| `CODOH_PROXY_CALLBACK_URL` | - | Proxy base URL for `POST /cache-insert` delivery (required) |
+
 ---
 
 ## What's Implemented
@@ -304,7 +308,7 @@ Client → Proxy (codohproxy plugin) → Target (codohtarget plugin) → Upstrea
 
 1. **Enclave** (`enclave-sim` or SGX `enclave`) — HPKE keypair, cache (LRU or ORAM), Q_E decryption, cache-insert verification, batched cache updates, defensive mode, omission detection
 2. **Proxy** (`codohproxy` plugin, port 8080) — fans out Q_E to enclave + Q_T to target in parallel
-3. **Target** (`codohtarget` plugin, port 8443) — ODoH resolution, cache-insert bundle construction, Ed25519 signing
+3. **Target** (`codohtarget` plugin, port 8443) — ODoH resolution, cache-insert bundle construction, Ed25519 signing, cover response generation
 
 **Flow (miss):**
 1. Client fetches enclave public key from proxy `/enclave-keys`
@@ -312,9 +316,10 @@ Client → Proxy (codohproxy plugin) → Target (codohtarget plugin) → Upstrea
 3. Client sends ODoH request to proxy `/proxy` with `X-CoDOH-Query` header
 4. Proxy fans out: sends Q_E to enclave (IPC) and Q_T to target (HTTPS) in parallel
 5. Enclave decrypts Q_E, cache miss → returns dummy (indistinguishable from hit)
-6. Target resolves DNS, builds cache-insert bundle, encrypts under enclave pubkey, signs with Ed25519
-7. Proxy fires async `store_encrypted` IPC to enclave with encrypted bundle + signature. Enclave enqueues entry for batched commit.
-8. Proxy returns ODoH response to client
+6. Target resolves DNS, builds cache-insert bundle (real + k covers), encrypts each under enclave pubkey, signs with Ed25519
+7. Target asynchronously POSTs bundle batch to proxy's `/cache-insert` endpoint
+8. Proxy fires `store_encrypted` IPC to enclave for each entry. Enclave enqueues for batched commit.
+9. Proxy returns ODoH response to client
 
 **Flow (hit):**
 1-4 same as above, but enclave finds cached response, encrypts under session key k_r (derived via HPKE Export), returns `status: "hit"`
@@ -362,7 +367,7 @@ Client → Proxy (HTTPS, built-in cache) → ODoH Target → Upstream DNS
 **Processes:**
 
 1. **ODoH Target** (`codohtarget` plugin, port 10444)
-2. **Proxy** (`enclave-sim -mode proxy`, port 10443) — HTTPS server with HPKE keypair and LRU cache
+2. **Proxy** (`ego run enclave -mode proxy`, port 10443) — HTTPS server with HPKE keypair and LRU cache
 
 **Running manually:**
 
@@ -370,8 +375,8 @@ Client → Proxy (HTTPS, built-in cache) → ODoH Target → Upstream DNS
 # 1. Start target
 ./coredns-test -conf benchmark/Corefile.codoh-base-target
 
-# 2. Start enclave-proxy (simulation)
-./enclave-sim -mode proxy -https-port 10443 \
+# 2. Start enclave-proxy (SGX)
+ego run enclave/enclave -mode proxy -https-port 10443 \
     -tls-cert localhost.pem -tls-key localhost-key.pem \
     -target https://127.0.0.1:10444
 

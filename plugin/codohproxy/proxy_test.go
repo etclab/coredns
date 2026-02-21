@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/coredns/coredns/enclave"
@@ -14,7 +16,17 @@ import (
 
 // mockEnclaveHandler implements enclave.RequestHandler for testing.
 type mockEnclaveHandler struct {
-	processFunc func(qe string) *enclave.Response
+	processFunc        func(qe string) *enclave.Response
+	storeEncryptedFunc func(blob, sig string) *enclave.Response
+
+	// Captured store_encrypted calls
+	mu         sync.Mutex
+	storeCalls []storeCall
+}
+
+type storeCall struct {
+	Blob string
+	Sig  string
 }
 
 func (m *mockEnclaveHandler) HandleProcess(qe string) *enclave.Response {
@@ -22,6 +34,12 @@ func (m *mockEnclaveHandler) HandleProcess(qe string) *enclave.Response {
 }
 
 func (m *mockEnclaveHandler) HandleStoreEncrypted(blob, sig string) *enclave.Response {
+	m.mu.Lock()
+	m.storeCalls = append(m.storeCalls, storeCall{Blob: blob, Sig: sig})
+	m.mu.Unlock()
+	if m.storeEncryptedFunc != nil {
+		return m.storeEncryptedFunc(blob, sig)
+	}
 	return &enclave.Response{Status: enclave.StatusOK}
 }
 
@@ -168,6 +186,154 @@ func TestProxyHandler_CacheMiss_TwoChunkResponse(t *testing.T) {
 	}
 	if !bytes.Equal(chunk2, targetBody) {
 		t.Fatalf("chunk2 mismatch: got %x, want %x", chunk2, targetBody)
+	}
+}
+
+// --- S5-T5: /cache-insert handler tests ---
+
+func newCacheInsertProxy(t *testing.T, handler *mockEnclaveHandler) (*odohProxy, func()) {
+	t.Helper()
+	socketPath := filepath.Join(t.TempDir(), "test-enclave.sock")
+	ipcServer, err := enclave.NewIPCServer(socketPath, handler)
+	if err != nil {
+		t.Fatalf("NewIPCServer: %v", err)
+	}
+	go ipcServer.Serve()
+
+	ec := NewEnclaveClient(socketPath)
+	if err := ec.CheckHealth(); err != nil {
+		t.Fatalf("CheckHealth: %v", err)
+	}
+
+	proxy := &odohProxy{
+		enclaveEnabled: true,
+		enclaveClient:  ec,
+	}
+	return proxy, func() { ipcServer.Close() }
+}
+
+func TestCacheInsertHandler_ValidPOST(t *testing.T) {
+	handler := &mockEnclaveHandler{
+		processFunc: func(qe string) *enclave.Response {
+			return &enclave.Response{Status: enclave.StatusMiss}
+		},
+	}
+	proxy, cleanup := newCacheInsertProxy(t, handler)
+	defer cleanup()
+
+	body := `{"encrypted_blob":"AQIDBA==","signature":"BQYHCA=="}`
+	req := httptest.NewRequest("POST", "/cache-insert", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	proxy.cacheInsertHandler(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != 200 {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, respBody)
+	}
+
+	// Verify enclave received the store_encrypted call with correct values
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	if len(handler.storeCalls) != 1 {
+		t.Fatalf("expected 1 store call, got %d", len(handler.storeCalls))
+	}
+	if handler.storeCalls[0].Blob != "AQIDBA==" {
+		t.Errorf("blob mismatch: got %q", handler.storeCalls[0].Blob)
+	}
+	if handler.storeCalls[0].Sig != "BQYHCA==" {
+		t.Errorf("sig mismatch: got %q", handler.storeCalls[0].Sig)
+	}
+}
+
+func TestCacheInsertHandler_InvalidJSON(t *testing.T) {
+	handler := &mockEnclaveHandler{
+		processFunc: func(qe string) *enclave.Response {
+			return &enclave.Response{Status: enclave.StatusMiss}
+		},
+	}
+	proxy, cleanup := newCacheInsertProxy(t, handler)
+	defer cleanup()
+
+	req := httptest.NewRequest("POST", "/cache-insert", strings.NewReader("not json{{{"))
+	w := httptest.NewRecorder()
+
+	proxy.cacheInsertHandler(w, req)
+
+	if w.Code != 400 {
+		t.Fatalf("expected 400 for invalid JSON, got %d", w.Code)
+	}
+}
+
+func TestCacheInsertHandler_MissingBlob(t *testing.T) {
+	handler := &mockEnclaveHandler{
+		processFunc: func(qe string) *enclave.Response {
+			return &enclave.Response{Status: enclave.StatusMiss}
+		},
+	}
+	proxy, cleanup := newCacheInsertProxy(t, handler)
+	defer cleanup()
+
+	body := `{"encrypted_blob":"","signature":"BQYHCA=="}`
+	req := httptest.NewRequest("POST", "/cache-insert", strings.NewReader(body))
+	w := httptest.NewRecorder()
+
+	proxy.cacheInsertHandler(w, req)
+
+	if w.Code != 400 {
+		t.Fatalf("expected 400 for empty blob, got %d", w.Code)
+	}
+}
+
+func TestCacheInsertHandler_EnclaveIPCFail(t *testing.T) {
+	handler := &mockEnclaveHandler{
+		processFunc: func(qe string) *enclave.Response {
+			return &enclave.Response{Status: enclave.StatusMiss}
+		},
+		storeEncryptedFunc: func(blob, sig string) *enclave.Response {
+			return &enclave.Response{Status: enclave.StatusError, Error: "decrypt_failed"}
+		},
+	}
+	proxy, cleanup := newCacheInsertProxy(t, handler)
+	defer cleanup()
+
+	body := `{"encrypted_blob":"AQIDBA==","signature":"BQYHCA=="}`
+	req := httptest.NewRequest("POST", "/cache-insert", strings.NewReader(body))
+	w := httptest.NewRecorder()
+
+	proxy.cacheInsertHandler(w, req)
+
+	if w.Code != 502 {
+		t.Fatalf("expected 502 for IPC failure, got %d", w.Code)
+	}
+}
+
+func TestCacheInsertHandler_NoEnclaveClient(t *testing.T) {
+	proxy := &odohProxy{enclaveEnabled: false, enclaveClient: nil}
+
+	body := `{"encrypted_blob":"AQIDBA==","signature":"BQYHCA=="}`
+	req := httptest.NewRequest("POST", "/cache-insert", strings.NewReader(body))
+	w := httptest.NewRecorder()
+
+	proxy.cacheInsertHandler(w, req)
+
+	if w.Code != 502 {
+		t.Fatalf("expected 502 when enclave not configured, got %d", w.Code)
+	}
+}
+
+func TestCacheInsertHandler_MethodNotAllowed(t *testing.T) {
+	proxy := &odohProxy{}
+
+	req := httptest.NewRequest("GET", "/cache-insert", nil)
+	w := httptest.NewRecorder()
+
+	proxy.cacheInsertHandler(w, req)
+
+	if w.Code != 405 {
+		t.Fatalf("expected 405 for GET, got %d", w.Code)
 	}
 }
 

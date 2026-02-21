@@ -14,6 +14,16 @@ import (
 	"github.com/coredns/coredns/plugin/codohtarget"
 )
 
+// marshalSingleBundle wraps a single CacheInsertBundle into the multi-entry wire format.
+func marshalSingleBundle(t *testing.T, b *enclave.CacheInsertBundle) []byte {
+	t.Helper()
+	data, err := enclave.MarshalMultiBundle([]enclave.CacheInsertBundle{*b})
+	if err != nil {
+		t.Fatalf("MarshalMultiBundle: %v", err)
+	}
+	return data
+}
+
 func newTestHandler(replayDelta float64) *EnclaveHandler {
 	keypair, _ := enclave.GenerateKeypair()
 	return &EnclaveHandler{
@@ -173,7 +183,7 @@ func TestHandleStoreEncrypted_RejectsReplay(t *testing.T) {
 			CanonicalQuery: query,
 			DNSResponse:    []byte{0xAB, 0xCD},
 		}
-		bundleBytes := enclave.MarshalCacheInsertBundle(bundle)
+		bundleBytes := marshalSingleBundle(t, bundle)
 
 		// Encrypt to enclave's public key using the target's encrypt helper
 		pubBytes, _ := h.keypair.PublicKeyBytes()
@@ -319,7 +329,7 @@ func TestDefensiveMode_ExitsOnWarmupThreshold(t *testing.T) {
 			CanonicalQuery: query,
 			DNSResponse:    []byte{0xAB},
 		}
-		bundleBytes := enclave.MarshalCacheInsertBundle(bundle)
+		bundleBytes := marshalSingleBundle(t, bundle)
 		pubBytes, _ := h.keypair.PublicKeyBytes()
 		ct, _ := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
 		hash := sha256.Sum256(bundleBytes)
@@ -426,7 +436,7 @@ func TestOutstandingTTL_Cleanup(t *testing.T) {
 		CanonicalQuery: "stored.com.:1",
 		DNSResponse:    []byte{0xAB},
 	}
-	bundleBytes := enclave.MarshalCacheInsertBundle(bundle)
+	bundleBytes := marshalSingleBundle(t, bundle)
 	pubBytes, _ := h.keypair.PublicKeyBytes()
 	ct, _ := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
 	hash := sha256.Sum256(bundleBytes)
@@ -482,7 +492,7 @@ func TestOutstandingQuery_RemovedOnStore(t *testing.T) {
 		CanonicalQuery: "a.com.:1",
 		DNSResponse:    []byte{0xAB},
 	}
-	bundleBytes := enclave.MarshalCacheInsertBundle(bundle)
+	bundleBytes := marshalSingleBundle(t, bundle)
 	pubBytes, _ := h.keypair.PublicKeyBytes()
 	ct, _ := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
 	hash := sha256.Sum256(bundleBytes)
@@ -591,7 +601,7 @@ func TestDefensiveMode_NoOutstandingTrackingDuringDefensive(t *testing.T) {
 			TTL: 300, Timestamp: int64(1001 + i),
 			CanonicalQuery: query, DNSResponse: []byte{0xAB},
 		}
-		bundleBytes := enclave.MarshalCacheInsertBundle(bundle)
+		bundleBytes := marshalSingleBundle(t, bundle)
 		pubBytes, _ := h.keypair.PublicKeyBytes()
 		ct, _ := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
 		hash := sha256.Sum256(bundleBytes)
@@ -638,7 +648,7 @@ func TestDefensiveMode_FullCycle(t *testing.T) {
 			TTL: 300, Timestamp: ts,
 			CanonicalQuery: query, DNSResponse: []byte{0xAB},
 		}
-		bundleBytes := enclave.MarshalCacheInsertBundle(bundle)
+		bundleBytes := marshalSingleBundle(t, bundle)
 		pubBytes, _ := h.keypair.PublicKeyBytes()
 		ct, _ := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
 		hash := sha256.Sum256(bundleBytes)
@@ -741,7 +751,7 @@ func TestDefensiveMode_ConcurrentMissesAndStores(t *testing.T) {
 				TTL: 300, Timestamp: ts,
 				CanonicalQuery: query, DNSResponse: []byte{0xAB},
 			}
-			bundleBytes := enclave.MarshalCacheInsertBundle(bundle)
+			bundleBytes := marshalSingleBundle(t, bundle)
 			pubBytes, _ := h.keypair.PublicKeyBytes()
 			ct, _ := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
 			hash := sha256.Sum256(bundleBytes)
@@ -838,7 +848,7 @@ func TestBatch_StoreEnqueuesNotCaches(t *testing.T) {
 		CanonicalQuery: "queued.com.:1",
 		DNSResponse:    []byte{0xAB},
 	}
-	bundleBytes := enclave.MarshalCacheInsertBundle(bundle)
+	bundleBytes := marshalSingleBundle(t, bundle)
 	pubBytes, _ := h.keypair.PublicKeyBytes()
 	ct, _ := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
 	hash := sha256.Sum256(bundleBytes)
@@ -880,7 +890,7 @@ func TestBatch_HandleProcessCommitsQueue(t *testing.T) {
 			CanonicalQuery: query,
 			DNSResponse:    []byte{0xAB},
 		}
-		bundleBytes := enclave.MarshalCacheInsertBundle(bundle)
+		bundleBytes := marshalSingleBundle(t, bundle)
 		pubBytes, _ := h.keypair.PublicKeyBytes()
 		ct, _ := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
 		hash := sha256.Sum256(bundleBytes)
@@ -937,7 +947,7 @@ func TestBatch_OmissionDropsOnEnqueue(t *testing.T) {
 		CanonicalQuery: "miss0.com.:1",
 		DNSResponse:    []byte{0xAB},
 	}
-	bundleBytes := enclave.MarshalCacheInsertBundle(bundle)
+	bundleBytes := marshalSingleBundle(t, bundle)
 	pubBytes, _ := h.keypair.PublicKeyBytes()
 	ct, _ := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
 	hash := sha256.Sum256(bundleBytes)
@@ -970,7 +980,7 @@ func TestBatch_HealthEndpointReturnsQueueStats(t *testing.T) {
 			CanonicalQuery: fmt.Sprintf("health%d.com.:1", i),
 			DNSResponse:    []byte{0xAB},
 		}
-		bundleBytes := enclave.MarshalCacheInsertBundle(bundle)
+		bundleBytes := marshalSingleBundle(t, bundle)
 		pubBytes, _ := h.keypair.PublicKeyBytes()
 		ct, _ := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
 		hash := sha256.Sum256(bundleBytes)
@@ -1021,7 +1031,7 @@ func TestBatch_QueueOverflow(t *testing.T) {
 			CanonicalQuery: fmt.Sprintf("overflow%d.com.:1", i),
 			DNSResponse:    []byte{byte(i)},
 		}
-		bundleBytes := enclave.MarshalCacheInsertBundle(bundle)
+		bundleBytes := marshalSingleBundle(t, bundle)
 		pubBytes, _ := h.keypair.PublicKeyBytes()
 		ct, _ := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
 		hash := sha256.Sum256(bundleBytes)
@@ -1080,7 +1090,7 @@ func TestBatch_DefensiveNotFalseTriggeredByDelay(t *testing.T) {
 			CanonicalQuery: fmt.Sprintf("q%d.com.:1", i),
 			DNSResponse:    []byte{0xAB},
 		}
-		bundleBytes := enclave.MarshalCacheInsertBundle(bundle)
+		bundleBytes := marshalSingleBundle(t, bundle)
 		pubBytes, _ := h.keypair.PublicKeyBytes()
 		ct, _ := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
 		hash := sha256.Sum256(bundleBytes)
@@ -1102,5 +1112,181 @@ func TestBatch_DefensiveNotFalseTriggeredByDelay(t *testing.T) {
 	resp := h.HandleProcess(qe)
 	if resp.Status != enclave.StatusHit {
 		t.Fatalf("expected hit (no false omission from batch delay), got %s", resp.Status)
+	}
+}
+
+// --- Sprint 5: Multi-entry bundle tests ---
+
+// marshalMultiBundle builds an encrypted+signed multi-entry store request.
+func marshalMultiBundle(t *testing.T, h *EnclaveHandler, sigPriv ed25519.PrivateKey, entries []enclave.CacheInsertBundle) (blob, sig string) {
+	t.Helper()
+	bundleBytes, err := enclave.MarshalMultiBundle(entries)
+	if err != nil {
+		t.Fatalf("MarshalMultiBundle: %v", err)
+	}
+	pubBytes, _ := h.keypair.PublicKeyBytes()
+	ct, err := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
+	if err != nil {
+		t.Fatalf("EncryptForEnclave: %v", err)
+	}
+	hash := sha256.Sum256(bundleBytes)
+	sigBytes := ed25519.Sign(sigPriv, hash[:])
+	return base64.StdEncoding.EncodeToString(ct), base64.StdEncoding.EncodeToString(sigBytes)
+}
+
+func TestMultiEntry_FourEntriesAllEnqueued(t *testing.T) {
+	sigPub, sigPriv, _ := ed25519.GenerateKey(rand.Reader)
+	h := newTestHandler(100.0) // wide δ
+	h.batchCommitProb = 0      // no auto-commit
+	h.targetSigningPubKey = sigPub
+
+	entries := []enclave.CacheInsertBundle{
+		{TTL: 300, Timestamp: 1000, CanonicalQuery: "real.com.:1", DNSResponse: []byte{0x01}},
+		{TTL: 60, Timestamp: 1000, CanonicalQuery: "cover1.com.:1", DNSResponse: []byte{0x02}},
+		{TTL: 120, Timestamp: 1000, CanonicalQuery: "cover2.com.:1", DNSResponse: []byte{0x03}},
+		{TTL: 180, Timestamp: 1000, CanonicalQuery: "cover3.com.:1", DNSResponse: []byte{0x04}},
+	}
+
+	blob, sig := marshalMultiBundle(t, h, sigPriv, entries)
+	resp := h.HandleStoreEncrypted(blob, sig)
+	if resp.Status != enclave.StatusOK {
+		t.Fatalf("expected ok, got %s %s", resp.Status, resp.Error)
+	}
+
+	if h.insertionQueue.Len() != 4 {
+		t.Fatalf("expected 4 queued entries, got %d", h.insertionQueue.Len())
+	}
+
+	// Flush and verify all 4 in cache
+	flushQueue(h)
+	for _, e := range entries {
+		if _, ok := h.cache.Get(e.CanonicalQuery, 1000); !ok {
+			t.Errorf("%s should be in cache", e.CanonicalQuery)
+		}
+	}
+}
+
+func TestMultiEntry_OneStaleThreeEnqueued(t *testing.T) {
+	sigPub, sigPriv, _ := ed25519.GenerateKey(rand.Reader)
+	h := newTestHandler(3.0)
+	h.batchCommitProb = 0
+	h.targetSigningPubKey = sigPub
+	h.tLatest.Store(1000)
+
+	entries := []enclave.CacheInsertBundle{
+		{TTL: 300, Timestamp: 1001, CanonicalQuery: "fresh1.com.:1", DNSResponse: []byte{0x01}},
+		{TTL: 60, Timestamp: 990, CanonicalQuery: "stale.com.:1", DNSResponse: []byte{0x02}}, // 990 < 1000-3=997 → stale
+		{TTL: 120, Timestamp: 1002, CanonicalQuery: "fresh2.com.:1", DNSResponse: []byte{0x03}},
+		{TTL: 180, Timestamp: 1001, CanonicalQuery: "fresh3.com.:1", DNSResponse: []byte{0x04}},
+	}
+
+	blob, sig := marshalMultiBundle(t, h, sigPriv, entries)
+	resp := h.HandleStoreEncrypted(blob, sig)
+	if resp.Status != enclave.StatusOK {
+		t.Fatalf("expected ok (3/4 enqueued), got %s %s", resp.Status, resp.Error)
+	}
+
+	if h.insertionQueue.Len() != 3 {
+		t.Fatalf("expected 3 queued entries (1 stale skipped), got %d", h.insertionQueue.Len())
+	}
+
+	flushQueue(h)
+	if _, ok := h.cache.Get("stale.com.:1", 1010); ok {
+		t.Fatal("stale.com.:1 should NOT be in cache")
+	}
+	for _, q := range []string{"fresh1.com.:1", "fresh2.com.:1", "fresh3.com.:1"} {
+		if _, ok := h.cache.Get(q, 1010); !ok {
+			t.Errorf("%s should be in cache", q)
+		}
+	}
+}
+
+func TestMultiEntry_OutstandingRealRemovedCoverNoop(t *testing.T) {
+	sigPub, sigPriv, _ := ed25519.GenerateKey(rand.Reader)
+	h := newTestHandler(100.0)
+	h.batchCommitProb = 0
+	h.targetSigningPubKey = sigPub
+	h.tLatest.Store(1000)
+
+	// Generate a cache miss for "real.com.:1" → adds to outstanding
+	qe := makeProcessReq(t, h, "real.com.:1")
+	h.HandleProcess(qe)
+
+	h.mu.Lock()
+	if _, exists := h.outstandingQueries["real.com.:1"]; !exists {
+		t.Fatal("real.com.:1 should be in outstanding after miss")
+	}
+	h.mu.Unlock()
+
+	// Store multi-bundle with real + covers
+	entries := []enclave.CacheInsertBundle{
+		{TTL: 300, Timestamp: 1001, CanonicalQuery: "real.com.:1", DNSResponse: []byte{0x01}},
+		{TTL: 60, Timestamp: 1001, CanonicalQuery: "cover1.com.:1", DNSResponse: []byte{0x02}},
+		{TTL: 120, Timestamp: 1001, CanonicalQuery: "cover2.com.:1", DNSResponse: []byte{0x03}},
+	}
+
+	blob, sig := marshalMultiBundle(t, h, sigPriv, entries)
+	resp := h.HandleStoreEncrypted(blob, sig)
+	if resp.Status != enclave.StatusOK {
+		t.Fatalf("expected ok, got %s %s", resp.Status, resp.Error)
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	// real.com.:1 removed from outstanding
+	if _, exists := h.outstandingQueries["real.com.:1"]; exists {
+		t.Fatal("real.com.:1 should be removed from outstanding after store")
+	}
+
+	// cover queries were never in outstanding → delete is no-op, no panic
+	// (implicitly tested by reaching this point without error)
+}
+
+func TestMultiEntry_SingleEntryCount1(t *testing.T) {
+	sigPub, sigPriv, _ := ed25519.GenerateKey(rand.Reader)
+	h := newTestHandler(100.0)
+	h.batchCommitProb = 0
+	h.targetSigningPubKey = sigPub
+
+	entries := []enclave.CacheInsertBundle{
+		{TTL: 300, Timestamp: 1000, CanonicalQuery: "only.com.:1", DNSResponse: []byte{0xFF}},
+	}
+
+	blob, sig := marshalMultiBundle(t, h, sigPriv, entries)
+	resp := h.HandleStoreEncrypted(blob, sig)
+	if resp.Status != enclave.StatusOK {
+		t.Fatalf("expected ok, got %s %s", resp.Status, resp.Error)
+	}
+
+	if h.insertionQueue.Len() != 1 {
+		t.Fatalf("expected 1 queued entry, got %d", h.insertionQueue.Len())
+	}
+
+	flushQueue(h)
+	if _, ok := h.cache.Get("only.com.:1", 1000); !ok {
+		t.Fatal("only.com.:1 should be in cache")
+	}
+}
+
+func TestMultiEntry_AllStaleReturnsError(t *testing.T) {
+	sigPub, sigPriv, _ := ed25519.GenerateKey(rand.Reader)
+	h := newTestHandler(3.0)
+	h.targetSigningPubKey = sigPub
+	h.tLatest.Store(1000)
+
+	// All entries stale: ts=990 < 1000-3=997
+	entries := []enclave.CacheInsertBundle{
+		{TTL: 300, Timestamp: 990, CanonicalQuery: "old1.com.:1", DNSResponse: []byte{0x01}},
+		{TTL: 60, Timestamp: 991, CanonicalQuery: "old2.com.:1", DNSResponse: []byte{0x02}},
+	}
+
+	blob, sig := marshalMultiBundle(t, h, sigPriv, entries)
+	resp := h.HandleStoreEncrypted(blob, sig)
+	if resp.Status != enclave.StatusError {
+		t.Fatalf("expected error when all entries stale, got %s", resp.Status)
+	}
+	if resp.Error != enclave.ErrStaleTimestamp {
+		t.Fatalf("expected %q, got %q", enclave.ErrStaleTimestamp, resp.Error)
 	}
 }

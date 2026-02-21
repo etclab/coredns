@@ -14,9 +14,18 @@
         }
     ],
     "env": [
-        {
-            "name": "HOME",
-            "fromHost": true
-        }
+        { "name": "HOME", "fromHost": true },
+        { "name": "CODOH_CACHE_SIZE", "fromHost": true },
+        { "name": "CODOH_USE_ORAM", "fromHost": true },
+        { "name": "CODOH_ORAM_BLOCK_SIZE", "fromHost": true },
+        { "name": "CODOH_DEFAULT_PAD_SIZE", "fromHost": true },
+        { "name": "CODOH_REPLAY_DELTA_SECS", "fromHost": true },
+        { "name": "CODOH_WARMUP_THRESHOLD", "fromHost": true },
+        { "name": "CODOH_OMISSION_THRESHOLD", "fromHost": true },
+        { "name": "CODOH_OUTSTANDING_TTL_SECS", "fromHost": true },
+        { "name": "CODOH_BATCH_SIZE", "fromHost": true },
+        { "name": "CODOH_BATCH_COMMIT_PROB", "fromHost": true },
+        { "name": "CODOH_QUEUE_MAX_SIZE", "fromHost": true },
+        { "name": "CODOH_TARGET_SIGNING_PUBKEY", "fromHost": true }
     ]
 }

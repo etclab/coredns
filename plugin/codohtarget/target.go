@@ -2,19 +2,23 @@
 package codohtarget
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"strings"
+	"os"
+	"strconv"
 	"time"
 
 	odoh "github.com/cloudflare/odoh-go"
 	"github.com/coredns/coredns/enclave"
+	"github.com/coredns/coredns/plugin/codohtarget/cover"
 	"github.com/coredns/coredns/plugin/pkg/dnsutil"
 	clog "github.com/coredns/coredns/plugin/pkg/log"
 	"github.com/coredns/coredns/plugin/pkg/response"
@@ -26,6 +30,16 @@ import (
 var log = clog.NewWithPlugin("codohtarget")
 
 const odohContentType = "application/oblivious-dns-message"
+
+// coverSampler abstracts cover domain sampling for testability.
+type coverSampler interface {
+	Sample(k int, exclude string) []string
+}
+
+// coverResolver abstracts cover DNS resolution for testability.
+type coverResolver interface {
+	Resolve(ctx context.Context, domains []string) []cover.ResolvedCover
+}
 
 type odohTarget struct {
 	addr       string // :8443
@@ -41,6 +55,13 @@ type odohTarget struct {
 	// Signing key for target response authentication
 	signingKeyPath string
 	signingKey     *SigningKey
+
+	// Cover response config
+	coverCount       int            // k cover domains per query (0 = disabled)
+	coverSampler     coverSampler   // domain sampler
+	coverResolver    coverResolver  // DNS resolver for covers
+	proxyCallbackURL string         // proxy base URL for POST /cache-insert
+	callbackClient   *http.Client   // TLS-configured client for proxy callback
 
 	keyPair   odoh.ObliviousDoHKeyPair
 	dnsClient *dns.Client
@@ -85,6 +106,11 @@ func (t *odohTarget) OnStartup() error {
 		Timeout: 5 * time.Second,
 	}
 
+	// Initialize cover responses
+	if err := t.initCoverResponses(); err != nil {
+		return fmt.Errorf("cover init: %w", err)
+	}
+
 	// Load TLS config
 	tlsConfig, err := pkgtls.NewTLSConfig(t.tlsCert, t.tlsKey, "")
 	if err != nil {
@@ -122,6 +148,54 @@ func (t *odohTarget) OnStartup() error {
 	}()
 
 	log.Infof("ODoH target listening on %s", t.addr)
+	return nil
+}
+
+// initCoverResponses loads cover config from env vars and initializes sampler + resolver.
+func (t *odohTarget) initCoverResponses() error {
+	t.coverCount = envInt("CODOH_COVER_COUNT", 3)
+	t.proxyCallbackURL = os.Getenv("CODOH_PROXY_CALLBACK_URL")
+
+	if t.proxyCallbackURL == "" {
+		log.Info("CODOH_PROXY_CALLBACK_URL not set; cache-insert delivery disabled")
+		return nil
+	}
+
+	// Callback client with TLS skip-verify for self-signed dev certs
+	t.callbackClient = &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+
+	domainFile := os.Getenv("CODOH_COVER_DOMAIN_FILE")
+	if t.coverCount > 0 && domainFile == "" {
+		return fmt.Errorf("CODOH_COVER_DOMAIN_FILE required when CODOH_COVER_COUNT > 0")
+	}
+
+	if t.coverCount > 0 {
+		popularCutoff := envInt("CODOH_COVER_POPULAR_CUTOFF", 10000)
+		popularRatio := envFloat("CODOH_COVER_POPULAR_RATIO", 0.8)
+
+		sampler, err := cover.NewSampler(domainFile, popularCutoff, popularRatio)
+		if err != nil {
+			return err
+		}
+		t.coverSampler = sampler
+		log.Infof("Cover sampler loaded (k=%d, cutoff=%d, ratio=%.2f)", t.coverCount, popularCutoff, popularRatio)
+
+		resolverAddr := os.Getenv("CODOH_COVER_RESOLVER")
+		if resolverAddr == "" {
+			resolverAddr = "127.0.0.1:53"
+		}
+		timeout := time.Duration(envInt("CODOH_COVER_TIMEOUT_MS", 2000)) * time.Millisecond
+		t.coverResolver = cover.NewResolver(resolverAddr, timeout)
+		log.Infof("Cover resolver: %s (timeout %v)", resolverAddr, timeout)
+	} else {
+		log.Info("Cover responses disabled (CODOH_COVER_COUNT=0)")
+	}
+
 	return nil
 }
 
@@ -236,36 +310,73 @@ func (t *odohTarget) odohQueryHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	targetEncryptSeconds.Observe(time.Since(encryptStart).Seconds())
 
-	// Build cache-insert blob if enclave public key provided
-	if enclavePubKey := r.Header.Get("X-Enclave-PubKey"); enclavePubKey != "" {
-		pubKeyBytes, err := base64.StdEncoding.DecodeString(enclavePubKey)
-		if err == nil && len(dnsQuery.Question) > 0 {
-			t.prepareCacheInsert(w, pubKeyBytes, dnsQuery, packedResponse, ttl)
-		}
-	}
-
-	// Send ODoH response
+	// Send ODoH response immediately (before cache-insert)
 	w.Header().Set("Content-Type", odohContentType)
 	w.Write(encryptedResponse.Marshal())
 
 	targetRequestsTotal.WithLabelValues("success").Inc()
 	targetLatencySeconds.Observe(time.Since(start).Seconds())
+
+	// Launch async cache-insert with covers (fire-and-forget)
+	if enclavePubKey := r.Header.Get("X-Enclave-PubKey"); enclavePubKey != "" && t.proxyCallbackURL != "" {
+		pubKeyBytes, err := base64.StdEncoding.DecodeString(enclavePubKey)
+		if err == nil && len(dnsQuery.Question) > 0 {
+			go t.prepareCacheInsert(pubKeyBytes, dnsQuery, packedResponse, ttl)
+		}
+	}
 }
 
-// prepareCacheInsert builds a cache-insert bundle, encrypts it to pk_E, signs it,
-// and sets the appropriate response headers.
-func (t *odohTarget) prepareCacheInsert(w http.ResponseWriter, pubKeyBytes []byte, dnsQuery *dns.Msg, packedResponse []byte, ttl uint32) {
-	q := dnsQuery.Question[0]
-	canonicalQuery := fmt.Sprintf("%s:%d", strings.ToLower(q.Name), q.Qtype)
+// cacheInsertPayload is the JSON body POSTed to the proxy's /cache-insert endpoint.
+type cacheInsertPayload struct {
+	EncryptedBlob string `json:"encrypted_blob"`
+	Signature     string `json:"signature"`
+}
 
-	bundle := &enclave.CacheInsertBundle{
+// prepareCacheInsert builds a multi-entry bundle (real + k covers), encrypts,
+// signs, and POSTs to the proxy's /cache-insert endpoint.
+func (t *odohTarget) prepareCacheInsert(pubKeyBytes []byte, dnsQuery *dns.Msg, packedResponse []byte, ttl uint32) {
+	q := dnsQuery.Question[0]
+	canonicalQuery := enclave.CanonicalizeQuery(q.Name, q.Qtype)
+	now := time.Now().Unix()
+
+	// Real entry
+	realEntry := enclave.CacheInsertBundle{
 		TTL:            ttl,
-		Timestamp:      time.Now().Unix(),
+		Timestamp:      now,
 		CanonicalQuery: canonicalQuery,
 		DNSResponse:    packedResponse,
 	}
 
-	plaintext := enclave.MarshalCacheInsertBundle(bundle)
+	entries := []enclave.CacheInsertBundle{realEntry}
+
+	// Sample and resolve covers
+	if t.coverCount > 0 && t.coverSampler != nil && t.coverResolver != nil {
+		coverDomains := t.coverSampler.Sample(t.coverCount, q.Name)
+		resolved := t.coverResolver.Resolve(context.Background(), coverDomains)
+
+		if len(resolved) == 0 {
+			// All covers failed → drop entire bundle (D6)
+			log.Warning("All cover resolutions failed; dropping cache-insert bundle")
+			return
+		}
+
+		for _, rc := range resolved {
+			coverCanonical := enclave.CanonicalizeQuery(rc.Domain, dns.TypeA)
+			entries = append(entries, enclave.CacheInsertBundle{
+				TTL:            rc.TTL,
+				Timestamp:      now,
+				CanonicalQuery: coverCanonical,
+				DNSResponse:    rc.DNSResponse,
+			})
+		}
+	}
+
+	// Marshal multi-bundle
+	plaintext, err := enclave.MarshalMultiBundle(entries)
+	if err != nil {
+		log.Warningf("Failed to marshal multi-bundle: %v", err)
+		return
+	}
 
 	// HPKE-encrypt to enclave
 	encrypted, err := EncryptForEnclave(pubKeyBytes, plaintext)
@@ -273,17 +384,44 @@ func (t *odohTarget) prepareCacheInsert(w http.ResponseWriter, pubKeyBytes []byt
 		log.Warningf("Failed to encrypt cache-insert for enclave: %v", err)
 		return
 	}
-	w.Header().Set("X-Enclave-Cache", base64.StdEncoding.EncodeToString(encrypted))
+
+	payload := cacheInsertPayload{
+		EncryptedBlob: base64.StdEncoding.EncodeToString(encrypted),
+	}
 
 	// Sign H(plaintext_bundle) with Ed25519
 	if t.signingKey != nil {
 		hash := sha256.Sum256(plaintext)
 		signature := t.signingKey.Sign(hash[:])
-		w.Header().Set("X-Enclave-Cache-Sig", base64.StdEncoding.EncodeToString(signature))
+		payload.Signature = base64.StdEncoding.EncodeToString(signature)
+	}
+
+	// POST to proxy
+	jsonBody, err := json.Marshal(payload)
+	if err != nil {
+		log.Warningf("Failed to marshal cache-insert payload: %v", err)
+		return
+	}
+
+	resp, err := t.callbackClient.Post(t.proxyCallbackURL+"/cache-insert", "application/json", bytes.NewReader(jsonBody))
+	if err != nil {
+		log.Warningf("Failed to POST cache-insert to proxy: %v", err)
+		return
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Warningf("Proxy cache-insert returned status %d", resp.StatusCode)
 	}
 }
 
-// extractMinimalTTL determines the appropriate TTL for caching based on DNS response type
+// extractMinimalTTL determines the appropriate TTL for caching based on DNS response type.
+// For negative responses (NXDOMAIN, NODATA), applies RFC 2308 §5:
+//
+//	negative_cache_ttl = min(SOA.TTL, SOA.MINIMUM)
+//
+// CoreDNS's dnsutil.MinimalTTL only checks SOA.TTL (the header TTL), not the
+// SOA RDATA MINIMUM field. We patch the result for negative responses here.
 func extractMinimalTTL(msg *dns.Msg) uint32 {
 	var responseType response.Type
 	if msg.Rcode == dns.RcodeSuccess {
@@ -299,5 +437,45 @@ func extractMinimalTTL(msg *dns.Msg) uint32 {
 	}
 
 	ttl := dnsutil.MinimalTTL(msg, responseType)
-	return uint32(ttl.Seconds())
+	result := uint32(ttl.Seconds())
+
+	// RFC 2308 §5: for negative responses, cap TTL at SOA MINIMUM field.
+	if responseType == response.NameError || responseType == response.NoData {
+		for _, rr := range msg.Ns {
+			if soa, ok := rr.(*dns.SOA); ok {
+				if soa.Minttl < result {
+					result = soa.Minttl
+				}
+				break
+			}
+		}
+	}
+
+	return result
+}
+
+// envInt reads an env var as int, returning defaultVal if unset or unparseable.
+func envInt(key string, defaultVal int) int {
+	s := os.Getenv(key)
+	if s == "" {
+		return defaultVal
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return defaultVal
+	}
+	return v
+}
+
+// envFloat reads an env var as float64, returning defaultVal if unset or unparseable.
+func envFloat(key string, defaultVal float64) float64 {
+	s := os.Getenv(key)
+	if s == "" {
+		return defaultVal
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return defaultVal
+	}
+	return v
 }

@@ -97,12 +97,14 @@ Client              Proxy                 Enclave              Target
    |                   |                     |                    |
    |                   |<-- HIT: Enc(k_r, resp) [or dummy on MISS]|
    |                   |                     |                    |
-   |                   |<-- ODoH response + cache-insert headers -|
-   |                   |    X-Enclave-Cache: HPKE.Seal(pk_E, bundle)
-   |                   |    X-Enclave-Cache-Sig: Ed25519(H(bundle))
+   |                   |<-- ODoH response ---|                    |
+   |                   |                     |                    |
+   |                   |                     | (async) POST /cache-insert
+   |                   |                     | with real + k covers
+   |                   |<--- cache-insert ---|--------------------+
    |                   |                     |                    |
    |                   |-- store_encrypted ->| Verify Ed25519 sig |
-   |                   |   (async, on miss)  | Validate timestamp |
+   |                   |  (per entry in batch)| Validate timestamp |
    |                   |                     | Decrypt bundle     |
    |                   |                     | Enqueue for batch  |
    |                   |                     |                    |
@@ -212,7 +214,7 @@ SGX has no trusted clock. The enclave maintains `t_latest` (highest timestamp se
 | SGX attestation + provisioning | G1 | Done | DCAP quote, signing key delivery |
 | Restart warm-up mode | G2 | Done | Defensive mode on boot, exits at WarmupThreshold |
 | Cache omission detection | G2 | Done | Outstanding query tracking, enters defensive mode at OmissionThreshold |
-| Cover responses | G2 | Not yet | Target returns k random domains per cache-insert |
+| Cover responses | G2 | Done | Target samples k random domains per cache-insert, delivered via POST /cache-insert |
 | Batched cache insertions | G2 | Done | InsertionQueue + pseudorandom commit via crypto/rand coin flip on query path |
 | Session ID (sid) binding | G3 | Not yet | Explicit sid in AAD to prevent cross-use |
 | Dual HPKE key wrapping | G3 | Not yet | Symmetric key k encrypted separately to target and enclave |
@@ -281,6 +283,18 @@ codohtarget {
 | CODOH_BATCH_COMMIT_PROB | 0.1 | Probability of batch commit per HandleProcess call |
 | CODOH_QUEUE_MAX_SIZE | 1000 | Max pending inserts in the insertion queue |
 
+### Target Environment Variables (Cover Responses)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| CODOH_COVER_COUNT | 3 | Cover domains per cache-insert (0 to disable) |
+| CODOH_COVER_DOMAIN_FILE | - | Path to domain list CSV (required when COVER_COUNT > 0) |
+| CODOH_COVER_POPULAR_CUTOFF | 10000 | Top-N domains treated as "popular" in sampler |
+| CODOH_COVER_POPULAR_RATIO | 0.8 | Fraction of covers drawn from popular tier |
+| CODOH_COVER_RESOLVER | 127.0.0.1:53 | DNS resolver for cover domain resolution |
+| CODOH_COVER_TIMEOUT_MS | 2000 | Timeout for cover DNS resolution (ms) |
+| CODOH_PROXY_CALLBACK_URL | - | Proxy base URL for cache-insert delivery (required) |
+
 ---
 
 ## HTTP Headers
@@ -289,11 +303,10 @@ codohtarget {
 |--------|-----------|-------------|
 | X-CoDOH-Query | Client -> Proxy | Base64-encoded Q_E (HPKE-encrypted query) |
 | X-Enclave-PubKey | Proxy -> Target | Base64-encoded enclave HPKE public key |
-| X-Enclave-Cache | Target -> Proxy | Base64-encoded HPKE-encrypted cache-insert bundle |
-| X-Enclave-Cache-Sig | Target -> Proxy | Base64-encoded Ed25519 signature |
-| X-Enclave-Cache-TTL | Target -> Proxy | TTL in seconds for cache entry |
 | X-CoDOH-Key-Rotated | Proxy -> Client | `true` when enclave pk_E has rotated; client should re-fetch from `/enclave-keys` |
 | X-CoDOH-Enclave-Error | Proxy -> Client | Error code when enclave leg fails (e.g., `key_rotated`, `enclave_unavailable`) |
+
+**Note:** Cache-insert bundles are no longer delivered via HTTP headers. The target POSTs a JSON payload to the proxy's `/cache-insert` endpoint asynchronously (including k cover entries).
 
 ## Content Types
 
@@ -396,42 +409,56 @@ coredns/
 
 ## Testing
 
-### E2E Test (Development)
+### Automated Tests (SGX)
+
+All scripts require SGX hardware and EGo SDK.
 
 ```bash
-./scripts/test-attestation-e2e.sh          # Simulation mode
-./scripts/test-attestation-e2e.sh --sgx    # SGX hardware mode
+./scripts/test-stack-simple.sh         # Quick Config 4 smoke test (build + 3 processes + client)
+./scripts/test-attestation-e2e.sh      # Full attestation flow (quote, provisioning, queries)
+./scripts/test-codoh-base-e2e.sh       # Config 3 proxy mode (2-process)
+./scripts/test-provisioning.sh         # Focused provisioning test (enclave + target only)
 ```
 
 ### Benchmarking
 
 ```bash
-# Run all configs
-./benchmark/run-all.sh
-
-# Quick mode (100 iterations, cold only)
-./benchmark/run-all.sh --quick
-
-# Specific configs
+./benchmark/run-all.sh                 # All configs
+./benchmark/run-all.sh --quick         # 100 iterations, cold only
 ./benchmark/run-all.sh --configs 1,3,4,5
 ```
 
-### Manual Testing
+### Manual Testing (SGX, Config 4)
+
+Launch order matters: enclave must serve `/attest` before target starts.
 
 ```bash
-# Terminal 1: Start enclave (simulation)
-./enclave-sim --socket /tmp/codoh-enclave.sock
+# Terminal 1: Build + start enclave (SGX)
+cd enclave && ego-go build -tags ego -o enclave ./cmd && ego sign enclave.json && cd ..
+go build -o coredns-test .
+CODOH_CACHE_SIZE=10000 CODOH_BATCH_SIZE=10 CODOH_BATCH_COMMIT_PROB=1.0 \
+CODOH_WARMUP_THRESHOLD=5 CODOH_REPLAY_DELTA_SECS=30 \
+ego run enclave/enclave --socket /tmp/codoh-enclave.sock
 
-# Terminal 2: Start target
-./coredns -conf Corefile.target
+# Terminal 2: Start target (provisions signing key via attestation)
+CODOH_COVER_COUNT=3 CODOH_COVER_DOMAIN_FILE=benchmark/top-1m.csv \
+CODOH_PROXY_CALLBACK_URL=https://127.0.0.1:8080 \
+CODOH_COVER_RESOLVER=8.8.8.8:53 CODOH_COVER_TIMEOUT_MS=2000 \
+./coredns-test -conf Corefile.target
 
 # Terminal 3: Start proxy
-./coredns -conf Corefile.proxy
+./coredns-test -conf Corefile.proxy
 
 # Terminal 4: Test
-cd ../codoh-client
-./odoh-client latency --protocol codoh \
+../codoh-client/odoh-client latency --protocol codoh \
   --target 127.0.0.1:8443 --proxy 127.0.0.1:8080 \
-  --customcert ../coredns/localhost.pem \
-  --domains ../coredns/benchmark/top-1m.csv --iterations 10
+  --customcert localhost.pem \
+  --domains benchmark/top-1m.csv --iterations 10
 ```
+
+### SGX Build Nuances
+
+- `ego-go` does **not** auto-set the `ego` build tag — always pass `-tags ego`
+- `go.mod` must use `go 1.25.1` for ego-go compatibility (ego ships Go 1.25.1)
+- `enclave/enclave.json` must list all `CODOH_*` env vars with `"fromHost": true`
+- `ego-host` child processes don't die when `ego run` parent is killed — clean up by port

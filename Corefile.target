@@ -8,6 +8,7 @@
         tls_key localhost-key.pem
         upstream 8.8.8.8:53
         signing_key /tmp/target-signing.pem
+        enclave_url https://127.0.0.1:8444
         log_queries true
     }
 

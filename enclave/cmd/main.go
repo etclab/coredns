@@ -446,38 +446,42 @@ func (h *EnclaveHandler) HandleStoreEncrypted(encryptedBlob, signature string) *
 		}
 	}
 
-	// Parse bundle
-	bundle, err := enclave.ParseCacheInsertBundle(plaintext)
+	// Parse multi-entry bundle (real + covers)
+	entries, err := enclave.ParseMultiBundle(plaintext)
 	if err != nil {
-		log.Printf("StoreEncrypted: parse bundle failed: %v", err)
+		log.Printf("StoreEncrypted: parse multi-bundle failed: %v", err)
 		return &enclave.Response{
 			Status: enclave.StatusError,
 			Error:  enclave.ErrInvalidBlob,
 		}
 	}
 
-	// Validate timestamp (δ-window check + advance t_latest)
-	if err := h.validateTimestamp(bundle.Timestamp); err != nil {
-		return &enclave.Response{
-			Status: enclave.StatusError,
-			Error:  enclave.ErrStaleTimestamp,
+	enqueued := 0
+	for i, entry := range entries {
+		// Validate timestamp per-entry (δ-window check + advance t_latest)
+		if err := h.validateTimestamp(entry.Timestamp); err != nil {
+			log.Printf("StoreEncrypted: entry %d stale timestamp (ts=%d)", i, entry.Timestamp)
+			continue // skip stale entry, process rest
 		}
+
+		// Enqueue for batched commit
+		h.insertionQueue.Enqueue(enclave.PendingInsert{
+			Query:      entry.CanonicalQuery,
+			Response:   entry.DNSResponse,
+			TTL:        entry.TTL,
+			InsertedAt: entry.Timestamp,
+		})
+		h.logCacheOp("enqueue", entry.CanonicalQuery)
+		enqueued++
+
+		// Outstanding query tracking: remove if present (no-op for covers)
+		h.mu.Lock()
+		delete(h.outstandingQueries, entry.CanonicalQuery)
+		h.mu.Unlock()
 	}
 
-	// Enqueue for batched commit (D1: commits happen on query path, not store path)
-	h.insertionQueue.Enqueue(enclave.PendingInsert{
-		Query:      bundle.CanonicalQuery,
-		Response:   bundle.DNSResponse,
-		TTL:        bundle.TTL,
-		InsertedAt: bundle.Timestamp,
-	})
-	h.logCacheOp("enqueue", bundle.CanonicalQuery)
-
-	// Outstanding query tracking (D2: remove on enqueue, not on commit)
-	h.mu.Lock()
-	delete(h.outstandingQueries, bundle.CanonicalQuery)
-
 	// Inline cleanup: evict outstanding entries older than TTL window
+	h.mu.Lock()
 	currentTLatest := h.tLatest.Load()
 	ttlWindow := int64(h.outstandingTTLSecs)
 	for q, entryT := range h.outstandingQueries {
@@ -486,6 +490,15 @@ func (h *EnclaveHandler) HandleStoreEncrypted(encryptedBlob, signature string) *
 		}
 	}
 	h.mu.Unlock()
+
+	log.Printf("StoreEncrypted: enqueued %d/%d entries", enqueued, len(entries))
+
+	if enqueued == 0 {
+		return &enclave.Response{
+			Status: enclave.StatusError,
+			Error:  enclave.ErrStaleTimestamp,
+		}
+	}
 
 	return &enclave.Response{Status: enclave.StatusOK}
 }
