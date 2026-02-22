@@ -89,13 +89,16 @@ func (s *IPCServer) dispatch(req *Request) *Response {
 
 // Wire format: [4 bytes: length][JSON payload]
 
+// maxIPCMessageSize is the maximum allowed IPC message size (64 KiB).
+const maxIPCMessageSize = 1 << 16
+
 func readMessage(r io.Reader) (*Request, error) {
 	var length uint32
 	if err := binary.Read(r, binary.BigEndian, &length); err != nil {
 		return nil, err
 	}
 
-	if length > 1<<20 { // 1MB max
+	if length > maxIPCMessageSize {
 		return nil, fmt.Errorf("message too large: %d", length)
 	}
 

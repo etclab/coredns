@@ -18,7 +18,7 @@
         { "name": "CODOH_CACHE_SIZE", "fromHost": true },
         { "name": "CODOH_USE_ORAM", "fromHost": true },
         { "name": "CODOH_ORAM_BLOCK_SIZE", "fromHost": true },
-        { "name": "CODOH_DEFAULT_PAD_SIZE", "fromHost": true },
+        { "name": "CODOH_PAD_BUCKETS", "fromHost": true },
         { "name": "CODOH_REPLAY_DELTA_SECS", "fromHost": true },
         { "name": "CODOH_WARMUP_THRESHOLD", "fromHost": true },
         { "name": "CODOH_OMISSION_THRESHOLD", "fromHost": true },

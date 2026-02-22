@@ -14,7 +14,9 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -140,7 +142,7 @@ func main() {
 		cache:               cache,
 		oramCache:           oramCache,
 		targetSigningPubKey: provData.SigningPublicKey,
-		defaultPadSize:      cfg.DefaultPadSize,
+		padBuckets:          cfg.PadBuckets,
 		replayDelta:         cfg.ReplayDelta,
 		// tLatest zero-initialized by atomic.Int64 default
 		defensiveMode:      true, // always start in defensive mode (warm-up)
@@ -199,9 +201,18 @@ func loadOptionalEnvSettings(cfg *enclave.Config) {
 			cfg.ORAMBlockSize = n
 		}
 	}
-	if padSize := os.Getenv("CODOH_DEFAULT_PAD_SIZE"); padSize != "" {
-		if n, err := strconv.Atoi(padSize); err == nil {
-			cfg.DefaultPadSize = n
+	if buckets := os.Getenv("CODOH_PAD_BUCKETS"); buckets != "" {
+		parts := strings.Split(buckets, ",")
+		var parsed []int
+		for _, p := range parts {
+			p = strings.TrimSpace(p)
+			if n, err := strconv.Atoi(p); err == nil && n > 0 {
+				parsed = append(parsed, n)
+			}
+		}
+		if len(parsed) > 0 {
+			sort.Ints(parsed)
+			cfg.PadBuckets = parsed
 		}
 	}
 	if delta := os.Getenv("CODOH_REPLAY_DELTA_SECS"); delta != "" {
@@ -265,7 +276,7 @@ type EnclaveHandler struct {
 	cache               enclave.Cache
 	oramCache           *enclave.ORAMCache // nil if not using ORAM (for stash monitoring)
 	targetSigningPubKey ed25519.PublicKey   // Target's Ed25519 public key
-	defaultPadSize      int
+	padBuckets          []int
 	tLatest             atomic.Int64 // monotonic logical clock (unix seconds)
 	replayDelta         float64      // δ in seconds
 
@@ -318,7 +329,8 @@ func (h *EnclaveHandler) HandleProcess(qe string) *enclave.Response {
 	// Indistinguishable from a normal cache miss to the proxy.
 	if inDefensiveMode {
 		_ = kr // kr derived but not used — defensive mode returns dummy
-		dummy := enclave.GenerateDummyResponse(h.defaultPadSize)
+		maxBucket := h.padBuckets[len(h.padBuckets)-1]
+		dummy := enclave.GenerateDummyResponse(maxBucket)
 		h.logCacheOp("miss(defensive)", string(query))
 		resp = &enclave.Response{
 			Status:   enclave.StatusMiss,
@@ -330,10 +342,13 @@ func (h *EnclaveHandler) HandleProcess(qe string) *enclave.Response {
 		// Cache lookup with logical time
 		tLatest := h.tLatest.Load()
 		if cachedResp, ok := h.cache.Get(canonicalQuery, tLatest); ok {
-			// Cache hit — encrypt under session key k_r
+			// Cache hit — encrypt under session key k_r, then pad to bucket
 			encrypted, encErr := enclave.EncryptCachedResponse(kr, cachedResp)
+			if encErr == nil {
+				encrypted, encErr = enclave.PadToBucket(encrypted, h.padBuckets)
+			}
 			if encErr != nil {
-				log.Printf("EncryptCachedResponse failed: %v", encErr)
+				log.Printf("EncryptCachedResponse/PadToBucket failed: %v", encErr)
 				// Fall through to dummy
 			} else {
 				h.logCacheOp("hit", canonicalQuery)
@@ -360,7 +375,8 @@ func (h *EnclaveHandler) HandleProcess(qe string) *enclave.Response {
 			h.mu.Unlock()
 
 			// Return dummy (indistinguishable from hit)
-			dummy := enclave.GenerateDummyResponse(h.defaultPadSize)
+			maxBucket := h.padBuckets[len(h.padBuckets)-1]
+			dummy := enclave.GenerateDummyResponse(maxBucket)
 			h.logCacheOp("miss", canonicalQuery)
 			resp = &enclave.Response{
 				Status:   enclave.StatusMiss,

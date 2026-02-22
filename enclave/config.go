@@ -4,10 +4,10 @@ package enclave
 type Config struct {
 	SocketPath     string  // Default: /tmp/codoh-enclave.sock
 	CacheSize      int     // Default: 10000 entries
-	UseORAMCache   bool    // Use ORAM-backed cache (default: false)
-	ORAMBlockSize  int     // ORAM block size in bytes (default: 4096)
-	DefaultPadSize int     // Default dummy response size (default: 512)
-	ReplayDelta    float64 // δ in seconds for replay protection (default: 3.0)
+	UseORAMCache  bool    // Use ORAM-backed cache (default: false)
+	ORAMBlockSize int     // ORAM block size in bytes (default: 4096)
+	PadBuckets    []int   // Padding bucket sizes in bytes (default: [16384])
+	ReplayDelta   float64 // δ in seconds for replay protection (default: 3.0)
 
 	// Defensive mode configuration
 	WarmupThreshold    int     // Cache entries needed to exit defensive mode (default: 100)
@@ -27,7 +27,7 @@ func DefaultConfig() *Config {
 		CacheSize:          10000,
 		UseORAMCache:       false,
 		ORAMBlockSize:      4096,
-		DefaultPadSize:     512,
+		PadBuckets:         []int{16384},
 		ReplayDelta:        3.0,
 		WarmupThreshold:    100,
 		OmissionThreshold:  50,

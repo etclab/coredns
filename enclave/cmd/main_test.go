@@ -30,7 +30,7 @@ func newTestHandler(replayDelta float64) *EnclaveHandler {
 		keypair:            keypair,
 		cache:              enclave.NewLRUCache(100),
 		replayDelta:        replayDelta,
-		defaultPadSize:     512,
+		padBuckets:         enclave.DefaultPadBuckets,
 		defensiveMode:      false, // tests default to normal mode (not warm-up)
 		outstandingQueries: make(map[string]int64),
 		warmupThreshold:    10,
@@ -1288,5 +1288,94 @@ func TestMultiEntry_AllStaleReturnsError(t *testing.T) {
 	}
 	if resp.Error != enclave.ErrStaleTimestamp {
 		t.Fatalf("expected %q, got %q", enclave.ErrStaleTimestamp, resp.Error)
+	}
+}
+
+// --- Sprint 6: Padding Integration Tests ---
+
+func TestHandleProcess_HitResponseIsBucketSized(t *testing.T) {
+	h := newTestHandler(3.0)
+	h.tLatest.Store(1000)
+	h.cache.Put("padtest.com.:1", []byte{0xDE, 0xAD, 0xBE, 0xEF}, 1000, 300)
+
+	qe := makeProcessReq(t, h, "padtest.com.:1")
+	resp := h.HandleProcess(qe)
+	if resp.Status != enclave.StatusHit {
+		t.Fatalf("expected hit, got %s", resp.Status)
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(resp.Response)
+	if err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	// Must be exactly the default bucket size (16384)
+	if len(decoded) != enclave.DefaultPadBuckets[0] {
+		t.Fatalf("hit response size=%d, want %d (bucket size)", len(decoded), enclave.DefaultPadBuckets[0])
+	}
+}
+
+func TestHandleProcess_MissResponseIsBucketSized(t *testing.T) {
+	h := newTestHandler(3.0)
+	h.tLatest.Store(1000)
+
+	qe := makeProcessReq(t, h, "nonexistent.com.:1")
+	resp := h.HandleProcess(qe)
+	if resp.Status != enclave.StatusMiss {
+		t.Fatalf("expected miss, got %s", resp.Status)
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(resp.Response)
+	if err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if len(decoded) != enclave.DefaultPadBuckets[0] {
+		t.Fatalf("miss response size=%d, want %d (max bucket)", len(decoded), enclave.DefaultPadBuckets[0])
+	}
+}
+
+func TestHandleProcess_HitDecryptableAfterUnpad(t *testing.T) {
+	h := newTestHandler(3.0)
+	h.tLatest.Store(1000)
+
+	dnsResponse := []byte{0x00, 0x01, 0x02, 0x03, 0x04, 0x05}
+	h.cache.Put("roundtrip.com.:1", dnsResponse, 1000, 300)
+
+	// Build Q_E and get the sender-side k_r
+	pubBytes, _ := h.keypair.PublicKeyBytes()
+	pk, err := enclave.ParsePublicKeyBytes(pubBytes)
+	if err != nil {
+		t.Fatalf("ParsePublicKeyBytes: %v", err)
+	}
+	qeRaw, clientKr, err := enclave.EncryptQueryE(pk, []byte("roundtrip.com.:1"))
+	if err != nil {
+		t.Fatalf("EncryptQueryE: %v", err)
+	}
+	qeB64 := base64.StdEncoding.EncodeToString(qeRaw)
+
+	resp := h.HandleProcess(qeB64)
+	if resp.Status != enclave.StatusHit {
+		t.Fatalf("expected hit, got %s", resp.Status)
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(resp.Response)
+	if err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	// Unpad → Decrypt → verify original DNS response
+	unpadded, err := enclave.UnpadFromBucket(decoded)
+	if err != nil {
+		t.Fatalf("UnpadFromBucket: %v", err)
+	}
+
+	decrypted, err := enclave.DecryptCachedResponse(clientKr, unpadded)
+	if err != nil {
+		t.Fatalf("DecryptCachedResponse: %v", err)
+	}
+
+	if string(decrypted) != string(dnsResponse) {
+		t.Fatalf("round-trip mismatch: got %x, want %x", decrypted, dnsResponse)
 	}
 }

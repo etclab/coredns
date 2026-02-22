@@ -1,20 +1,18 @@
 #!/bin/bash
-# Config 7: CODoH full defense stack
+# Config 6: CODoH IPC with LRU cache + cover responses
 # Architecture: Same as Config 4 (3-process IPC)
-# Adds: ORAM cache + cover responses + batching + padding
+# Adds: Cover responses (k=3) for cache-insert indistinguishability
 
-CONFIG_NAME="codoh-full"
-CONFIG_NUM=7
+CONFIG_NAME="codoh-cover"
+CONFIG_NUM=6
 CONFIG_PROTOCOL="codoh"
 
 start_config() {
     local root_dir=$1 cert_path=$2 output_dir=$3
 
-    # Start enclave (simulation mode, ORAM cache, full defenses)
-    echo "Starting enclave (simulation, ORAM, full defenses)..."
-    CODOH_USE_ORAM=true \
-    CODOH_PAD_BUCKETS=16384 \
-        "$root_dir/enclave-sim" \
+    # Start enclave (simulation mode, LRU cache)
+    echo "Starting enclave (simulation, LRU cache)..."
+    "$root_dir/enclave-sim" \
         > "$output_dir/enclave.log" 2>&1 &
     sleep 2
 

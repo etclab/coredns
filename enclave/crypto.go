@@ -4,8 +4,10 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/cloudflare/circl/hpke"
 	"github.com/cloudflare/circl/kem"
@@ -174,4 +176,70 @@ func GenerateDummyResponse(size int) []byte {
 	buf := make([]byte, size)
 	rand.Read(buf)
 	return buf
+}
+
+// DefaultPadBuckets is the default padding bucket set.
+// A single bucket forces all responses (hits and misses) to exactly 16384 bytes,
+// achieving complete size indistinguishability.
+var DefaultPadBuckets = []int{16384}
+
+// PadToBucket pads data to the next bucket boundary.
+// Wire format: [2-byte LE length prefix][data][random padding]
+// Total output length equals the smallest bucket >= len(data)+2.
+// If data+2 exceeds the largest bucket, rounds up to the next multiple of the largest.
+func PadToBucket(data []byte, buckets []int) ([]byte, error) {
+	if len(buckets) == 0 {
+		return nil, errors.New("empty bucket list")
+	}
+
+	needed := len(data) + 2 // 2-byte length prefix
+	if needed > 65535+2 {
+		return nil, errors.New("data too large for 2-byte length prefix")
+	}
+
+	sorted := make([]int, len(buckets))
+	copy(sorted, buckets)
+	sort.Ints(sorted)
+
+	// Find the smallest bucket that fits
+	targetSize := 0
+	for _, b := range sorted {
+		if b >= needed {
+			targetSize = b
+			break
+		}
+	}
+
+	// If no bucket fits, round up to next multiple of largest bucket
+	if targetSize == 0 {
+		largest := sorted[len(sorted)-1]
+		targetSize = ((needed + largest - 1) / largest) * largest
+	}
+
+	out := make([]byte, targetSize)
+	binary.LittleEndian.PutUint16(out[:2], uint16(len(data)))
+	copy(out[2:], data)
+
+	// Fill remaining bytes with random padding
+	padStart := 2 + len(data)
+	if padStart < targetSize {
+		rand.Read(out[padStart:])
+	}
+
+	return out, nil
+}
+
+// UnpadFromBucket extracts the original data from a padded message.
+// Reads the 2-byte LE length prefix and returns the inner data.
+func UnpadFromBucket(padded []byte) ([]byte, error) {
+	if len(padded) < 2 {
+		return nil, errors.New("padded data too short")
+	}
+
+	dataLen := int(binary.LittleEndian.Uint16(padded[:2]))
+	if 2+dataLen > len(padded) {
+		return nil, fmt.Errorf("invalid length prefix: %d exceeds padded size %d", dataLen, len(padded)-2)
+	}
+
+	return padded[2 : 2+dataLen], nil
 }

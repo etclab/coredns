@@ -263,31 +263,32 @@ For quote verification on the target side, build with `-tags sgxverify` (require
 
 ### Enclave Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `CODOH_CACHE_SIZE` | 10000 | Number of cache entries |
-| `CODOH_USE_ORAM` | false | Use ORAM cache instead of LRU |
-| `CODOH_ORAM_BLOCK_SIZE` | 4096 | ORAM block size in bytes |
-| `CODOH_DEFAULT_PAD_SIZE` | 512 | Dummy response size in bytes |
-| `CODOH_TARGET_SIGNING_PUBKEY` | - | Base64 Ed25519 pubkey (simulation mode only) |
-| `CODOH_WARMUP_THRESHOLD` | 100 | Cache entries needed to exit defensive mode |
-| `CODOH_OMISSION_THRESHOLD` | 50 | Outstanding queries to trigger defensive mode |
-| `CODOH_OUTSTANDING_TTL_SECS` | 300 | Logical-time window (seconds) for outstanding query eviction |
-| `CODOH_BATCH_SIZE` | 10 | Entries per batch commit |
-| `CODOH_BATCH_COMMIT_PROB` | 0.1 | Probability of batch commit per HandleProcess call |
-| `CODOH_QUEUE_MAX_SIZE` | 1000 | Max pending inserts in the insertion queue |
+| Variable | Type | Default | Paper Symbol | Description |
+|----------|------|---------|-------------|-------------|
+| `CODOH_CACHE_SIZE` | int | 10000 | N | Max cache entries |
+| `CODOH_USE_ORAM` | bool | false | — | ORAM-backed cache (required for G2) |
+| `CODOH_ORAM_BLOCK_SIZE` | int | 4096 | — | ORAM block size (bytes) |
+| `CODOH_PAD_BUCKETS` | string | "16384" | — | Comma-separated padding bucket sizes (bytes) |
+| `CODOH_REPLAY_DELTA_SECS` | float | 3.0 | δ | Replay protection window (seconds) |
+| `CODOH_WARMUP_THRESHOLD` | int | 100 | — | Cache entries needed to exit defensive mode |
+| `CODOH_OMISSION_THRESHOLD` | int | 50 | — | Outstanding queries to trigger defensive mode |
+| `CODOH_OUTSTANDING_TTL_SECS` | int | 300 | — | Logical-time window (seconds) for outstanding query eviction |
+| `CODOH_BATCH_SIZE` | int | 10 | B | Entries per batch commit |
+| `CODOH_BATCH_COMMIT_PROB` | float | 0.1 | p | Per-query commit probability |
+| `CODOH_QUEUE_MAX_SIZE` | int | 1000 | — | Max pending inserts in insertion queue |
+| `CODOH_TARGET_SIGNING_PUBKEY` | string | — | — | Base64 Ed25519 pubkey (simulation mode only) |
 
 ### Target Environment Variables (Cover Responses)
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `CODOH_COVER_COUNT` | 3 | Cover domains per cache-insert (0 to disable) |
-| `CODOH_COVER_DOMAIN_FILE` | - | Path to domain list CSV (required when COVER_COUNT > 0) |
-| `CODOH_COVER_POPULAR_CUTOFF` | 10000 | Top-N domains treated as "popular" in sampler |
-| `CODOH_COVER_POPULAR_RATIO` | 0.8 | Fraction of covers drawn from popular tier |
-| `CODOH_COVER_RESOLVER` | 127.0.0.1:53 | DNS resolver for cover domain resolution |
-| `CODOH_COVER_TIMEOUT_MS` | 2000 | Timeout for cover DNS resolution (ms) |
-| `CODOH_PROXY_CALLBACK_URL` | - | Proxy base URL for `POST /cache-insert` delivery (required) |
+| Variable | Type | Default | Paper Symbol | Description |
+|----------|------|---------|-------------|-------------|
+| `CODOH_COVER_COUNT` | int | 3 | k | Cover responses per cache-insert (0 to disable) |
+| `CODOH_COVER_DOMAIN_FILE` | path | — | — | Domain list CSV (required when COVER_COUNT > 0) |
+| `CODOH_COVER_POPULAR_CUTOFF` | int | 10000 | — | Top-N domains treated as "popular" in sampler |
+| `CODOH_COVER_POPULAR_RATIO` | float | 0.8 | — | Fraction of covers drawn from popular tier |
+| `CODOH_COVER_RESOLVER` | string | 127.0.0.1:53 | — | DNS resolver for cover domain resolution |
+| `CODOH_COVER_TIMEOUT_MS` | int | 2000 | — | Timeout for cover DNS resolution (ms) |
+| `CODOH_PROXY_CALLBACK_URL` | URL | — | — | Proxy base URL for `POST /cache-insert` delivery |
 
 ---
 

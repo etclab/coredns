@@ -216,6 +216,7 @@ SGX has no trusted clock. The enclave maintains `t_latest` (highest timestamp se
 | Cache omission detection | G2 | Done | Outstanding query tracking, enters defensive mode at OmissionThreshold |
 | Cover responses | G2 | Done | Target samples k random domains per cache-insert, delivered via POST /cache-insert |
 | Batched cache insertions | G2 | Done | InsertionQueue + pseudorandom commit via crypto/rand coin flip on query path |
+| Wire-layer padding | G2, G3 | Done | Bucketed padding (default single 16384-byte bucket); hits and misses identical size to proxy |
 | Session ID (sid) binding | G3 | Not yet | Explicit sid in AAD to prevent cross-use |
 | Dual HPKE key wrapping | G3 | Not yet | Symmetric key k encrypted separately to target and enclave |
 
@@ -273,7 +274,7 @@ codohtarget {
 | CODOH_CACHE_SIZE | 10000 | Number of cache entries |
 | CODOH_USE_ORAM | false | Use ORAM cache instead of LRU |
 | CODOH_ORAM_BLOCK_SIZE | 4096 | ORAM block size in bytes |
-| CODOH_DEFAULT_PAD_SIZE | 512 | Dummy response size in bytes |
+| CODOH_PAD_BUCKETS | "16384" | Comma-separated padding bucket sizes (bytes) |
 | CODOH_REPLAY_DELTA_SECS | 3.0 | Timestamp replay window (seconds) |
 | CODOH_TARGET_SIGNING_PUBKEY | - | Base64 Ed25519 pubkey (sim mode only) |
 | CODOH_WARMUP_THRESHOLD | 100 | Cache entries needed to exit defensive mode |

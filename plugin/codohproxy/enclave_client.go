@@ -159,7 +159,8 @@ func (c *EnclaveClient) sendRequest(req *EnclaveRequest) (*EnclaveResponse, erro
 		return nil, fmt.Errorf("read length: %w", err)
 	}
 
-	if length > 1<<20 {
+	const maxIPCResponseSize = 1 << 16
+	if length > maxIPCResponseSize {
 		c.setHealthy(false)
 		return nil, fmt.Errorf("response too large: %d", length)
 	}

@@ -2,6 +2,7 @@ package enclave
 
 import (
 	"bytes"
+	"sort"
 	"testing"
 
 	"github.com/cloudflare/circl/hpke"
@@ -304,5 +305,156 @@ func TestGenerateDummyResponse(t *testing.T) {
 
 	if bytes.Equal(d1, d2) {
 		t.Fatal("two dummy responses are identical — randomness broken")
+	}
+}
+
+// --- Sprint 6: Bucketed Padding Tests ---
+
+func TestPadToBucket_RoundTrip(t *testing.T) {
+	buckets := []int{1024, 2048, 4096, 8192, 16384}
+	testData := [][]byte{
+		[]byte("hello"),
+		make([]byte, 100),
+		make([]byte, 1000),
+		make([]byte, 4000),
+		make([]byte, 8000),
+	}
+	for _, data := range testData {
+		padded, err := PadToBucket(data, buckets)
+		if err != nil {
+			t.Fatalf("PadToBucket(%d bytes): %v", len(data), err)
+		}
+		unpadded, err := UnpadFromBucket(padded)
+		if err != nil {
+			t.Fatalf("UnpadFromBucket: %v", err)
+		}
+		if !bytes.Equal(unpadded, data) {
+			t.Fatalf("round-trip failed for %d-byte data: got %d bytes", len(data), len(unpadded))
+		}
+	}
+}
+
+func TestPadToBucket_OutputLengthInBucketSet(t *testing.T) {
+	buckets := []int{1024, 2048, 4096, 8192, 16384}
+	sorted := make([]int, len(buckets))
+	copy(sorted, buckets)
+	sort.Ints(sorted)
+
+	for dataLen := 1; dataLen <= 16000; dataLen += 137 {
+		data := make([]byte, dataLen)
+		padded, err := PadToBucket(data, buckets)
+		if err != nil {
+			t.Fatalf("PadToBucket(%d bytes): %v", dataLen, err)
+		}
+		found := false
+		for _, b := range sorted {
+			if len(padded) == b {
+				found = true
+				break
+			}
+		}
+		if !found {
+			// Check if it's a valid multiple of the largest bucket
+			largest := sorted[len(sorted)-1]
+			if len(padded)%largest != 0 {
+				t.Fatalf("data=%d: padded len=%d not in bucket set and not a multiple of %d",
+					dataLen, len(padded), largest)
+			}
+		}
+	}
+}
+
+func TestPadToBucket_EncryptedResponsePads(t *testing.T) {
+	kr := make([]byte, 16)
+	kr[0] = 0xAB
+	response := []byte("short DNS response")
+
+	encrypted, err := EncryptCachedResponse(kr, response)
+	if err != nil {
+		t.Fatalf("EncryptCachedResponse: %v", err)
+	}
+
+	padded, err := PadToBucket(encrypted, DefaultPadBuckets)
+	if err != nil {
+		t.Fatalf("PadToBucket: %v", err)
+	}
+
+	if len(padded) != DefaultPadBuckets[0] {
+		t.Fatalf("padded len=%d, want %d", len(padded), DefaultPadBuckets[0])
+	}
+
+	// Verify round-trip: unpad → decrypt
+	unpadded, err := UnpadFromBucket(padded)
+	if err != nil {
+		t.Fatalf("UnpadFromBucket: %v", err)
+	}
+	decrypted, err := DecryptCachedResponse(kr, unpadded)
+	if err != nil {
+		t.Fatalf("DecryptCachedResponse: %v", err)
+	}
+	if !bytes.Equal(decrypted, response) {
+		t.Fatalf("mismatch: got %q, want %q", decrypted, response)
+	}
+}
+
+func TestPadToBucket_ExceedsLargestBucket(t *testing.T) {
+	buckets := []int{1024, 2048}
+	// Data that needs 2050 bytes (data + 2-byte prefix) > 2048
+	data := make([]byte, 2048)
+	padded, err := PadToBucket(data, buckets)
+	if err != nil {
+		t.Fatalf("PadToBucket: %v", err)
+	}
+	// Should round up to next multiple of 2048 = 4096
+	if len(padded) != 4096 {
+		t.Fatalf("padded len=%d, want 4096 (2*largest bucket)", len(padded))
+	}
+	// Still round-trips
+	unpadded, err := UnpadFromBucket(padded)
+	if err != nil {
+		t.Fatalf("UnpadFromBucket: %v", err)
+	}
+	if !bytes.Equal(unpadded, data) {
+		t.Fatal("round-trip failed for oversized data")
+	}
+}
+
+func TestPadToBucket_RandomFill(t *testing.T) {
+	data := []byte("same data")
+	p1, _ := PadToBucket(data, DefaultPadBuckets)
+	p2, _ := PadToBucket(data, DefaultPadBuckets)
+
+	// The data portion is identical but padding bytes should differ (with overwhelming probability)
+	if bytes.Equal(p1, p2) {
+		t.Fatal("two paddings of same data are identical — random fill not working")
+	}
+	// But unpadded data should match
+	u1, _ := UnpadFromBucket(p1)
+	u2, _ := UnpadFromBucket(p2)
+	if !bytes.Equal(u1, u2) {
+		t.Fatal("unpadded data should be identical")
+	}
+}
+
+func TestUnpadFromBucket_Errors(t *testing.T) {
+	// Too short
+	_, err := UnpadFromBucket([]byte{0x01})
+	if err == nil {
+		t.Fatal("expected error for 1-byte input")
+	}
+
+	// Invalid length prefix (claims 1000 bytes but only 10 available)
+	bad := make([]byte, 10)
+	bad[0] = 0xE8 // 1000 in LE
+	bad[1] = 0x03
+	_, err = UnpadFromBucket(bad)
+	if err == nil {
+		t.Fatal("expected error for invalid length prefix")
+	}
+
+	// Empty input
+	_, err = UnpadFromBucket(nil)
+	if err == nil {
+		t.Fatal("expected error for nil input")
 	}
 }
