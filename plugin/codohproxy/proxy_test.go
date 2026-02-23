@@ -123,7 +123,7 @@ func TestProxyHandler_CacheMiss_TwoChunkResponse(t *testing.T) {
 	dummyBlob := "AQIDBA==" // base64 of {0x01, 0x02, 0x03, 0x04}
 	handler := &mockEnclaveHandler{
 		processFunc: func(qe string) *enclave.Response {
-			return &enclave.Response{Status: enclave.StatusMiss, Response: dummyBlob}
+			return &enclave.Response{Status: enclave.StatusProcessed, Response: dummyBlob}
 		},
 	}
 	ipcServer, err := enclave.NewIPCServer(socketPath, handler)
@@ -215,7 +215,7 @@ func newCacheInsertProxy(t *testing.T, handler *mockEnclaveHandler) (*odohProxy,
 func TestCacheInsertHandler_ValidPOST(t *testing.T) {
 	handler := &mockEnclaveHandler{
 		processFunc: func(qe string) *enclave.Response {
-			return &enclave.Response{Status: enclave.StatusMiss}
+			return &enclave.Response{Status: enclave.StatusProcessed}
 		},
 	}
 	proxy, cleanup := newCacheInsertProxy(t, handler)
@@ -251,7 +251,7 @@ func TestCacheInsertHandler_ValidPOST(t *testing.T) {
 func TestCacheInsertHandler_InvalidJSON(t *testing.T) {
 	handler := &mockEnclaveHandler{
 		processFunc: func(qe string) *enclave.Response {
-			return &enclave.Response{Status: enclave.StatusMiss}
+			return &enclave.Response{Status: enclave.StatusProcessed}
 		},
 	}
 	proxy, cleanup := newCacheInsertProxy(t, handler)
@@ -270,7 +270,7 @@ func TestCacheInsertHandler_InvalidJSON(t *testing.T) {
 func TestCacheInsertHandler_MissingBlob(t *testing.T) {
 	handler := &mockEnclaveHandler{
 		processFunc: func(qe string) *enclave.Response {
-			return &enclave.Response{Status: enclave.StatusMiss}
+			return &enclave.Response{Status: enclave.StatusProcessed}
 		},
 	}
 	proxy, cleanup := newCacheInsertProxy(t, handler)
@@ -290,7 +290,7 @@ func TestCacheInsertHandler_MissingBlob(t *testing.T) {
 func TestCacheInsertHandler_EnclaveIPCFail(t *testing.T) {
 	handler := &mockEnclaveHandler{
 		processFunc: func(qe string) *enclave.Response {
-			return &enclave.Response{Status: enclave.StatusMiss}
+			return &enclave.Response{Status: enclave.StatusProcessed}
 		},
 		storeEncryptedFunc: func(blob, sig string) *enclave.Response {
 			return &enclave.Response{Status: enclave.StatusError, Error: "decrypt_failed"}

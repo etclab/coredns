@@ -281,11 +281,7 @@ func (p *odohProxy) proxyHandler(w http.ResponseWriter, r *http.Request) {
 		// Write chunk2 (ODoH response)
 		w.Write(targetRes.body)
 
-		if enclaveRes.resp != nil && enclaveRes.resp.Status == statusHit {
-			proxyRequestsTotal.WithLabelValues("cache_hit").Inc()
-		} else {
-			proxyRequestsTotal.WithLabelValues("cache_miss").Inc()
-		}
+		proxyRequestsTotal.WithLabelValues("enclave_ok").Inc()
 	} else {
 		// Degraded: standard ODoH response
 		w.Header().Set("Content-Type", odohContentType)

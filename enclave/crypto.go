@@ -170,8 +170,16 @@ func EncryptCachedResponse(kr, response []byte) ([]byte, error) {
 	return result, nil
 }
 
+// DummyInnerSize is the representative size of an AES-128-GCM ciphertext
+// used for dummy responses before PadToBucket. This produces a plausible
+// 2-byte LE length prefix, making dummies structurally identical to real
+// EncryptCachedResponse output after padding (C1 fix).
+// Value: 12 (nonce) + 256 (median DNS response) + 16 (GCM tag) = 284.
+const DummyInnerSize = 284
+
 // GenerateDummyResponse returns size bytes from crypto/rand.
-// Indistinguishable from a real EncryptCachedResponse output.
+// Used to generate dummy inner payloads that are subsequently wrapped
+// with PadToBucket to match the structure of real encrypted responses.
 func GenerateDummyResponse(size int) []byte {
 	buf := make([]byte, size)
 	rand.Read(buf)

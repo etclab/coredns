@@ -329,12 +329,16 @@ func (h *EnclaveHandler) HandleProcess(qe string) *enclave.Response {
 	// Indistinguishable from a normal cache miss to the proxy.
 	if inDefensiveMode {
 		_ = kr // kr derived but not used — defensive mode returns dummy
-		maxBucket := h.padBuckets[len(h.padBuckets)-1]
-		dummy := enclave.GenerateDummyResponse(maxBucket)
+		dummy := enclave.GenerateDummyResponse(enclave.DummyInnerSize)
+		padded, padErr := enclave.PadToBucket(dummy, h.padBuckets)
+		if padErr != nil {
+			log.Printf("PadToBucket(defensive dummy) failed: %v", padErr)
+			padded = dummy // fallback — should never happen
+		}
 		h.logCacheOp("miss(defensive)", string(query))
 		resp = &enclave.Response{
-			Status:   enclave.StatusMiss,
-			Response: base64.StdEncoding.EncodeToString(dummy),
+			Status:   enclave.StatusProcessed,
+			Response: base64.StdEncoding.EncodeToString(padded),
 		}
 	} else {
 		canonicalQuery := string(query)
@@ -353,7 +357,7 @@ func (h *EnclaveHandler) HandleProcess(qe string) *enclave.Response {
 			} else {
 				h.logCacheOp("hit", canonicalQuery)
 				resp = &enclave.Response{
-					Status:   enclave.StatusHit,
+					Status:   enclave.StatusProcessed,
 					Response: base64.StdEncoding.EncodeToString(encrypted),
 				}
 			}
@@ -374,13 +378,17 @@ func (h *EnclaveHandler) HandleProcess(qe string) *enclave.Response {
 			}
 			h.mu.Unlock()
 
-			// Return dummy (indistinguishable from hit)
-			maxBucket := h.padBuckets[len(h.padBuckets)-1]
-			dummy := enclave.GenerateDummyResponse(maxBucket)
+			// Return dummy (indistinguishable from hit — same PadToBucket structure)
+			dummy := enclave.GenerateDummyResponse(enclave.DummyInnerSize)
+			padded, padErr := enclave.PadToBucket(dummy, h.padBuckets)
+			if padErr != nil {
+				log.Printf("PadToBucket(miss dummy) failed: %v", padErr)
+				padded = dummy // fallback — should never happen
+			}
 			h.logCacheOp("miss", canonicalQuery)
 			resp = &enclave.Response{
-				Status:   enclave.StatusMiss,
-				Response: base64.StdEncoding.EncodeToString(dummy),
+				Status:   enclave.StatusProcessed,
+				Response: base64.StdEncoding.EncodeToString(padded),
 			}
 		}
 	}

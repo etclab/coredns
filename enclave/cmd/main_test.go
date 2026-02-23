@@ -303,12 +303,12 @@ func TestDefensiveMode_BootReturnsDummy(t *testing.T) {
 	h.cache.Put("example.com.:1", []byte{0xDE, 0xAD}, 1000, 300)
 	h.tLatest.Store(1000)
 
-	// HandleProcess should return miss (dummy) even though entry is in cache
+	// HandleProcess should return processed (dummy) even though entry is in cache
 	qe := makeProcessReq(t, h, "example.com.:1")
 	resp := h.HandleProcess(qe)
 
-	if resp.Status != enclave.StatusMiss {
-		t.Fatalf("defensive mode should return miss, got status=%s", resp.Status)
+	if resp.Status != enclave.StatusProcessed {
+		t.Fatalf("defensive mode should return processed, got status=%s", resp.Status)
 	}
 	if resp.Response == "" {
 		t.Fatal("defensive mode should return a dummy blob")
@@ -352,8 +352,8 @@ func TestDefensiveMode_ExitsOnWarmupThreshold(t *testing.T) {
 	// commits 2 entries → cache.Size()=2 < 3 → still defensive
 	qe := makeProcessReq(t, h, "a.com.:1")
 	resp := h.HandleProcess(qe)
-	if resp.Status != enclave.StatusMiss {
-		t.Fatalf("should still return miss before threshold (2 < 3), got %s", resp.Status)
+	if resp.Status != enclave.StatusProcessed {
+		t.Fatalf("should still return processed before threshold (2 < 3), got %s", resp.Status)
 	}
 
 	// 3rd store → queued
@@ -363,15 +363,15 @@ func TestDefensiveMode_ExitsOnWarmupThreshold(t *testing.T) {
 	// commits 1 entry → cache.Size()=3 >= 3 → exits defensive mode
 	qe = makeProcessReq(t, h, "a.com.:1")
 	resp = h.HandleProcess(qe)
-	if resp.Status != enclave.StatusMiss {
-		t.Fatalf("expected miss (defensive response determined before commit), got %s", resp.Status)
+	if resp.Status != enclave.StatusProcessed {
+		t.Fatalf("expected processed (defensive response determined before commit), got %s", resp.Status)
 	}
 
-	// Now defensive mode exited. Next HandleProcess should return hit.
+	// Now defensive mode exited. Next HandleProcess should return processed (hit).
 	qe = makeProcessReq(t, h, "a.com.:1")
 	resp = h.HandleProcess(qe)
-	if resp.Status != enclave.StatusHit {
-		t.Fatalf("expected cache hit after warm-up exit (3 >= 3), got status=%s", resp.Status)
+	if resp.Status != enclave.StatusProcessed {
+		t.Fatalf("expected processed after warm-up exit (3 >= 3), got status=%s", resp.Status)
 	}
 }
 
@@ -386,8 +386,8 @@ func TestOmissionDetection_EntersDefensiveMode(t *testing.T) {
 	// Verify normal mode works — cache hit
 	qe := makeProcessReq(t, h, "cached.com.:1")
 	resp := h.HandleProcess(qe)
-	if resp.Status != enclave.StatusHit {
-		t.Fatalf("expected hit before omission, got %s", resp.Status)
+	if resp.Status != enclave.StatusProcessed {
+		t.Fatalf("expected processed before omission, got %s", resp.Status)
 	}
 
 	// Generate 6 cache misses (> threshold of 5) to trigger omission detection
@@ -397,11 +397,11 @@ func TestOmissionDetection_EntersDefensiveMode(t *testing.T) {
 		h.HandleProcess(qe)
 	}
 
-	// Defensive mode active + cache cleared: previously-cached entry now returns miss
+	// Defensive mode active + cache cleared: previously-cached entry now returns processed (dummy)
 	qe = makeProcessReq(t, h, "cached.com.:1")
 	resp = h.HandleProcess(qe)
-	if resp.Status != enclave.StatusMiss {
-		t.Fatalf("expected miss after omission (defensive mode + cache cleared), got %s", resp.Status)
+	if resp.Status != enclave.StatusProcessed {
+		t.Fatalf("expected processed after omission (defensive mode + cache cleared), got %s", resp.Status)
 	}
 }
 
@@ -460,8 +460,8 @@ func TestOutstandingTTL_Cleanup(t *testing.T) {
 	// If cleanup worked, outstanding=5 ≤ 8 → no omission → sentinel still reachable.
 	qe := makeProcessReq(t, h, "sentinel.com.:1")
 	resp2 := h.HandleProcess(qe)
-	if resp2.Status != enclave.StatusHit {
-		t.Fatalf("expected hit (TTL cleanup should prevent omission), got %s", resp2.Status)
+	if resp2.Status != enclave.StatusProcessed {
+		t.Fatalf("expected processed (TTL cleanup should prevent omission), got %s", resp2.Status)
 	}
 }
 
@@ -512,12 +512,12 @@ func TestOutstandingQuery_RemovedOnStore(t *testing.T) {
 	qe = makeProcessReq(t, h, "d.com.:1")
 	h.HandleProcess(qe)
 
-	// If removal worked: "a.com.:1" is cached and no omission → hit.
-	// If removal failed: omission triggered → cache cleared → miss.
+	// If removal worked: "a.com.:1" is cached and no omission → processed (hit).
+	// If removal failed: omission triggered → cache cleared → processed (dummy).
 	qe = makeProcessReq(t, h, "a.com.:1")
 	resp2 := h.HandleProcess(qe)
-	if resp2.Status != enclave.StatusHit {
-		t.Fatalf("expected hit (store should remove from outstanding, preventing omission), got %s", resp2.Status)
+	if resp2.Status != enclave.StatusProcessed {
+		t.Fatalf("expected processed (store should remove from outstanding, preventing omission), got %s", resp2.Status)
 	}
 }
 
@@ -581,13 +581,13 @@ func TestDefensiveMode_NoOutstandingTrackingDuringDefensive(t *testing.T) {
 	h.omissionThreshold = 5
 	h.tLatest.Store(1000)
 
-	// 10 queries during defensive mode — all return miss (dummy)
+	// 10 queries during defensive mode — all return processed (dummy)
 	for i := 0; i < 10; i++ {
 		query := fmt.Sprintf("defensive%d.com.:1", i)
 		qe := makeProcessReq(t, h, query)
 		resp := h.HandleProcess(qe)
-		if resp.Status != enclave.StatusMiss {
-			t.Fatalf("expected miss during defensive mode, got %s", resp.Status)
+		if resp.Status != enclave.StatusProcessed {
+			t.Fatalf("expected processed during defensive mode, got %s", resp.Status)
 		}
 	}
 
@@ -622,11 +622,11 @@ func TestDefensiveMode_NoOutstandingTrackingDuringDefensive(t *testing.T) {
 		h.HandleProcess(qe)
 	}
 
-	// If no leakage: outstanding=3 ≤ 5 → no omission → stored entry is a hit.
+	// If no leakage: outstanding=3 ≤ 5 → no omission → stored entry is processed (hit).
 	qe := makeProcessReq(t, h, "stored0.com.:1")
 	resp := h.HandleProcess(qe)
-	if resp.Status != enclave.StatusHit {
-		t.Fatalf("expected hit (no outstanding leakage during defensive mode), got %s", resp.Status)
+	if resp.Status != enclave.StatusProcessed {
+		t.Fatalf("expected processed (no outstanding leakage during defensive mode), got %s", resp.Status)
 	}
 }
 
@@ -671,14 +671,14 @@ func TestDefensiveMode_FullCycle(t *testing.T) {
 	// First call: defensive → dummy response, then commits 3 entries → exits warmup.
 	qe := makeProcessReq(t, h, "a.com.:1")
 	resp := h.HandleProcess(qe)
-	if resp.Status != enclave.StatusMiss {
-		t.Fatalf("phase 2a: expected miss (defensive response before commit), got %s", resp.Status)
+	if resp.Status != enclave.StatusProcessed {
+		t.Fatalf("phase 2a: expected processed (defensive response before commit), got %s", resp.Status)
 	}
 	// Second call: normal mode → cache hit proves defensive mode exited.
 	qe = makeProcessReq(t, h, "a.com.:1")
 	resp = h.HandleProcess(qe)
-	if resp.Status != enclave.StatusHit {
-		t.Fatalf("phase 2b: expected hit after recovery, got %s", resp.Status)
+	if resp.Status != enclave.StatusProcessed {
+		t.Fatalf("phase 2b: expected processed after recovery, got %s", resp.Status)
 	}
 
 	// Phase 3: Trigger omission detection — 4 unique misses (> threshold=3)
@@ -687,11 +687,11 @@ func TestDefensiveMode_FullCycle(t *testing.T) {
 		h.HandleProcess(qe)
 	}
 
-	// Previously-cached entry now returns miss → defensive mode re-entered + cache cleared
+	// Previously-cached entry now returns processed (dummy) → defensive mode re-entered + cache cleared
 	qe = makeProcessReq(t, h, "a.com.:1")
 	resp = h.HandleProcess(qe)
-	if resp.Status != enclave.StatusMiss {
-		t.Fatalf("phase 3: expected miss (defensive mode after omission), got %s", resp.Status)
+	if resp.Status != enclave.StatusProcessed {
+		t.Fatalf("phase 3: expected processed (defensive mode after omission), got %s", resp.Status)
 	}
 
 	// Phase 4: Second recovery via 3 new stores (queued)
@@ -703,14 +703,14 @@ func TestDefensiveMode_FullCycle(t *testing.T) {
 	// First call: defensive → dummy, commits 3 entries → exits warmup.
 	qe = makeProcessReq(t, h, "d.com.:1")
 	resp = h.HandleProcess(qe)
-	if resp.Status != enclave.StatusMiss {
-		t.Fatalf("phase 5a: expected miss (defensive response before commit), got %s", resp.Status)
+	if resp.Status != enclave.StatusProcessed {
+		t.Fatalf("phase 5a: expected processed (defensive response before commit), got %s", resp.Status)
 	}
 	// Second call: normal mode → cache hit proves defensive mode exited again.
 	qe = makeProcessReq(t, h, "d.com.:1")
 	resp = h.HandleProcess(qe)
-	if resp.Status != enclave.StatusHit {
-		t.Fatalf("phase 5b: expected hit after second recovery, got %s", resp.Status)
+	if resp.Status != enclave.StatusProcessed {
+		t.Fatalf("phase 5b: expected processed after second recovery, got %s", resp.Status)
 	}
 }
 
@@ -780,11 +780,11 @@ func TestDefensiveMode_ConcurrentMissesAndStores(t *testing.T) {
 	h.mu.Unlock()
 
 	if h.cache.Size() >= h.warmupThreshold {
-		// Defensive mode should have exited — verify with a hit
+		// Defensive mode should have exited — verify with a processed response
 		qe := makeProcessReq(t, h, "cstore0.com.:1")
 		resp := h.HandleProcess(qe)
-		if resp.Status != enclave.StatusHit {
-			t.Fatalf("expected hit after concurrent recovery (cache=%d), got %s",
+		if resp.Status != enclave.StatusProcessed {
+			t.Fatalf("expected processed after concurrent recovery (cache=%d), got %s",
 				h.cache.Size(), resp.Status)
 		}
 	} else {
@@ -809,8 +809,8 @@ func TestDefensiveMode_ConcurrentOmissionTrigger(t *testing.T) {
 	// Verify sentinel is reachable before the storm
 	qe := makeProcessReq(t, h, "sentinel.com.:1")
 	resp := h.HandleProcess(qe)
-	if resp.Status != enclave.StatusHit {
-		t.Fatalf("expected hit before concurrent misses, got %s", resp.Status)
+	if resp.Status != enclave.StatusProcessed {
+		t.Fatalf("expected processed before concurrent misses, got %s", resp.Status)
 	}
 
 	// 20 goroutines all send unique misses — at least one push will exceed threshold
@@ -829,8 +829,8 @@ func TestDefensiveMode_ConcurrentOmissionTrigger(t *testing.T) {
 	// Sentinel should now be unreachable: defensive mode active + cache cleared
 	qe = makeProcessReq(t, h, "sentinel.com.:1")
 	resp = h.HandleProcess(qe)
-	if resp.Status != enclave.StatusMiss {
-		t.Fatalf("expected miss after concurrent omission trigger, got %s", resp.Status)
+	if resp.Status != enclave.StatusProcessed {
+		t.Fatalf("expected processed after concurrent omission trigger, got %s", resp.Status)
 	}
 }
 
@@ -1110,8 +1110,8 @@ func TestBatch_DefensiveNotFalseTriggeredByDelay(t *testing.T) {
 	// Sentinel should still be reachable (no omission triggered)
 	qe := makeProcessReq(t, h, "sentinel.com.:1")
 	resp := h.HandleProcess(qe)
-	if resp.Status != enclave.StatusHit {
-		t.Fatalf("expected hit (no false omission from batch delay), got %s", resp.Status)
+	if resp.Status != enclave.StatusProcessed {
+		t.Fatalf("expected processed (no false omission from batch delay), got %s", resp.Status)
 	}
 }
 
@@ -1300,8 +1300,8 @@ func TestHandleProcess_HitResponseIsBucketSized(t *testing.T) {
 
 	qe := makeProcessReq(t, h, "padtest.com.:1")
 	resp := h.HandleProcess(qe)
-	if resp.Status != enclave.StatusHit {
-		t.Fatalf("expected hit, got %s", resp.Status)
+	if resp.Status != enclave.StatusProcessed {
+		t.Fatalf("expected processed, got %s", resp.Status)
 	}
 
 	decoded, err := base64.StdEncoding.DecodeString(resp.Response)
@@ -1321,8 +1321,8 @@ func TestHandleProcess_MissResponseIsBucketSized(t *testing.T) {
 
 	qe := makeProcessReq(t, h, "nonexistent.com.:1")
 	resp := h.HandleProcess(qe)
-	if resp.Status != enclave.StatusMiss {
-		t.Fatalf("expected miss, got %s", resp.Status)
+	if resp.Status != enclave.StatusProcessed {
+		t.Fatalf("expected processed, got %s", resp.Status)
 	}
 
 	decoded, err := base64.StdEncoding.DecodeString(resp.Response)
@@ -1355,8 +1355,8 @@ func TestHandleProcess_HitDecryptableAfterUnpad(t *testing.T) {
 	qeB64 := base64.StdEncoding.EncodeToString(qeRaw)
 
 	resp := h.HandleProcess(qeB64)
-	if resp.Status != enclave.StatusHit {
-		t.Fatalf("expected hit, got %s", resp.Status)
+	if resp.Status != enclave.StatusProcessed {
+		t.Fatalf("expected processed, got %s", resp.Status)
 	}
 
 	decoded, err := base64.StdEncoding.DecodeString(resp.Response)

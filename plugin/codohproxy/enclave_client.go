@@ -28,7 +28,6 @@ const (
 
 // IPC Response Status
 const (
-	statusHit        = "hit"
 	statusError      = "error"
 	statusOK         = "ok"
 	statusKeyRotated = "key_rotated"

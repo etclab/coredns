@@ -13,6 +13,7 @@ const (
 const (
 	StatusHit        = "hit"
 	StatusMiss       = "miss"
+	StatusProcessed  = "processed" // uniform status for all query responses (hit or miss) — C2 fix
 	StatusError      = "error"
 	StatusOK         = "ok"
 	StatusKeyRotated = "key_rotated"
