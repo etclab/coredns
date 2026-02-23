@@ -5,6 +5,6 @@
         port 10444
         tls_cert localhost.pem
         tls_key localhost-key.pem
-        upstream 8.8.8.8:53
+        upstream 127.0.0.1:5353
     }
 }

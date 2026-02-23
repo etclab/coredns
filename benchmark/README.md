@@ -1,257 +1,221 @@
 # CODoH Benchmark
 
-Latency comparison between ODoH (baseline) and CODoH (with enclave).
+Reproduce the performance evaluation from the CODoH paper. Compares plain DoH, ODoH, and CODoH with incremental privacy defenses across three DNS workloads.
 
-## Quick Start
+## Prerequisites
+
+- **Hardware**: Intel CPU with SGX support (`/dev/sgx_enclave` must exist)
+- **OS**: Ubuntu 22.04+ (tested on 6.8.0-1010-intel kernel)
+- **Software**: Go 1.25+, [EGo SDK](https://docs.edgeless.systems/ego), `dig`, `curl`, `python3`, `gnuplot`
+- **Repos**: This repo (`coredns/`) and `codoh-client/` must be siblings in the same parent directory
+
+```
+codoh/
+├── coredns/         # this repo
+└── codoh-client/    # client binary
+```
+
+## Step-by-Step
+
+All commands run from the **repository root** (`coredns/`).
+
+### 1. Build everything
 
 ```bash
-# From coredns root directory
-./benchmark/run-benchmark.sh        # Full benchmark (1000 iterations)
-./benchmark/run-benchmark.sh 100    # Quick test (100 iterations)
+./benchmark/setup.sh
 ```
 
-Results saved to `benchmark/results/<timestamp>/`.
+This will:
+- Verify SGX hardware (fails if absent)
+- Build the SGX enclave, server (`coredns-test`), and client (`odoh-client`)
+- Generate TLS certificates
+- Download the Cisco Umbrella top-1M domain list
+- Create a git worktree for Config 3 (pinned to commit `e81a315`)
 
-## Test Scenarios
+Expected output ends with a "Setup Complete" summary listing all binary paths.
 
-| Test | Distribution | Description |
-|------|--------------|-------------|
-| `odoh` | sequential | ODoH baseline, unique queries from Top 1M |
-| `codoh_cold` | sequential | CODoH cache miss path (all unique domains) |
-| `codoh_zipf` | Zipf (s=1.0) | CODoH realistic traffic (natural cache hits) |
-| `codoh_warm` | single domain | CODoH best-case (all cache hits after first) |
+### 2. Set up the local DNS resolver
 
-## Architecture
-
-```
-ODoH Baseline (ports 9080/9443):
-  Client → odohproxy → odohtarget → upstream DNS
-
-CODoH (ports 8080/8443):
-  Client → codohproxy → enclave → codohtarget → upstream DNS
-```
-
-## Files
-
-```
-benchmark/
-├── run-benchmark.sh                  # Main benchmark (ODoH vs CODoH)
-├── run-mle-stochastic-benchmark.sh   # MLE + Stochastic defense benchmark
-├── SPEC.md                           # Full specification
-├── README.md                         # This file
-├── top-1m.csv                        # Cisco Umbrella Top 1M domains
-├── top-1k.csv                        # Top 1K domains (for quick tests)
-├── Corefile.odoh-proxy               # ODoH baseline proxy config
-├── Corefile.odoh-target              # ODoH baseline target config
-└── results/                          # Benchmark output
-    ├── <timestamp>/                  # Main benchmark results
-    │   ├── odoh.{csv,json}
-    │   ├── codoh_cold.{csv,json}
-    │   ├── codoh_zipf.{csv,json}
-    │   └── codoh_warm.{csv,json}
-    ├── stochastic_<timestamp>/       # Stochastic benchmark results (legacy)
-    └── mle_stochastic_<timestamp>/   # MLE + Stochastic benchmark results
-        ├── baseline_zipf.{csv,json}
-        ├── *_bench.log               # Client benchmark output
-        ├── *_enclave.log             # Enclave logs
-        ├── *_cache_stats.txt         # Cache statistics
-        └── comparison_report.txt
-```
-
-## Manual Usage
+We use a local [Unbound](https://nlnetlabs.nl/projects/unbound/about/) resolver to eliminate upstream DNS latency variance from measurements.
 
 ```bash
-# Build (from coredns root)
-go build -o coredns-test .
-go build -o enclave-test ./enclave/cmd
-cd ../odoh-client-go && go build -o odoh-client ./cmd/odoh-client.go
-
-# Run individual benchmark
-./odoh-client latency \
-  --protocol codoh \
-  --distribution zipf \
-  --iterations 1000 \
-  --target 127.0.0.1:8443 \
-  --proxy 127.0.0.1:8080 \
-  --domains benchmark/top-1m.csv \
-  --zipf-s 1.0 \
-  --customcert localhost.pem \
-  --output results.csv \
-  --summary results.json
+sudo apt install unbound -y
+sudo cp benchmark/unbound.conf /etc/unbound/unbound.conf.d/benchmark.conf
+sudo systemctl restart unbound
 ```
 
-## CLI Options
+Verify it's working:
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--protocol` | odoh | `odoh` or `codoh` |
-| `--distribution` | sequential | `sequential` or `zipf` |
-| `--iterations` | 1000 | Number of queries |
-| `--domains` | - | Path to domains CSV (rank,domain format) |
-| `--zipf-s` | 1.0 | Zipf skew parameter (higher = more skewed) |
-| `--target` | 127.0.0.1:8443 | Target address |
-| `--proxy` | - | Proxy address (required for codoh) |
-| `--customcert` | - | Path to CA cert for self-signed TLS |
-| `--output` | - | CSV output path |
-| `--summary` | - | JSON summary path |
-| `--mle` | false | Enable MLE (Message-Locked Encryption) mode |
+```bash
+dig @127.0.0.1 -p 5353 google.com +short
+```
 
-## Output Format
+You should see an IP address. If not, check `sudo systemctl status unbound`.
 
-### JSON Summary
+### 3. Prewarm the resolver cache
+
+Prewarms Unbound with all domains used in the workloads. Takes ~2 minutes. Only needs to run once per session (cache persists for 24 hours).
+
+```bash
+./benchmark/prewarm-unbound.sh
+```
+
+### 4. Validate the setup
+
+Run a quick smoke test to verify all configurations start and respond correctly:
+
+```bash
+./benchmark/run-all.sh --quick
+```
+
+This sends 10 queries to each config (smoke test) then 500 queries to Configs 4 and 7 (spot check). Takes ~5-8 minutes. Check the output for any `FAIL` lines.
+
+### 5. Run the benchmark
+
+Choose a run mode:
+
+```bash
+# Standard comparison (~1 hour)
+# Compares ODoH vs CODoH-base vs CODoH-full — the paper's core result
+./benchmark/run-all.sh --standard --sgx --run-id std-01
+
+# Full evaluation (~4-7 hours)
+# All 9 configs + ablation + parameter sweeps
+./benchmark/run-all.sh --sgx --run-id full-01 --sweep-oram --sweep-cover
+```
+
+### 6. Find the results
+
+Results are in `benchmark/results/<run-id>/`:
+
+```
+benchmark/results/std-01/
+├── metadata.json              # Run parameters, system info, timestamps
+├── raw/
+│   ├── odoh_cold.json         # Per-config per-workload results
+│   ├── odoh_cold.csv          # Per-query latency trace
+│   ├── codoh-base_cold.json
+│   ├── codoh-full_zipf.json
+│   └── ...
+└── processed/                 # (populated by plotting scripts)
+```
+
+Each `.json` file contains:
 
 ```json
 {
-  "protocol": "codoh",
-  "distribution": "zipf",
-  "iterations": 1000,
-  "successful": 1000,
-  "failed": 0,
-  "cache_hits": 776,
-  "cache_misses": 224,
-  "cache_hit_rate": 0.776,
-  "latency_ms": {
-    "min": 0.5,
-    "max": 89.3,
-    "mean": 7.1,
-    "p50": 0.9,
-    "p95": 29.6,
-    "p99": 40.6
-  },
+  "latency_ms": { "min": 0.5, "mean": 7.1, "p50": 0.9, "p95": 29.6, "p99": 40.6 },
   "throughput_qps": 140.8,
-  "token_fetch_ms": 4.2,
-  "total_duration_s": 7.1
+  "cache_hit_rate": 0.776,
+  "iterations": 10000,
+  "successful": 10000
 }
 ```
 
-### CSV
-
-```csv
-timestamp,protocol,distribution,query_num,domain,latency_ms,cache_status,success,error
-1768846058834,codoh,zipf,1,google.com.,0.871,hit,true,
-1768846058835,codoh,zipf,2,facebook.com.,29.243,miss,true,
-```
-
-## Ports
-
-| Service | ODoH Baseline | CODoH |
-|---------|---------------|-------|
-| Proxy | 9080 | 8080 |
-| Target | 9443 | 8443 |
-| Enclave | - | Unix socket |
+A summary table is printed to stdout when the run completes.
 
 ---
 
-## MLE + Stochastic Defense Benchmark
+## What's Being Measured
 
-Measures the latency impact of MLE (ciphertext-only cache) and stochastic defenses (hit suppression, non-insertion, churn).
+### Configurations
 
-### Quick Start
+The benchmark incrementally adds privacy defenses to measure their individual overhead:
 
-```bash
-# MLE mode with quick test (100 iterations)
-./benchmark/run-mle-stochastic-benchmark.sh --mle --quick
+| # | Config | What it adds over previous |
+|---|--------|---------------------------|
+| 1 | **DoH** | Baseline — plain DNS-over-HTTPS |
+| 2 | **ODoH** | + Oblivious proxy (HPKE encryption) |
+| 3 | **CODoH-base** | + Enclave with LRU cache (2-proc proxy mode) |
+| 4 | **CODoH-IPC** | + 3-proc IPC architecture, dummy responses, replay protection |
+| 5 | **CODoH-ORAM** | + ORAM cache (hides access patterns) |
+| 6 | **CODoH-cover** | + Cover responses (hides cache set membership) |
+| 7 | **CODoH-full** | + All defenses: ORAM + covers + batching + padding |
 
-# MLE mode with standard test (500 iterations)
-./benchmark/run-mle-stochastic-benchmark.sh --mle
+Ablation configs **4b** (batching only) and **4p** (padding only) isolate cheap defenses.
 
-# MLE + ORAM cache + churn test
-./benchmark/run-mle-stochastic-benchmark.sh --mle --oram
+### Workloads
 
-# Legacy enclave mode (without MLE)
-./benchmark/run-mle-stochastic-benchmark.sh --quick
+| Name | Pattern | Purpose |
+|------|---------|---------|
+| **cold** | 10K unique domains (sequential) | Worst case: all cache misses |
+| **zipf** | 10K queries, Zipf s=1.0 over 1K domains | Realistic: skewed popularity with natural hits |
+| **warm** | 10K queries to `google.com` | Best case: all cache hits after first |
 
-# Custom iterations
-./benchmark/run-mle-stochastic-benchmark.sh --mle --iterations=200
-```
+### Parameter Sweeps
 
-### Test Configurations
+| Sweep | Values | Configs | Purpose |
+|-------|--------|---------|---------|
+| ORAM capacity (N) | 256, 1024, 2048 | 5, 7 | ORAM scaling within SGX EPC |
+| Cover count (k) | 1, 3, 5 | 6, 7 | Privacy vs. performance tradeoff |
 
-| Config | p_fn | p_ins | Churn | Description |
-|--------|------|-------|-------|-------------|
-| baseline | 0.0 | 1.0 | No | No defenses (reference) |
-| light | 0.1 | 0.9 | No | Production recommended |
-| moderate | 0.2 | 0.8 | No | Balanced security |
-| heavy | 0.3 | 0.7 | No | Higher security |
-| max_security | 0.5 | 0.5 | No | Maximum snapshot resistance |
-| oram_churn | 0.1 | 0.9 | 30s | ORAM only, with background eviction |
+---
 
-### MLE Mode
-
-MLE (Message-Locked Encryption) provides ciphertext-only cache - the enclave stores encrypted responses that only the original client can decrypt.
-
-| Aspect | Legacy Enclave | MLE Mode |
-|--------|----------------|----------|
-| Cache content | Plaintext DNS | MLE-encrypted ciphertext |
-| Enclave can decrypt | Yes | No |
-| Cache backend | LRU or ORAM (`--oram`) | **Always ORAM** (hardcoded) |
-| Latency overhead | ~5-10ms | ~25-35ms (Argon2 key derivation) |
-| Privacy | Good | Maximum |
-
-**Note:** The `--oram` flag only affects legacy enclave mode. MLE mode always uses ORAM for access pattern hiding.
-
-### Stochastic Parameters
-
-| Parameter | Env Variable | Description |
-|-----------|--------------|-------------|
-| Hit Suppression (p_fn) | `CODOH_HIT_SUPPRESSION_PROB` | Probability of returning miss even when cached [0.0-1.0] |
-| Insert Probability (p_ins) | `CODOH_INSERT_PROB` | Probability of caching a response [0.0-1.0] |
-| Churn Enabled | `CODOH_CHURN_ENABLED` | Enable background random eviction (ORAM only) |
-| Churn Interval | `CODOH_CHURN_INTERVAL_SECS` | Seconds between churn events |
-
-### Output
-
-Results saved to `benchmark/results/mle_stochastic_<timestamp>/` (or `stochastic_<timestamp>/` without `--mle`):
-
-| File | Description |
-|------|-------------|
-| `*_zipf.csv/json` | Latency measurements |
-| `*_enclave.log` | Cache hit/miss/suppression logs |
-| `*_cache_stats.txt` | Cache behavior summary |
-| `comparison_report.txt` | Side-by-side comparison |
-
-### Example Results (MLE Mode)
+## Options Reference
 
 ```
-Config            Mean(ms)    P50(ms)    P95(ms)    P99(ms)    HitRate
--------           --------    -------    -------    -------    -------
-baseline             53.97      63.89      78.84      88.93      38.0%
-light                55.14      63.77      78.98      86.48      31.0%
-moderate             54.07      63.62      75.59      78.14      32.0%
-heavy                59.44      66.45      80.35      91.36      25.0%
-max_security         62.59      65.86      78.00      80.13      12.0%
+./benchmark/run-all.sh [OPTIONS]
 
-Config           MLEHits  MLEMiss  MLEStor Suppressed    Skipped  Churned
--------          -------  -------  ------- ----------    -------  -------
-baseline              38       62       62          0          0        0
-light                 31       69       69          8          4        0
-moderate              32       68       68          6         15        0
-heavy                 25       75       75          9         19        0
-max_security          12       88       88         12         39        0
+Modes (mutually exclusive):
+  --quick              Smoke test + spot check                    (~5-8 min)
+  --standard           Core 3-config comparison                   (~1 hour)
+  (default)            Full 9-config evaluation                   (~4-7 hrs)
+
+Options:
+  --run-id NAME        Name for results directory (default: auto-generated)
+  --sgx                Run enclaves with SGX (ego run). Required for paper results.
+  --configs 1,4,7      Run only specified configs
+  --workloads cold,warm Run only specified workloads
+  --iterations N       Queries per workload (default: 10000)
+  --warmup N           Warm-up queries to discard (default: 100)
+  --sweep-oram         ORAM capacity sweep (N=256,1024,2048)
+  --sweep-cover        Cover count sweep (k=1,3,5)
+  --zipf-s S           Zipf skew parameter (default: 1.0)
 ```
 
-Note: MLE mode adds ~22ms latency per query due to Argon2id key derivation (intentional rate-limiting).
+---
 
-### Recommended Production Settings
+## Troubleshooting
 
-```bash
-# MLE mode with balanced stochastic defenses (recommended)
-# Client: use --mle flag
-CODOH_HIT_SUPPRESSION_PROB=0.1
-CODOH_INSERT_PROB=0.9
-# Expected: ~55ms mean latency, strong privacy
+**`setup.sh` fails with "SGX hardware required"**
+Your machine needs Intel SGX. Check `ls /dev/sgx*`. Without SGX, remove `--sgx` from run commands to use simulation mode (results won't match the paper).
 
-# MLE + ORAM + High security
-# Client: use --mle flag
-CODOH_USE_ORAM=true
-CODOH_HIT_SUPPRESSION_PROB=0.2
-CODOH_INSERT_PROB=0.8
-CODOH_CHURN_ENABLED=true
-CODOH_CHURN_INTERVAL_SECS=60
-# Expected: ~65ms mean latency, maximum privacy
+**Unbound not responding on port 5353**
+Check for systemd-resolved conflict: `sudo systemctl stop systemd-resolved`. Verify config: `sudo unbound-checkconf`.
 
-# Legacy enclave mode (without MLE, lower latency)
-CODOH_HIT_SUPPRESSION_PROB=0.1
-CODOH_INSERT_PROB=0.9
-# Expected: ~12ms mean latency, good privacy
-```
+**Config 3 fails with "worktree not found"**
+Run `./benchmark/setup.sh` first. It creates the git worktree at `benchmark/worktrees/config3-proxy/`.
+
+**Health check timeout on SGX configs**
+SGX enclave initialization is slow (10-30s). The orchestrator waits up to 45s in SGX mode. If still failing, check enclave logs in `results/<run-id>/raw/enclave.log`.
+
+**Port conflicts**
+Kill leftover processes: `lsof -ti :8080 :8443 :7443 :9080 :9443 :10443 :10444 | xargs kill -9`
+Also: `pkill -f 'ego-host.*enclave'` and `rm -f /tmp/codoh-enclave.sock`
+
+**Prewarm takes too long**
+Increase parallelism: `./benchmark/prewarm-unbound.sh --parallel 100`
+
+---
+
+## Ports Used
+
+| Port | Service |
+|------|---------|
+| 5353 | Unbound (local resolver) |
+| 7443 | DoH server (Config 1) |
+| 8080 | CODoH proxy (Configs 4-7) |
+| 8443 | CODoH target (Configs 4-7) |
+| 8444 | Enclave attestation |
+| 9080 | ODoH proxy (Config 2) |
+| 9443 | ODoH target (Config 2) |
+| 10443 | CODoH-base enclave-proxy (Config 3) |
+| 10444 | CODoH-base target (Config 3) |
+
+## Notes for Artifact Reviewers
+
+- All paper numbers use `--sgx`. Simulation mode (`enclave-sim`) is for development only.
+- Config 3 runs from a pinned git worktree (`e81a315`) because the proxy-mode architecture diverged from the current IPC-based codebase. The crypto primitives are identical.
+- ORAM sweep sizes (256/1024/2048) are chosen to fit within the SGX EPC (~93MB). Larger ORAM trees cause EPC paging and unrepresentative results.
+- Unbound's `cache-min-ttl: 86400` ensures cached entries survive the entire benchmark session. Prewarm once before running.
+- `metadata.json` in each results directory records all run parameters for reproducibility.

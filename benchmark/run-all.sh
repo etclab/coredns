@@ -1,16 +1,25 @@
 #!/bin/bash
 # CODoH Multi-Configuration Benchmark Orchestrator
-# Runs benchmarks across all 7 configurations from the comparison matrix.
+#
+# Run modes:
+#   --quick       Smoke test (10q all configs) + spot check (500q on configs 4,7)  ~5-8 min
+#   --standard    Core comparison (10Kq on configs 2,3,7)                          ~45-90 min
+#   (default)     Full benchmark (10Kq all configs + ablation + sweeps)            ~4-7 hrs
 #
 # Usage:
 #   ./benchmark/run-all.sh [options]
 #
 # Options:
-#   --configs 1,3,5,7    Run only specified configs (default: all)
+#   --run-id NAME        Name for results directory (default: timestamp)
+#   --configs 1,3,5,7    Run only specified configs (default: mode-dependent)
 #   --workloads cold,zipf,warm  Run only specified workloads (default: all)
-#   --iterations N       Queries per workload (default: 1000)
-#   --quick              Quick mode: 100 iterations, cold workload only
+#   --iterations N       Queries per workload (default: 10000)
+#   --warmup N           Warm-up queries to discard (default: 100)
+#   --quick              Quick validation mode
+#   --standard           Standard comparison mode
 #   --sgx                Use SGX enclave (default: simulation)
+#   --sweep-oram         Run ORAM capacity sweep (N=256,1024,2048 on configs 5,7)
+#   --sweep-cover        Run cover count sweep (k=1,3,5 on configs 6,7)
 #   --zipf-s S           Zipf skew parameter (default: 1.0)
 
 set -e
@@ -19,68 +28,98 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 CONFIG_DIR="$SCRIPT_DIR/configs"
 
-# Defaults
-SELECTED_CONFIGS="1,2,3,4,5,6,7"
+# Defaults (full mode)
+RUN_MODE="full"
+RUN_ID=""
+SELECTED_CONFIGS=""
 SELECTED_WORKLOADS="cold,zipf,warm"
-ITERATIONS=1000
+ITERATIONS=10000
+WARMUP_QUERIES=100
 ZIPF_S=1.0
-SGX_MODE=false
+SGX_MODE=true
+SWEEP_ORAM=false
+SWEEP_COVER=false
 
 CLIENT_PATH="$(dirname "$ROOT_DIR")/codoh-client/odoh-client"
 CERT_PATH="$ROOT_DIR/localhost.pem"
-DOMAINS_1M="$SCRIPT_DIR/top-1m.csv"
-DOMAINS_1K="$SCRIPT_DIR/top-1k.csv"
+DOMAINS_1M="$SCRIPT_DIR/top-1m-10k-resolvable.csv"
+DOMAINS_1K="$SCRIPT_DIR/top-1k-resolvable.csv"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --configs)
-            SELECTED_CONFIGS="$2"
-            shift 2
-            ;;
-        --workloads)
-            SELECTED_WORKLOADS="$2"
-            shift 2
-            ;;
-        --iterations)
-            ITERATIONS="$2"
-            shift 2
-            ;;
-        --quick)
-            ITERATIONS=100
-            SELECTED_WORKLOADS="cold"
-            shift
-            ;;
-        --sgx)
-            SGX_MODE=true
-            shift
-            ;;
-        --zipf-s)
-            ZIPF_S="$2"
-            shift 2
-            ;;
+        --run-id)       RUN_ID="$2"; shift 2 ;;
+        --configs)      SELECTED_CONFIGS="$2"; shift 2 ;;
+        --workloads)    SELECTED_WORKLOADS="$2"; shift 2 ;;
+        --iterations)   ITERATIONS="$2"; shift 2 ;;
+        --warmup)       WARMUP_QUERIES="$2"; shift 2 ;;
+        --quick)        RUN_MODE="quick"; shift ;;
+        --standard)     RUN_MODE="standard"; shift ;;
+        --no-sgx)       SGX_MODE=false; shift ;;
+        --sweep-oram)   SWEEP_ORAM=true; shift ;;
+        --sweep-cover)  SWEEP_COVER=true; shift ;;
+        --zipf-s)       ZIPF_S="$2"; shift 2 ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--configs 1,3,5] [--workloads cold,zipf,warm] [--iterations N] [--quick] [--sgx] [--zipf-s S]"
+            echo "Usage: $0 [--run-id NAME] [--configs 1,3,5] [--quick|--standard] [--no-sgx] [--sweep-oram] [--sweep-cover]"
             exit 1
             ;;
     esac
 done
 
+# Apply mode defaults
+case $RUN_MODE in
+    quick)
+        [[ -z "$SELECTED_CONFIGS" ]] && SELECTED_CONFIGS="1,2,3,4,5,6,7"
+        ITERATIONS=10         # Phase 1: smoke
+        WARMUP_QUERIES=0
+        SELECTED_WORKLOADS="warm"
+        ;;
+    standard)
+        [[ -z "$SELECTED_CONFIGS" ]] && SELECTED_CONFIGS="2,3,7"
+        ;;
+    full)
+        [[ -z "$SELECTED_CONFIGS" ]] && SELECTED_CONFIGS="1,2,3,4,4b,4p,5,6,7"
+        ;;
+esac
+
 # Export SGX_MODE so config scripts can use it
 export SGX_MODE
 
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-OUTPUT_DIR="$SCRIPT_DIR/results/comparison_$TIMESTAMP"
-mkdir -p "$OUTPUT_DIR"
+# Results directory
+if [[ -z "$RUN_ID" ]]; then
+    RUN_ID="${RUN_MODE}_$(date +%Y%m%d_%H%M%S)"
+fi
+OUTPUT_BASE="$SCRIPT_DIR/results/$RUN_ID"
+OUTPUT_RAW="$OUTPUT_BASE/raw"
+OUTPUT_PROCESSED="$OUTPUT_BASE/processed"
+mkdir -p "$OUTPUT_RAW" "$OUTPUT_PROCESSED"
 
-echo "=== CODoH Multi-Configuration Benchmark ==="
+# Save run metadata
+cat > "$OUTPUT_BASE/metadata.json" << METAEOF
+{
+    "run_id": "$RUN_ID",
+    "mode": "$RUN_MODE",
+    "iterations": $ITERATIONS,
+    "warmup": $WARMUP_QUERIES,
+    "sgx_mode": $SGX_MODE,
+    "zipf_s": $ZIPF_S,
+    "configs": "$SELECTED_CONFIGS",
+    "workloads": "$SELECTED_WORKLOADS",
+    "timestamp": "$(date -Iseconds)",
+    "hostname": "$(hostname)",
+    "kernel": "$(uname -r)",
+    "config3_commit": "e81a315ec3a91dee1bad2cc2bbf139ebee145ab8"
+}
+METAEOF
+
+echo "=== CODoH Benchmark ($RUN_MODE mode) ==="
+echo "Run ID:     $RUN_ID"
 echo "Configs:    $SELECTED_CONFIGS"
 echo "Workloads:  $SELECTED_WORKLOADS"
-echo "Iterations: $ITERATIONS"
+echo "Iterations: $ITERATIONS (+ $WARMUP_QUERIES warmup)"
 echo "SGX mode:   $SGX_MODE"
-echo "Zipf s:     $ZIPF_S"
-echo "Output:     $OUTPUT_DIR"
+echo "Output:     $OUTPUT_BASE/"
 echo ""
 
 # Convert comma-separated lists to arrays
@@ -94,7 +133,7 @@ cleanup_all() {
     echo "Cleaning up all processes..."
     pkill -9 -f coredns-test 2>/dev/null || true
     pkill -9 -f enclave-sim 2>/dev/null || true
-    pkill -9 -f enclave-sgx 2>/dev/null || true
+    pkill -9 -f 'ego-host.*enclave' 2>/dev/null || true
     pkill -9 -f erthost 2>/dev/null || true
     for port in 7443 8080 8443 9080 9443 10443 10444; do
         lsof -ti :$port 2>/dev/null | xargs kill -9 2>/dev/null || true
@@ -105,34 +144,44 @@ cleanup_all() {
 trap cleanup_all EXIT
 
 #######################################
-# Build all binaries
+# Build binaries (skip in quick mode if already built)
 #######################################
-echo "=== Building Binaries ==="
-cd "$ROOT_DIR"
+build_binaries() {
+    echo "=== Building Binaries ==="
+    cd "$ROOT_DIR"
 
-echo "Building coredns-test..."
-go build -o coredns-test . 2>/dev/null
+    if [[ ! -f "$ROOT_DIR/coredns-test" ]] || [[ "$RUN_MODE" != "quick" ]]; then
+        echo "Building coredns-test..."
+        go build -o coredns-test . 2>/dev/null
+    fi
 
-if $SGX_MODE; then
-    echo "Building SGX enclave..."
-    (cd enclave && ego-go build -o enclave ./cmd && ego sign enclave) 2>/dev/null
-else
-    echo "Building enclave-sim..."
-    go build -o enclave-sim ./enclave/cmd 2>/dev/null
-fi
+    if $SGX_MODE; then
+        if [[ ! -f "$ROOT_DIR/enclave/enclave" ]] || [[ "$RUN_MODE" != "quick" ]]; then
+            echo "Building SGX enclave..."
+            (cd enclave && ego-go build -tags ego -o enclave ./cmd && ego sign enclave.json) 2>/dev/null
+        fi
+    else
+        if [[ ! -f "$ROOT_DIR/enclave-sim" ]] || [[ "$RUN_MODE" != "quick" ]]; then
+            echo "Building enclave-sim..."
+            go build -o enclave-sim ./enclave/cmd 2>/dev/null
+        fi
+    fi
 
-echo "Building odoh-client..."
-(cd "$(dirname "$ROOT_DIR")/codoh-client" && go build -o odoh-client ./cmd 2>/dev/null)
+    if [[ ! -f "$CLIENT_PATH" ]] || [[ "$RUN_MODE" != "quick" ]]; then
+        echo "Building odoh-client..."
+        (cd "$(dirname "$ROOT_DIR")/codoh-client" && go build -o odoh-client ./cmd 2>/dev/null)
+    fi
 
-echo "Build complete."
-echo ""
+    echo "Build complete."
+    echo ""
+}
 
 #######################################
 # Health check with polling
 #######################################
 wait_for_health() {
     local urls="$1"
-    local max_wait="${2:-30}"  # default 30s timeout
+    local max_wait="${2:-30}"
     local all_ok=false
 
     echo "Waiting for services (up to ${max_wait}s)..."
@@ -145,8 +194,8 @@ wait_for_health() {
             fi
         done
         if $all_ok; then
-            echo "All services ready after ${i}s"
-            break
+            echo "  All services ready after ${i}s"
+            return 0
         fi
         sleep 1
     done
@@ -160,17 +209,15 @@ wait_for_health() {
         fi
     done
 
-    if ! $all_ok; then
-        echo "WARNING: Some health checks failed after ${max_wait}s!"
-        return 1
-    fi
+    echo "WARNING: Some health checks failed after ${max_wait}s!"
+    return 1
 }
 
 #######################################
 # Run a single workload
 #######################################
 run_workload() {
-    local config_name=$1 workload=$2 client_args_fn=$3
+    local config_name=$1 workload=$2 client_args_fn=$3 iterations=$4 warmup=$5 output_dir=$6
 
     local distribution domains_path zipf_args=""
     case $workload in
@@ -180,12 +227,11 @@ run_workload() {
             ;;
         zipf)
             distribution="zipf"
-            domains_path="${DOMAINS_1K:-$DOMAINS_1M}"
+            domains_path="$DOMAINS_1K"
             zipf_args="--zipf-s $ZIPF_S"
             ;;
         warm)
             distribution="sequential"
-            # Create single-domain file for warm test (all cache hits)
             echo "1,google.com" > /tmp/warm-domain.csv
             domains_path="/tmp/warm-domain.csv"
             ;;
@@ -195,36 +241,44 @@ run_workload() {
             ;;
     esac
 
-    # Use top-1k for zipf if available, fall back to top-1m
-    if [[ "$workload" == "zipf" && -f "$DOMAINS_1K" ]]; then
-        domains_path="$DOMAINS_1K"
+    local output_prefix="$output_dir/${config_name}_${workload}"
+
+    # Warm-up pass (discarded)
+    if [[ $warmup -gt 0 ]]; then
+        echo "  Warm-up: $warmup queries..."
+        local warmup_args
+        warmup_args=$(eval "$client_args_fn" "'$CERT_PATH'" "'$domains_path'" "'$warmup'" "'$distribution'" "'/tmp/warmup'")
+        eval "$CLIENT_PATH" latency $warmup_args $zipf_args > /dev/null 2>&1 || true
+        rm -f /tmp/warmup.csv /tmp/warmup.json 2>/dev/null
     fi
 
-    local output_prefix="$OUTPUT_DIR/${config_name}_${workload}"
-    echo "  Running $workload workload ($distribution, $ITERATIONS iterations)..."
-
+    # Measured run
+    echo "  Running $workload ($distribution, $iterations queries)..."
     local args
-    args=$(eval "$client_args_fn" "'$CERT_PATH'" "'$domains_path'" "'$ITERATIONS'" "'$distribution'" "'$output_prefix'")
+    args=$(eval "$client_args_fn" "'$CERT_PATH'" "'$domains_path'" "'$iterations'" "'$distribution'" "'$output_prefix'")
 
-    # Run the benchmark
-    if ! eval "$CLIENT_PATH" latency $args $zipf_args 2>&1 | tail -20; then
-        echo "  WARNING: $config_name/$workload benchmark had issues"
+    if ! eval "$CLIENT_PATH" latency $args $zipf_args 2>&1 | tail -5; then
+        echo "  WARNING: $config_name/$workload had issues"
+        return 1
     fi
     echo ""
 }
 
 #######################################
-# Main benchmark loop
+# Run a config across workloads
 #######################################
-SUMMARY_DATA=()
+run_config() {
+    local config_num=$1 iterations=$2 warmup=$3 output_dir=$4
+    shift 4
+    local workloads=("$@")
 
-for config_num in "${CONFIGS[@]}"; do
-    config_file="$CONFIG_DIR/${config_num}-*.sh"
-    config_file=$(ls $config_file 2>/dev/null | head -1)
+    # Find config file (supports numeric and alphanumeric like 4b, 4p)
+    local config_file
+    config_file=$(ls "$CONFIG_DIR/${config_num}-"*.sh 2>/dev/null | head -1)
 
     if [[ -z "$config_file" || ! -f "$config_file" ]]; then
         echo "WARNING: Config $config_num not found, skipping"
-        continue
+        return 1
     fi
 
     # Source the config profile
@@ -232,128 +286,176 @@ for config_num in "${CONFIGS[@]}"; do
 
     echo ""
     echo "========================================"
-    echo "Config $CONFIG_NUM: $CONFIG_NAME ($CONFIG_PROTOCOL)"
+    echo "Config $CONFIG_NUM: $CONFIG_NAME"
     echo "========================================"
 
     # Cleanup previous config's processes
     cleanup_all
 
     # Start this config's processes
-    start_config "$ROOT_DIR" "$CERT_PATH" "$OUTPUT_DIR"
-
-    # Wait for health with polling (longer timeout for SGX)
-    local_timeout=15
-    if $SGX_MODE; then
-        local_timeout=30
+    if ! start_config "$ROOT_DIR" "$CERT_PATH" "$output_dir"; then
+        echo "ERROR: Config $CONFIG_NUM failed to start"
+        return 1
     fi
-    echo "Health check:"
-    if ! wait_for_health "$HEALTH_URLS" "$local_timeout"; then
+
+    # Wait for health
+    local timeout=15
+    if $SGX_MODE; then timeout=45; fi
+    if ! wait_for_health "$HEALTH_URLS" "$timeout"; then
         echo "Skipping config $CONFIG_NUM due to health check failure"
-        continue
+        return 1
     fi
-    echo ""
 
-    # Run selected workloads
-    for workload in "${WORKLOADS[@]}"; do
-        run_workload "$CONFIG_NAME" "$workload" "client_args"
-    done
-
-    # Collect summary for report
-    for workload in "${WORKLOADS[@]}"; do
-        local_summary="$OUTPUT_DIR/${CONFIG_NAME}_${workload}.json"
-        if [[ -f "$local_summary" ]]; then
-            SUMMARY_DATA+=("$CONFIG_NUM|$CONFIG_NAME|$workload|$local_summary")
+    # Run workloads
+    local success=0 fail=0
+    for workload in "${workloads[@]}"; do
+        if run_workload "$CONFIG_NAME" "$workload" "client_args" "$iterations" "$warmup" "$output_dir"; then
+            ((success++)) || true
+        else
+            ((fail++)) || true
         fi
     done
-done
+
+    echo "  Config $CONFIG_NUM: $success passed, $fail failed"
+    return 0
+}
 
 #######################################
-# Generate comparison plot (gnuplot)
+# Quick mode
 #######################################
-echo ""
-echo "=== Generating Plot ==="
+run_quick() {
+    # Phase 1: Smoke — 50 queries, warm workload, all configs
+    echo "=== Phase 1: Smoke Test (50 queries, warm, all configs) ==="
+    local smoke_pass=0 smoke_fail=0
+    local smoke_file="$OUTPUT_RAW/smoke.txt"
+    : > "$smoke_file"
 
-# Write per-workload data files (one row per config)
-for workload in "${WORKLOADS[@]}"; do
-    dat="$OUTPUT_DIR/${workload}.dat"
-    : > "$dat"
-    for entry in "${SUMMARY_DATA[@]}"; do
-        IFS='|' read -r cfg_num cfg_name wkload json_file <<< "$entry"
-        [[ "$wkload" != "$workload" || ! -f "$json_file" ]] && continue
-        python3 -c "
-import json
-d = json.load(open('$json_file'))
-l = d['latency_ms']
-print('\"$cfg_name\"', f\"{l['mean']:.2f}\", f\"{l['p50']:.2f}\", f\"{l['p95']:.2f}\", f\"{l['p99']:.2f}\", f\"{d['throughput_qps']:.1f}\")
-" >> "$dat" 2>/dev/null
+    for config_num in "${CONFIGS[@]}"; do
+        if run_config "$config_num" 50 10 "$OUTPUT_RAW" "warm"; then
+            echo "PASS  Config $config_num" >> "$smoke_file"
+            ((smoke_pass++)) || true
+        else
+            echo "FAIL  Config $config_num" >> "$smoke_file"
+            ((smoke_fail++)) || true
+        fi
     done
 
-    # Transpose for plotting: rows=metrics, columns=configs
-    python3 -c "
-import sys
-rows = [line.split() for line in open('$dat') if line.strip()]
-if not rows: sys.exit()
-names = [r[0] for r in rows]
-metrics = ['\"Mean\"','\"P50\"','\"P95\"','\"P99\"']
-print('\"Metric\"', ' '.join(names))
-for i, m in enumerate(metrics):
-    print(m, ' '.join(r[i+1] for r in rows))
-" > "$OUTPUT_DIR/${workload}_plot.dat" 2>/dev/null
-done
+    echo ""
+    echo "Smoke results: $smoke_pass passed, $smoke_fail failed"
+    cat "$smoke_file"
 
-# Build gnuplot script
-NUM_WL=${#WORKLOADS[@]}
-PLOT_PNG="$OUTPUT_DIR/comparison.png"
-GP_SCRIPT="$OUTPUT_DIR/plot.gp"
-
-{
-    echo "set terminal pngcairo size 1200,$((400 * NUM_WL)) enhanced font 'Arial,12'"
-    echo "set output '$PLOT_PNG'"
-    echo "set style data histogram"
-    echo "set style histogram clustered gap 1"
-    echo "set style fill solid 0.8 border -1"
-    echo "set key outside top right"
-    echo "set grid ytics"
-    if [[ $NUM_WL -gt 1 ]]; then
-        echo "set multiplot layout $NUM_WL,1"
+    if [[ $smoke_fail -gt 0 ]]; then
+        echo "WARNING: Some configs failed smoke test!"
     fi
 
-    for workload in "${WORKLOADS[@]}"; do
-        # Count config columns from the transposed file
-        ncols=$(head -1 "$OUTPUT_DIR/${workload}_plot.dat" | wc -w)
-        echo "set title '${workload} workload — Latency (ms)'"
-        echo "set ylabel 'Latency (ms)'"
-        plot_cmd="plot '$OUTPUT_DIR/${workload}_plot.dat' using 2:xtic(1) title columnheader(2)"
-        for (( c=3; c<=ncols; c++ )); do
-            plot_cmd="$plot_cmd, '' using $c title columnheader($c)"
-        done
-        echo "$plot_cmd"
+    # Phase 2: Spot check — 1000 queries, all 3 workloads, configs 2, 4, 7
+    echo ""
+    echo "=== Phase 2: Spot Check (1000 queries, all workloads, configs 2+4+7) ==="
+    for config_num in 2 4 7; do
+        run_config "$config_num" 1000 50 "$OUTPUT_RAW" "cold" "zipf" "warm"
+    done
+}
+
+#######################################
+# Standard mode
+#######################################
+run_standard() {
+    echo "=== Standard Comparison (configs 2,3,7) ==="
+    for config_num in "${CONFIGS[@]}"; do
+        run_config "$config_num" "$ITERATIONS" "$WARMUP_QUERIES" "$OUTPUT_RAW" "${WORKLOADS[@]}"
+    done
+}
+
+#######################################
+# Full mode
+#######################################
+run_full() {
+    echo "=== Full Benchmark ==="
+
+    # Main comparison
+    echo ""
+    echo "--- Main Comparison ---"
+    for config_num in "${CONFIGS[@]}"; do
+        run_config "$config_num" "$ITERATIONS" "$WARMUP_QUERIES" "$OUTPUT_RAW" "${WORKLOADS[@]}"
+    done
+
+    # ORAM capacity sweep
+    if $SWEEP_ORAM; then
         echo ""
-    done
-
-    if [[ $NUM_WL -gt 1 ]]; then
-        echo "unset multiplot"
+        echo "--- ORAM Capacity Sweep ---"
+        for oram_n in 256 2048; do  # 1024 already covered in main
+            for config_num in 5 7; do
+                export CODOH_CACHE_SIZE=$oram_n
+                local sweep_dir="$OUTPUT_RAW/sweep_oram_${oram_n}"
+                mkdir -p "$sweep_dir"
+                run_config "$config_num" "$ITERATIONS" "$WARMUP_QUERIES" "$sweep_dir" "${WORKLOADS[@]}"
+                unset CODOH_CACHE_SIZE
+            done
+        done
     fi
-} > "$GP_SCRIPT"
 
-gnuplot "$GP_SCRIPT"
+    # Cover count sweep
+    if $SWEEP_COVER; then
+        echo ""
+        echo "--- Cover Count Sweep ---"
+        for cover_k in 1 5; do  # k=3 already covered in main
+            for config_num in 6 7; do
+                export CODOH_COVER_COUNT=$cover_k
+                local sweep_dir="$OUTPUT_RAW/sweep_cover_${cover_k}"
+                mkdir -p "$sweep_dir"
+                run_config "$config_num" "$ITERATIONS" "$WARMUP_QUERIES" "$sweep_dir" "${WORKLOADS[@]}"
+                unset CODOH_COVER_COUNT
+            done
+        done
+    fi
+}
 
-# Print summary table to console
-echo ""
-printf "%-20s %-8s %8s %8s %8s %8s %8s\n" "Config" "Workload" "Mean" "P50" "P95" "P99" "QPS"
-printf "%-20s %-8s %8s %8s %8s %8s %8s\n" "------" "--------" "------" "------" "------" "------" "------"
-for entry in "${SUMMARY_DATA[@]}"; do
-    IFS='|' read -r cfg_num cfg_name wkload json_file <<< "$entry"
-    [[ ! -f "$json_file" ]] && continue
-    python3 -c "
-import json
+#######################################
+# Summary table
+#######################################
+print_summary() {
+    echo ""
+    echo "=== Results Summary ==="
+    echo ""
+    printf "%-20s %-8s %10s %10s %10s %10s\n" "Config" "Workload" "Median" "P95" "P99" "QPS"
+    printf "%-20s %-8s %10s %10s %10s %10s\n" "------" "--------" "------" "------" "------" "------"
+
+    for json_file in "$OUTPUT_RAW"/*.json "$OUTPUT_RAW"/sweep_*/*.json; do
+        [[ -f "$json_file" ]] || continue
+        [[ "$(basename "$json_file")" == "metadata.json" ]] && continue
+        python3 -c "
+import json, os
 d = json.load(open('$json_file'))
-l = d['latency_ms']
-print(f\"{'$cfg_name':<20} {'$wkload':<8} {l['mean']:>8.2f} {l['p50']:>8.2f} {l['p95']:>8.2f} {l['p99']:>8.2f} {d['throughput_qps']:>8.1f}\")
+l = d.get('latency_ms', {})
+name = os.path.basename('$json_file').replace('.json','')
+parts = name.rsplit('_', 1)
+cfg, wl = parts[0], parts[1] if len(parts) == 2 else '?'
+print(f'{cfg:<20} {wl:<8} {l.get(\"p50\",0):>10.2f} {l.get(\"p95\",0):>10.2f} {l.get(\"p99\",0):>10.2f} {d.get(\"throughput_qps\",0):>10.1f}')
 " 2>/dev/null
-done
+    done
+}
+
+#######################################
+# Main
+#######################################
+build_binaries
+
+case $RUN_MODE in
+    quick)    run_quick ;;
+    standard) run_standard ;;
+    full)     run_full ;;
+esac
+
+print_summary
 
 echo ""
 echo "=== Benchmark Complete ==="
-echo "Results: $OUTPUT_DIR/"
-echo "Plot:    $PLOT_PNG"
+echo "Results: $OUTPUT_BASE/"
+echo "Raw:     $OUTPUT_RAW/"
+
+# Exit non-zero if quick mode had smoke failures
+if [[ "$RUN_MODE" == "quick" && -f "$OUTPUT_RAW/smoke.txt" ]]; then
+    if grep -q "FAIL" "$OUTPUT_RAW/smoke.txt"; then
+        exit 1
+    fi
+fi

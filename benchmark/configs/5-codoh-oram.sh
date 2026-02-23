@@ -2,6 +2,7 @@
 # Config 5: CODoH IPC with ORAM cache
 # Architecture: Same as Config 4 (3-process IPC)
 # Adds: ORAM-backed cache for access pattern hiding
+# CODOH_CACHE_SIZE controls ORAM capacity (default 1024, sweep: 256/1024/2048)
 
 CONFIG_NAME="codoh-oram"
 CONFIG_NUM=5
@@ -10,11 +11,19 @@ CONFIG_PROTOCOL="codoh"
 start_config() {
     local root_dir=$1 cert_path=$2 output_dir=$3
 
-    # Start enclave (simulation mode, ORAM cache)
-    echo "Starting enclave (simulation, ORAM cache)..."
-    CODOH_USE_ORAM=true \
-        "$root_dir/enclave-sim" \
-        > "$output_dir/enclave.log" 2>&1 &
+    # Start enclave (ORAM cache)
+    echo "Starting enclave (ORAM cache, N=${CODOH_CACHE_SIZE:-1024})..."
+    if [[ "${SGX_MODE:-false}" == "true" ]]; then
+        CODOH_USE_ORAM=true \
+        CODOH_CACHE_SIZE="${CODOH_CACHE_SIZE:-1024}" \
+            ego run "$root_dir/enclave/enclave" \
+            > "$output_dir/enclave.log" 2>&1 &
+    else
+        CODOH_USE_ORAM=true \
+        CODOH_CACHE_SIZE="${CODOH_CACHE_SIZE:-1024}" \
+            "$root_dir/enclave-sim" \
+            > "$output_dir/enclave.log" 2>&1 &
+    fi
     sleep 2
 
     echo "Starting CODoH target on port 8443..."
