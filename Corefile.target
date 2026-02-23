@@ -1,12 +1,12 @@
 # CODoH Target Server
 # Handles: ODoH key distribution, DNS resolution, cache-insert encryption
 
-.:5353 {
+.:25356 {
     codohtarget {
         port 8443
         tls_cert localhost.pem
         tls_key localhost-key.pem
-        upstream 8.8.8.8:53
+        upstream 127.0.0.1:5353
         signing_key /tmp/target-signing.pem
         enclave_url https://127.0.0.1:8444
         log_queries true

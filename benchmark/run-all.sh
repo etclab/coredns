@@ -17,7 +17,7 @@
 #   --warmup N           Warm-up queries to discard (default: 100)
 #   --quick              Quick validation mode
 #   --standard           Standard comparison mode
-#   --sgx                Use SGX enclave (default: simulation)
+#   --no-sgx             Use simulation mode (default: SGX)
 #   --sweep-oram         Run ORAM capacity sweep (N=256,1024,2048 on configs 5,7)
 #   --sweep-cover        Run cover count sweep (k=1,3,5 on configs 6,7)
 #   --zipf-s S           Zipf skew parameter (default: 1.0)
@@ -177,6 +177,43 @@ build_binaries() {
 }
 
 #######################################
+# Wait for enclave (IPC configs)
+#######################################
+# Phase 1: Wait for attestation server (port 8444) — call after starting enclave
+wait_for_enclave_attest() {
+    local port="${1:-8444}"
+    local max_wait="${2:-30}"
+
+    echo "Waiting for enclave attestation (port $port, up to ${max_wait}s)..."
+    for i in $(seq 1 "$max_wait"); do
+        if curl -sk "https://127.0.0.1:$port/attest" > /dev/null 2>&1; then
+            echo "  Enclave attestation ready after ${i}s"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "WARNING: Enclave attestation not ready after ${max_wait}s!"
+    return 1
+}
+
+# Phase 2: Wait for IPC socket — call after starting target (which provisions the enclave)
+wait_for_enclave_socket() {
+    local socket="${1:-/tmp/codoh-enclave.sock}"
+    local max_wait="${2:-30}"
+
+    echo "Waiting for enclave socket (up to ${max_wait}s)..."
+    for i in $(seq 1 "$max_wait"); do
+        if [[ -S "$socket" ]]; then
+            echo "  Enclave socket ready after ${i}s"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "WARNING: Enclave socket not found after ${max_wait}s!"
+    return 1
+}
+
+#######################################
 # Health check with polling
 #######################################
 wait_for_health() {
@@ -219,6 +256,9 @@ wait_for_health() {
 run_workload() {
     local config_name=$1 workload=$2 client_args_fn=$3 iterations=$4 warmup=$5 output_dir=$6
 
+    # Allow per-config client override (e.g., Config 3 worktree client)
+    local client_bin="${CONFIG_CLIENT_PATH:-$CLIENT_PATH}"
+
     local distribution domains_path zipf_args=""
     case $workload in
         cold)
@@ -248,7 +288,7 @@ run_workload() {
         echo "  Warm-up: $warmup queries..."
         local warmup_args
         warmup_args=$(eval "$client_args_fn" "'$CERT_PATH'" "'$domains_path'" "'$warmup'" "'$distribution'" "'/tmp/warmup'")
-        eval "$CLIENT_PATH" latency $warmup_args $zipf_args > /dev/null 2>&1 || true
+        eval "$client_bin" latency $warmup_args $zipf_args > /dev/null 2>&1 || true
         rm -f /tmp/warmup.csv /tmp/warmup.json 2>/dev/null
     fi
 
@@ -257,7 +297,7 @@ run_workload() {
     local args
     args=$(eval "$client_args_fn" "'$CERT_PATH'" "'$domains_path'" "'$iterations'" "'$distribution'" "'$output_prefix'")
 
-    if ! eval "$CLIENT_PATH" latency $args $zipf_args 2>&1 | tail -5; then
+    if ! eval "$client_bin" latency $args $zipf_args 2>&1 | tail -5; then
         echo "  WARNING: $config_name/$workload had issues"
         return 1
     fi
@@ -280,6 +320,9 @@ run_config() {
         echo "WARNING: Config $config_num not found, skipping"
         return 1
     fi
+
+    # Reset per-config overrides
+    CONFIG_CLIENT_PATH=""
 
     # Source the config profile
     source "$config_file"

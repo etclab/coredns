@@ -1,6 +1,6 @@
 # ODoH Target Server (Baseline)
 # Standard ODoH without CODoH extensions
-.:5353 {
+.:25353 {
     odohtarget {
         port 9443
         tls_cert localhost.pem

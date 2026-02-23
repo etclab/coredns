@@ -1,6 +1,6 @@
 # CODoH-base Target Server (Config 3)
 # Standard ODoH target with X-Enclave-Cache support (no token issuance)
-.:5353 {
+.:25355 {
     codohtarget {
         port 10444
         tls_cert localhost.pem

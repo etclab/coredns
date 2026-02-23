@@ -24,12 +24,12 @@ start_config() {
             "$root_dir/enclave-sim" \
             > "$output_dir/enclave.log" 2>&1 &
     fi
-    sleep 2
+    wait_for_enclave_attest
 
     echo "Starting CODoH target on port 8443..."
     "$root_dir/coredns-test" -conf "$root_dir/Corefile.target" \
         > "$output_dir/codoh-target.log" 2>&1 &
-    sleep 2
+    wait_for_enclave_socket
 
     echo "Starting CODoH proxy on port 8080..."
     "$root_dir/coredns-test" -conf "$root_dir/Corefile.proxy" \

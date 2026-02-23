@@ -213,6 +213,19 @@ if grep -q 'pathoram-go v0.1.0' "$WORKTREE_DIR/go.mod" || grep -q 'go 1.25.5' "$
     (cd "$WORKTREE_DIR" && GOFLAGS=-mod=mod go mod tidy 2>&1 | tail -3)
 fi
 
+# Patch protocol compatibility: the pinned commit uses v1 HPKE info string
+# and X-ODoH-Blob header, but the current client uses "codoh transport key"
+# and X-CoDOH-Query.
+if grep -q 'codoh-enclave-v1' "$WORKTREE_DIR/enclave/crypto.go"; then
+    echo "  Patching HPKE info string and header name for client compatibility..."
+    sed -i 's/codoh-enclave-v1/codoh transport key/' "$WORKTREE_DIR/enclave/crypto.go"
+    sed -i 's/X-ODoH-Blob/X-CoDOH-Query/g' "$WORKTREE_DIR/enclave/cmd/proxy_mode.go"
+fi
+# Also patch codohtarget plugin in worktree (used by Config 3 target)
+if grep -q 'codoh-enclave-v1' "$WORKTREE_DIR/plugin/codohtarget/enclave_encrypt.go" 2>/dev/null; then
+    sed -i 's/codoh-enclave-v1/codoh transport key/' "$WORKTREE_DIR/plugin/codohtarget/enclave_encrypt.go"
+fi
+
 # Build Config 3 binaries from worktree
 echo "  Building Config 3 binaries from worktree..."
 (cd "$WORKTREE_DIR" && go build -o coredns-test . 2>&1 | tail -5)

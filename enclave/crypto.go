@@ -19,7 +19,7 @@ var (
 	kdfID  = hpke.KDF_HKDF_SHA256
 	aeadID = hpke.AEAD_AES128GCM
 	suite  = hpke.NewSuite(kemID, kdfID, aeadID)
-	info = []byte("codoh-enclave-v2")
+	info = []byte("codoh transport key")
 
 	// ExportLabel is the HPKE export label for deriving the response key k_r.
 	ExportLabel = []byte("codoh response")

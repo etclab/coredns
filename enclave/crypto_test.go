@@ -13,7 +13,7 @@ func TestHPKEExport(t *testing.T) {
 	kdfID := hpke.KDF_HKDF_SHA256
 	aeadID := hpke.AEAD_AES128GCM
 	suite := hpke.NewSuite(kemID, kdfID, aeadID)
-	info := []byte("codoh-enclave-v2")
+	info := []byte("codoh transport key")
 
 	// Generate receiver keypair
 	pub, priv, err := kemID.Scheme().GenerateKeyPair()
@@ -80,7 +80,7 @@ func TestHPKEExportDifferentSessions(t *testing.T) {
 	kdfID := hpke.KDF_HKDF_SHA256
 	aeadID := hpke.AEAD_AES128GCM
 	suite := hpke.NewSuite(kemID, kdfID, aeadID)
-	info := []byte("codoh-enclave-v2")
+	info := []byte("codoh transport key")
 
 	pub, priv, err := kemID.Scheme().GenerateKeyPair()
 	if err != nil {

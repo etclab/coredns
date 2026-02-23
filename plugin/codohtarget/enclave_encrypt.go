@@ -13,7 +13,7 @@ var (
 	enclaveKdfID  = hpke.KDF_HKDF_SHA256
 	enclaveAeadID = hpke.AEAD_AES128GCM
 	enclaveSuite  = hpke.NewSuite(enclaveKemID, enclaveKdfID, enclaveAeadID)
-	enclaveInfo   = []byte("codoh-enclave-v2")
+	enclaveInfo   = []byte("codoh transport key")
 )
 
 // EncryptForEnclave encrypts data using the enclave's HPKE public key.

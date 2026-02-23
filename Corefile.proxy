@@ -1,7 +1,7 @@
 # CODoH Proxy Server
 # Handles: client connections, enclave IPC, target forwarding
 
-.:5353 {
+.:25357 {
     codohproxy {
         target https://127.0.0.1:8443/dns-query
         port 8080
