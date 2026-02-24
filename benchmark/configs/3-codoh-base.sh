@@ -31,7 +31,7 @@ start_config() {
     local wt="$WORKTREE_DIR"
 
     echo "Starting CODoH-base target on port 10444..."
-    "$wt/coredns-test" -conf "$root_dir/benchmark/Corefile.codoh-base-target" \
+    "$wt/coredns-test" -conf "$COREFILE_DIR/Corefile.codoh-base-target" \
         > "$output_dir/codoh-base-target.log" 2>&1 &
     sleep 2
 
@@ -52,7 +52,7 @@ start_config() {
             -https-port 10443 \
             -tls-cert "$enclave_cert" \
             -tls-key "$enclave_key" \
-            -target "https://127.0.0.1:10444" \
+            -target "https://${TARGET_IP:-127.0.0.1}:10444" \
             > "$output_dir/enclave-proxy.log" 2>&1 &
     else
         "$wt/enclave-sim" \
@@ -60,19 +60,19 @@ start_config() {
             -https-port 10443 \
             -tls-cert "$enclave_cert" \
             -tls-key "$enclave_key" \
-            -target "https://127.0.0.1:10444" \
+            -target "https://${TARGET_IP:-127.0.0.1}:10444" \
             > "$output_dir/enclave-proxy.log" 2>&1 &
     fi
 
-    HEALTH_URLS="https://127.0.0.1:10443/health https://127.0.0.1:10444/health"
+    HEALTH_URLS="https://${PROXY_IP:-127.0.0.1}:10443/health https://${TARGET_IP:-127.0.0.1}:10444/health"
 }
 
 client_args() {
     local cert_path=$1 domains_path=$2 iterations=$3 distribution=$4 output_prefix=$5
 
     echo "--protocol codoh-base \
-        --target 127.0.0.1:10444 \
-        --proxy 127.0.0.1:10443 \
+        --target ${TARGET_IP:-127.0.0.1}:10444 \
+        --proxy ${PROXY_IP:-127.0.0.1}:10443 \
         --distribution $distribution \
         --iterations $iterations \
         --customcert $cert_path \

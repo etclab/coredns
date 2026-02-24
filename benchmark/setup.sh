@@ -123,10 +123,13 @@ else
         (cd "$ROOT_DIR" && mkcert -cert-file localhost.pem -key-file localhost-key.pem localhost 127.0.0.1)
     else
         echo "  Generating self-signed cert with openssl..."
+        local san="DNS:localhost,IP:127.0.0.1"
+        [[ -n "${PROXY_IP:-}" ]] && san="${san},IP:${PROXY_IP}"
+        [[ -n "${TARGET_IP:-}" ]] && san="${san},IP:${TARGET_IP}"
         openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
             -keyout "$ROOT_DIR/localhost-key.pem" -out "$ROOT_DIR/localhost.pem" \
             -days 365 -nodes -subj "/CN=localhost" \
-            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null
+            -addext "subjectAltName=${san}" 2>/dev/null
     fi
     echo "  Certs: generated"
 fi
@@ -205,11 +208,11 @@ fi
 # Patch go.mod version to match ego-go (1.25.1) — the pinned commit
 # uses 1.25.5 which is newer than the ego SDK ships.
 # Patch go.mod: downgrade go version to match ego-go (1.25.1) and bump
-# pathoram-go from v0.1.0 (requires go 1.25.5) to v0.1.1 (supports 1.25.1).
-if grep -q 'pathoram-go v0.1.0' "$WORKTREE_DIR/go.mod" || grep -q 'go 1.25.5' "$WORKTREE_DIR/go.mod"; then
+# pathoram-go to v0.1.2 (supports 1.25.1, adds WriteBatch).
+if grep -q 'pathoram-go v0.1.0\|pathoram-go v0.1.1' "$WORKTREE_DIR/go.mod" || grep -q 'go 1.25.5' "$WORKTREE_DIR/go.mod"; then
     echo "  Patching go.mod for ego-go compatibility..."
     sed -i 's/^go 1.25.5/go 1.25.1/' "$WORKTREE_DIR/go.mod"
-    sed -i 's|pathoram-go v0.1.0|pathoram-go v0.1.1|' "$WORKTREE_DIR/go.mod"
+    sed -i 's|pathoram-go v0.1.[01]|pathoram-go v0.1.2|' "$WORKTREE_DIR/go.mod"
     (cd "$WORKTREE_DIR" && GOFLAGS=-mod=mod go mod tidy 2>&1 | tail -3)
 fi
 

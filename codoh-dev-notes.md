@@ -451,3 +451,76 @@ Results saved to `benchmark/results/<timestamp>/`:
 - `../codoh-client/odoh-client` built
 - `localhost.pem` and `localhost-key.pem` in project root
 - `benchmark/top-1m.csv` domain list (and optionally `top-1k.csv`)
+
+### Cloud Benchmarks (Multi-VM)
+
+Multi-VM setup for measuring realistic cross-network latency. Three VMs: **Proxy** (SGX enclave + codohproxy), **Target** (codohtarget + resolver), **Client** (odoh-client).
+
+```
+Client VM ──HTTPS──▶ Proxy VM (SGX) ──HTTPS──▶ Target VM
+ odoh-client          enclave + proxy            codohtarget + resolver
+                      (Unix socket)
+```
+
+**Setup:**
+
+```bash
+# 1. Configure IPs
+cp benchmark/cloud-env.sh benchmark/cloud-env.local.sh
+# Edit cloud-env.local.sh: set PROXY_IP, TARGET_IP
+
+# 2. Provision each VM (run ON the VM)
+./benchmark/cloud-setup.sh proxy    # on DCsv3 (SGX) VM
+./benchmark/cloud-setup.sh target   # on target VM
+./benchmark/cloud-setup.sh client   # on client VM
+```
+
+**Running (from client VM):**
+
+```bash
+./benchmark/cloud-run.sh --quick                # smoke test (configs 2,4,7, 50q)
+./benchmark/cloud-run.sh --standard             # comparison (configs 2,3,7, 10Kq)
+./benchmark/cloud-run.sh --configs 2,3,7 --iterations 5000
+./benchmark/cloud-run.sh --no-sgx               # simulation mode
+```
+
+**Options:**
+
+| Flag | Description |
+|------|-------------|
+| `--configs 2,3,7` | Run specific configs only |
+| `--quick` | 50 queries, warm workload, configs 2,4,7 |
+| `--standard` | 10K queries, all workloads, configs 2,3,7 |
+| `--no-sgx` | Use enclave-sim instead of SGX |
+| `--resolver cloudflare` | Upstream resolver (cloudflare/google/HOST:PORT) |
+| `--run-id NAME` | Name for results directory |
+
+**Port/VM Matrix:**
+
+| Port | Process | VM | Configs |
+|------|---------|-----|---------|
+| 8080 | codohproxy | Proxy | 4-7 |
+| 8444 | enclave attestation | Proxy | 4-7 |
+| 9080 | odohproxy | Proxy | 2 |
+| 10443 | enclave-proxy (config 3) | Proxy | 3 |
+| 7443 | DoH server | Target | 1 |
+| 8443 | codohtarget | Target | 4-7 |
+| 9443 | odohtarget | Target | 2 |
+| 10444 | codoh-base-target | Target | 3 |
+
+**Collecting Logs:**
+
+```bash
+./benchmark/cloud-collect-logs.sh <run-id>
+```
+
+**Files:**
+
+| File | Purpose |
+|------|---------|
+| `benchmark/cloud-env.sh` | Template env (copy to `cloud-env.local.sh`) |
+| `benchmark/cloud-setup.sh` | Per-VM provisioner (`proxy\|target\|client`) |
+| `benchmark/cloud-run.sh` | Cross-VM orchestrator (runs from client VM) |
+| `benchmark/cloud-collect-logs.sh` | Post-run log fetcher |
+
+Local single-machine benchmarks still work unchanged via `./benchmark/run-all.sh` — config IP vars default to `127.0.0.1`.

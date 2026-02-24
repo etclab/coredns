@@ -25,27 +25,27 @@ start_config() {
     echo "Starting CODoH target on port 8443 (covers k=${CODOH_COVER_COUNT:-3})..."
     CODOH_COVER_COUNT="${CODOH_COVER_COUNT:-3}" \
     CODOH_COVER_DOMAIN_FILE="$root_dir/benchmark/top-1k-resolvable.csv" \
-    CODOH_PROXY_CALLBACK_URL="https://127.0.0.1:8080" \
-    CODOH_COVER_RESOLVER="127.0.0.1:5353" \
+    CODOH_PROXY_CALLBACK_URL="https://${PROXY_IP:-127.0.0.1}:8080" \
+    CODOH_COVER_RESOLVER="$UPSTREAM_RESOLVER" \
     CODOH_COVER_TIMEOUT_MS=2000 \
-        "$root_dir/coredns-test" -conf "$root_dir/Corefile.target" \
+        "$root_dir/coredns-test" -conf "$COREFILE_DIR/Corefile.target" \
         > "$output_dir/codoh-target.log" 2>&1 &
     wait_for_enclave_socket
 
     echo "Starting CODoH proxy on port 8080..."
-    "$root_dir/coredns-test" -conf "$root_dir/Corefile.proxy" \
+    "$root_dir/coredns-test" -conf "$COREFILE_DIR/Corefile.proxy" \
         > "$output_dir/codoh-proxy.log" 2>&1 &
     sleep 2
 
-    HEALTH_URLS="https://127.0.0.1:8080/health https://127.0.0.1:8443/health"
+    HEALTH_URLS="https://${PROXY_IP:-127.0.0.1}:8080/health https://${TARGET_IP:-127.0.0.1}:8443/health"
 }
 
 client_args() {
     local cert_path=$1 domains_path=$2 iterations=$3 distribution=$4 output_prefix=$5
 
     echo "--protocol codoh \
-        --target 127.0.0.1:8443 \
-        --proxy 127.0.0.1:8080 \
+        --target ${TARGET_IP:-127.0.0.1}:8443 \
+        --proxy ${PROXY_IP:-127.0.0.1}:8080 \
         --distribution $distribution \
         --iterations $iterations \
         --customcert $cert_path \

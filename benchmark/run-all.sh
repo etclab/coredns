@@ -20,6 +20,7 @@
 #   --no-sgx             Use simulation mode (default: SGX)
 #   --sweep-oram         Run ORAM capacity sweep (N=256,1024,2048 on configs 5,7)
 #   --sweep-cover        Run cover count sweep (k=1,3,5 on configs 6,7)
+#   --resolver NAME      Upstream resolver: unbound (default), cloudflare, google, or HOST:PORT
 #   --zipf-s S           Zipf skew parameter (default: 1.0)
 
 set -e
@@ -39,6 +40,7 @@ ZIPF_S=1.0
 SGX_MODE=true
 SWEEP_ORAM=false
 SWEEP_COVER=false
+RESOLVER="unbound"
 
 CLIENT_PATH="$(dirname "$ROOT_DIR")/codoh-client/odoh-client"
 CERT_PATH="$ROOT_DIR/localhost.pem"
@@ -59,9 +61,10 @@ while [[ $# -gt 0 ]]; do
         --sweep-oram)   SWEEP_ORAM=true; shift ;;
         --sweep-cover)  SWEEP_COVER=true; shift ;;
         --zipf-s)       ZIPF_S="$2"; shift 2 ;;
+        --resolver)     RESOLVER="$2"; shift 2 ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--run-id NAME] [--configs 1,3,5] [--quick|--standard] [--no-sgx] [--sweep-oram] [--sweep-cover]"
+            echo "Usage: $0 [--run-id NAME] [--configs 1,3,5] [--quick|--standard] [--no-sgx] [--resolver unbound|cloudflare|google|HOST:PORT] [--sweep-oram] [--sweep-cover]"
             exit 1
             ;;
     esac
@@ -86,6 +89,23 @@ esac
 # Export SGX_MODE so config scripts can use it
 export SGX_MODE
 
+# Map resolver name to address
+case $RESOLVER in
+    unbound)    UPSTREAM_RESOLVER="127.0.0.1:5353" ;;
+    cloudflare) UPSTREAM_RESOLVER="1.1.1.1:53" ;;
+    google)     UPSTREAM_RESOLVER="8.8.8.8:53" ;;
+    *)
+        # Treat as raw host:port
+        if [[ "$RESOLVER" == *:* ]]; then
+            UPSTREAM_RESOLVER="$RESOLVER"
+        else
+            echo "ERROR: Invalid resolver '$RESOLVER'. Use: unbound, cloudflare, google, or HOST:PORT"
+            exit 1
+        fi
+        ;;
+esac
+export UPSTREAM_RESOLVER
+
 # Results directory
 if [[ -z "$RUN_ID" ]]; then
     RUN_ID="${RUN_MODE}_$(date +%Y%m%d_%H%M%S)"
@@ -95,6 +115,18 @@ OUTPUT_RAW="$OUTPUT_BASE/raw"
 OUTPUT_PROCESSED="$OUTPUT_BASE/processed"
 mkdir -p "$OUTPUT_RAW" "$OUTPUT_PROCESSED"
 
+# Generate Corefiles with selected resolver
+COREFILE_DIR="$OUTPUT_BASE/corefiles"
+export COREFILE_DIR
+mkdir -p "$COREFILE_DIR"
+
+for cf in "$SCRIPT_DIR/Corefile.doh" "$SCRIPT_DIR/Corefile.odoh-target" "$SCRIPT_DIR/Corefile.odoh-proxy" \
+          "$SCRIPT_DIR/Corefile.codoh-base-target" "$ROOT_DIR/Corefile.target" "$ROOT_DIR/Corefile.proxy"; do
+    if [[ -f "$cf" ]]; then
+        sed "s|127\.0\.0\.1:5353|$UPSTREAM_RESOLVER|g" "$cf" > "$COREFILE_DIR/$(basename "$cf")"
+    fi
+done
+
 # Save run metadata
 cat > "$OUTPUT_BASE/metadata.json" << METAEOF
 {
@@ -103,6 +135,8 @@ cat > "$OUTPUT_BASE/metadata.json" << METAEOF
     "iterations": $ITERATIONS,
     "warmup": $WARMUP_QUERIES,
     "sgx_mode": $SGX_MODE,
+    "resolver": "$RESOLVER",
+    "upstream_resolver": "$UPSTREAM_RESOLVER",
     "zipf_s": $ZIPF_S,
     "configs": "$SELECTED_CONFIGS",
     "workloads": "$SELECTED_WORKLOADS",
@@ -118,6 +152,7 @@ echo "Run ID:     $RUN_ID"
 echo "Configs:    $SELECTED_CONFIGS"
 echo "Workloads:  $SELECTED_WORKLOADS"
 echo "Iterations: $ITERATIONS (+ $WARMUP_QUERIES warmup)"
+echo "Resolver:   $RESOLVER ($UPSTREAM_RESOLVER)"
 echo "SGX mode:   $SGX_MODE"
 echo "Output:     $OUTPUT_BASE/"
 echo ""

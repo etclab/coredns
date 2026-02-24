@@ -160,15 +160,15 @@ SGX has no trusted clock. The enclave maintains `t_latest` (highest timestamp se
 | **Enclave Core** | | |
 | HPKE keypair + decrypt/encrypt | enclave/crypto.go | Suite: X25519/HKDF-SHA256/AES-128-GCM |
 | HPKE Export key derivation (k_r) | enclave/crypto.go | Label: "codoh response" |
-| IPC server (Unix socket) | enclave/ipc.go | 4-byte length + JSON wire protocol |
+| IPC server (Unix socket) | enclave/ipc.go | Binary wire protocol: [4B len][1B type/status][payload] |
 | LRU cache with logical-time TTL | enclave/cache.go | container/list, sync.RWMutex |
 | ORAM cache (Path ORAM) | enclave/oram_cache.go | FNV hash mapping, lazy expiry |
 | Cache interface | enclave/cache_interface.go | Get/Put/Size/Clear/CleanExpired |
-| Cache-insert bundle format | enclave/bundle.go | ttl + timestamp + query + response |
+| Cache-insert bundle format | enclave/bundle.go | ttl + timestamp + query + response; also CanonicalizeQuery |
 | Ed25519 signature verification | enclave/cmd/main.go | On cache-insert bundles |
 | Timestamp replay protection | enclave/cmd/main.go | Monotonic t_latest + δ-window |
 | Dummy response generation | enclave/crypto.go | crypto/rand, same size as real |
-| Query canonicalization | enclave/query.go | domain:qtype format |
+| Query canonicalization | enclave/bundle.go | domain:qtype format (CanonicalizeQuery) |
 | Configuration loading | enclave/config.go | Env vars + defaults |
 | SGX attestation server | enclave/attestation.go | /attest, /provision, /health |
 | SGX quote generation | enclave/attestation_sgx.go | EGo DCAP |
@@ -214,7 +214,7 @@ SGX has no trusted clock. The enclave maintains `t_latest` (highest timestamp se
 | SGX attestation + provisioning | G1 | Done | DCAP quote, signing key delivery |
 | Restart warm-up mode | G2 | Done | Defensive mode on boot, exits at WarmupThreshold |
 | Cache omission detection | G2 | Done | Outstanding query tracking, enters defensive mode at OmissionThreshold |
-| Cover responses | G2 | Done | Target samples k random domains per cache-insert, delivered via POST /cache-insert |
+| Cover responses | G2 | Done | Target samples k random domains (codohtarget/cover/), delivered via POST /cache-insert |
 | Batched cache insertions | G2 | Done | InsertionQueue + pseudorandom commit via crypto/rand coin flip on query path |
 | Wire-layer padding | G2, G3 | Done | Bucketed padding (default single 16384-byte bucket); hits and misses identical size to proxy |
 | Session ID (sid) binding | G3 | Not yet | Explicit sid in AAD to prevent cross-use |
@@ -321,11 +321,29 @@ codohtarget {
 ## IPC Protocol (Unix Socket)
 
 ```
-Wire format: [4 bytes: length (big-endian)][JSON payload]
+Wire format: [4 bytes: total length (big-endian)][1 byte: type/status][payload]
 
-Request types:  process, store_encrypted, get_pubkey, health
-Response status: hit, miss, error, ok, key_rotated
+All payloads are binary (no JSON).
+
+Request types (1-byte opcodes):
+  0x01 = process          (payload: HPKE ciphertext)
+  0x02 = store_encrypted  (payload: [4B blob_len][blob][signature])
+  0x03 = get_pubkey       (no payload)
+  0x04 = health           (no payload)
+
+Response status (1-byte codes):
+  0x00 = ok
+  0x01 = processed        (payload: encrypted response or dummy)
+  0x02 = error            (payload: error code string)
+  0x03 = key_rotated      (no payload)
+
+Error codes: invalid_blob, decrypt_failed, hpke_error,
+             invalid_signature, stale_timestamp, internal_error
+
+Max message size: 64 KiB (maxIPCMessageSize)
 ```
+
+**Note:** Hit vs miss is NOT distinguished at the IPC layer. The enclave always returns `processed` (0x01) with either a real encrypted response or a same-size dummy. The proxy distinguishes hit/miss at the HTTP layer via Content-Type (`application/codoh-cached` vs `application/oblivious-dns-message`).
 
 ---
 
@@ -361,13 +379,12 @@ coredns/
 │   ├── cmd/proxy_mode.go      # ProxyServer for CODoH-base
 │   ├── crypto.go              # HPKE keypair, decrypt, encrypt, k_r derivation, dummy response
 │   ├── client_crypto.go       # Client-side HPKE helpers (EncryptQueryE, DecryptCachedResponse)
-│   ├── bundle.go              # CacheInsertBundle marshal/parse
-│   ├── ipc.go                 # Unix socket server
+│   ├── bundle.go              # CacheInsertBundle marshal/parse + CanonicalizeQuery
+│   ├── ipc.go                 # Unix socket server (binary wire protocol)
 │   ├── cache.go               # LRU cache with logical-time TTL
 │   ├── cache_interface.go     # Cache interface (Get/Put/PutBatch/Size/Clear/CleanExpired)
 │   ├── oram_cache.go          # Path ORAM cache (access-pattern hiding)
 │   ├── insertion_queue.go     # Bounded FIFO queue for batched cache inserts
-│   ├── query.go               # Query canonicalization
 │   ├── config.go              # Configuration loading (env vars)
 │   ├── types.go               # IPC message types
 │   ├── attestation.go         # HTTPS attestation server (/attest, /provision)
@@ -389,13 +406,20 @@ coredns/
 │       ├── attestation.go     # Enclave provisioning client
 │       ├── attestation_verify_sgx.go  # SGX quote verification (DCAP)
 │       ├── attestation_verify_sim.go  # Simulation (skip verification)
+│       ├── cover/             # Cover response generation
+│       │   ├── sampler.go     # Tiered domain sampling (popular/long-tail)
+│       │   └── resolver.go    # DNS resolution for cover domains
 │       ├── setup.go           # Corefile parsing
 │       └── metrics.go         # Prometheus metrics
 │
 ├── benchmark/                  # Benchmarking tools
-│   ├── configs/{1..7}-*.sh    # Config profiles (sourceable)
+│   ├── configs/               # Config profiles (sourceable, 9 files)
+│   │   ├── {1..7}-*.sh        # Main configs: doh, odoh, codoh-base, codoh-ipc, codoh-oram, codoh-cover, codoh-full
+│   │   ├── 4b-codoh-batch.sh  # Variant: IPC + batching only
+│   │   └── 4p-codoh-pad.sh    # Variant: IPC + padding only
+│   ├── setup.sh               # Shared setup/teardown helpers
 │   ├── run-all.sh             # Multi-config orchestrator
-│   └── top-1m.csv             # Domain list
+│   └── top-1m.csv             # Domain list (+ subsets: top-10, top-1k, etc.)
 │
 └── codoh-client/              # Client (separate repo)
     └── commands/

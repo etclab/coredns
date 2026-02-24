@@ -15,7 +15,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -582,8 +581,8 @@ func (h *EnclaveHandler) HandleHealth() *enclave.BinaryResponse {
 }
 
 // batchWorker drains the insertion queue and commits batches to cache in the background.
-// Uses signal coalescing (A) to prevent back-to-back batch commits from piled-up signals,
-// and runtime.Gosched (B) between puts to reduce within-batch mutex starvation of Gets.
+// Uses signal coalescing (A) to prevent back-to-back batch commits from piled-up signals.
+// WriteBatch shares path reads/evictions across entries, holding the ORAM lock once.
 func (h *EnclaveHandler) batchWorker() {
 	for range h.batchCh {
 		// A: Coalesce — drain any extra buffered signals so we don't
@@ -609,12 +608,8 @@ func (h *EnclaveHandler) batchWorker() {
 			continue
 		}
 
-		// B: Per-entry puts with Gosched yields so pending Gets can acquire the ORAM lock.
 		t0 := time.Now()
-		for _, e := range batch {
-			h.cache.Put(e.Query, e.Response, e.InsertedAt, e.TTL)
-			runtime.Gosched()
-		}
+		h.cache.PutBatch(batch)
 		dur := time.Since(t0)
 
 		h.totalCommits.Add(1)

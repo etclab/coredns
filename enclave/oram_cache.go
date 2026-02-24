@@ -279,12 +279,31 @@ func (c *ORAMCache) deserialize(data []byte) (*CacheEntry, bool) {
 	}, true
 }
 
-// PutBatch stores multiple entries from the insertion queue.
-// Phase 1: sequential puts (correct but not optimized).
-// TODO: coalesce ORAM path accesses for batch optimization.
+// PutBatch stores multiple entries using PathORAM's WriteBatch for shared
+// path reads/evictions. Holds the lock once for the entire batch.
 func (c *ORAMCache) PutBatch(entries []PendingInsert) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	items := make([]pathoram.BatchItem, 0, len(entries))
 	for _, e := range entries {
-		c.Put(e.Query, e.Response, e.InsertedAt, e.TTL)
+		blockID := c.queryToBlockID(e.Query)
+		entry := &CacheEntry{
+			Query: e.Query, Response: e.Response,
+			InsertedAt: e.InsertedAt, TTLSeconds: e.TTL,
+		}
+		data, ok := c.serialize(entry)
+		if !ok {
+			log.Printf("ORAMCache.PutBatch: entry too large")
+			continue
+		}
+		items = append(items, pathoram.BatchItem{BlockID: blockID, Data: data})
+		c.used[blockID] = true
+	}
+	if len(items) > 0 {
+		if err := c.oram.WriteBatch(items); err != nil {
+			log.Printf("ORAMCache.PutBatch: WriteBatch error: %v", err)
+		}
 	}
 }
 

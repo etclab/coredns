@@ -53,7 +53,7 @@ require (
 	github.com/cloudflare/circl v1.3.7
 	github.com/cloudflare/odoh-go v1.0.0
 	github.com/edgelesssys/ego v1.8.1
-	github.com/etclab/pathoram-go v0.1.1
+	github.com/etclab/pathoram-go v0.1.2
 	github.com/stretchr/testify v1.11.1
 )
 

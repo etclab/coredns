@@ -11,7 +11,7 @@ start_config() {
     local root_dir=$1 cert_path=$2 output_dir=$3
 
     echo "Starting DoH server on port 7443..."
-    "$root_dir/coredns-test" -conf "$root_dir/benchmark/Corefile.doh" \
+    "$root_dir/coredns-test" -conf "$COREFILE_DIR/Corefile.doh" \
         > "$output_dir/doh-server.log" 2>&1 &
     sleep 2
 

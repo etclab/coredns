@@ -25,24 +25,24 @@ start_config() {
     wait_for_enclave_attest
 
     echo "Starting CODoH target on port 8443..."
-    "$root_dir/coredns-test" -conf "$root_dir/Corefile.target" \
+    "$root_dir/coredns-test" -conf "$COREFILE_DIR/Corefile.target" \
         > "$output_dir/codoh-target.log" 2>&1 &
     wait_for_enclave_socket
 
     echo "Starting CODoH proxy on port 8080..."
-    "$root_dir/coredns-test" -conf "$root_dir/Corefile.proxy" \
+    "$root_dir/coredns-test" -conf "$COREFILE_DIR/Corefile.proxy" \
         > "$output_dir/codoh-proxy.log" 2>&1 &
     sleep 2
 
-    HEALTH_URLS="https://127.0.0.1:8080/health https://127.0.0.1:8443/health"
+    HEALTH_URLS="https://${PROXY_IP:-127.0.0.1}:8080/health https://${TARGET_IP:-127.0.0.1}:8443/health"
 }
 
 client_args() {
     local cert_path=$1 domains_path=$2 iterations=$3 distribution=$4 output_prefix=$5
 
     echo "--protocol codoh \
-        --target 127.0.0.1:8443 \
-        --proxy 127.0.0.1:8080 \
+        --target ${TARGET_IP:-127.0.0.1}:8443 \
+        --proxy ${PROXY_IP:-127.0.0.1}:8080 \
         --distribution $distribution \
         --iterations $iterations \
         --customcert $cert_path \
