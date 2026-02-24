@@ -2,7 +2,6 @@ package enclave
 
 import (
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -14,12 +13,12 @@ type IPCServer struct {
 	handler  RequestHandler
 }
 
-// RequestHandler processes incoming IPC requests.
+// RequestHandler processes incoming binary IPC requests.
 type RequestHandler interface {
-	HandleProcess(qe string) *Response
-	HandleStoreEncrypted(encryptedBlob, signature string) *Response
-	HandleGetPubKey() *Response
-	HandleHealth() *Response
+	HandleProcess(qe []byte) *BinaryResponse
+	HandleStoreEncrypted(blob, sig []byte) *BinaryResponse
+	HandleGetPubKey() *BinaryResponse
+	HandleHealth() *BinaryResponse
 }
 
 // NewIPCServer creates a new IPC server on the given socket path.
@@ -54,7 +53,7 @@ func (s *IPCServer) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
 	for {
-		req, err := readMessage(conn)
+		msgType, payload, err := readBinaryRequest(conn)
 		if err != nil {
 			if err != io.EOF {
 				// Log error in production
@@ -62,69 +61,78 @@ func (s *IPCServer) handleConnection(conn net.Conn) {
 			return
 		}
 
-		resp := s.dispatch(req)
-		if err := writeMessage(conn, resp); err != nil {
+		resp := s.dispatch(msgType, payload)
+		if err := writeBinaryResponse(conn, resp); err != nil {
 			return
 		}
 	}
 }
 
-func (s *IPCServer) dispatch(req *Request) *Response {
-	switch req.Type {
-	case MsgTypeProcess:
-		return s.handler.HandleProcess(req.QE)
-	case MsgTypeStoreEncrypted:
-		return s.handler.HandleStoreEncrypted(req.EncryptedBlob, req.Signature)
-	case MsgTypeGetPubKey:
+func (s *IPCServer) dispatch(msgType byte, payload []byte) *BinaryResponse {
+	switch msgType {
+	case BinMsgProcess:
+		return s.handler.HandleProcess(payload)
+	case BinMsgStoreEncrypted:
+		// Payload format: [4B BE blob_len][blob][sig]
+		if len(payload) < 4 {
+			return &BinaryResponse{Status: BinStatusError, Payload: []byte(ErrInvalidBlob)}
+		}
+		blobLen := binary.BigEndian.Uint32(payload[:4])
+		if uint32(len(payload)-4) < blobLen {
+			return &BinaryResponse{Status: BinStatusError, Payload: []byte(ErrInvalidBlob)}
+		}
+		blob := payload[4 : 4+blobLen]
+		sig := payload[4+blobLen:]
+		return s.handler.HandleStoreEncrypted(blob, sig)
+	case BinMsgGetPubKey:
 		return s.handler.HandleGetPubKey()
-	case MsgTypeHealth:
+	case BinMsgHealth:
 		return s.handler.HandleHealth()
 	default:
-		return &Response{
-			Status: StatusError,
-			Error:  "unknown message type",
-		}
+		return &BinaryResponse{Status: BinStatusError, Payload: []byte("unknown message type")}
 	}
 }
 
-// Wire format: [4 bytes: length][JSON payload]
+// Wire format: [4B BE total_len][1B type/status][payload]
 
 // maxIPCMessageSize is the maximum allowed IPC message size (64 KiB).
 const maxIPCMessageSize = 1 << 16
 
-func readMessage(r io.Reader) (*Request, error) {
+func readBinaryRequest(r io.Reader) (msgType byte, payload []byte, err error) {
 	var length uint32
 	if err := binary.Read(r, binary.BigEndian, &length); err != nil {
-		return nil, err
+		return 0, nil, err
 	}
 
 	if length > maxIPCMessageSize {
-		return nil, fmt.Errorf("message too large: %d", length)
+		return 0, nil, fmt.Errorf("message too large: %d", length)
 	}
 
-	payload := make([]byte, length)
-	if _, err := io.ReadFull(r, payload); err != nil {
-		return nil, err
+	if length < 1 {
+		return 0, nil, fmt.Errorf("message too short")
 	}
 
-	var req Request
-	if err := json.Unmarshal(payload, &req); err != nil {
-		return nil, fmt.Errorf("unmarshal: %w", err)
+	buf := make([]byte, length)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return 0, nil, err
 	}
 
-	return &req, nil
+	return buf[0], buf[1:], nil
 }
 
-func writeMessage(w io.Writer, resp *Response) error {
-	payload, err := json.Marshal(resp)
-	if err != nil {
-		return fmt.Errorf("marshal: %w", err)
-	}
-
-	if err := binary.Write(w, binary.BigEndian, uint32(len(payload))); err != nil {
+func writeBinaryResponse(w io.Writer, resp *BinaryResponse) error {
+	totalLen := 1 + len(resp.Payload) // 1B status + payload
+	if err := binary.Write(w, binary.BigEndian, uint32(totalLen)); err != nil {
 		return err
 	}
 
-	_, err = w.Write(payload)
-	return err
+	if _, err := w.Write([]byte{resp.Status}); err != nil {
+		return err
+	}
+
+	if len(resp.Payload) > 0 {
+		_, err := w.Write(resp.Payload)
+		return err
+	}
+	return nil
 }

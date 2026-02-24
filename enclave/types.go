@@ -1,48 +1,27 @@
 // Package enclave implements the SGX enclave for CODoH caching.
 package enclave
 
-// IPC Message Types
+// Binary IPC message types (request direction: proxy → enclave).
 const (
-	MsgTypeProcess        = "process"
-	MsgTypeStoreEncrypted = "store_encrypted"
-	MsgTypeGetPubKey      = "get_pubkey"
-	MsgTypeHealth         = "health"
+	BinMsgProcess        byte = 0x01
+	BinMsgStoreEncrypted byte = 0x02
+	BinMsgGetPubKey      byte = 0x03
+	BinMsgHealth         byte = 0x04
 )
 
-// IPC Response Status
+// Binary IPC response status codes (response direction: enclave → proxy).
 const (
-	StatusHit        = "hit"
-	StatusMiss       = "miss"
-	StatusProcessed  = "processed" // uniform status for all query responses (hit or miss) — C2 fix
-	StatusError      = "error"
-	StatusOK         = "ok"
-	StatusKeyRotated = "key_rotated"
+	BinStatusOK         byte = 0x00
+	BinStatusProcessed  byte = 0x01
+	BinStatusError      byte = 0x02
+	BinStatusKeyRotated byte = 0x03
 )
 
-// Request is the incoming IPC message from proxy.
-type Request struct {
-	Type string `json:"type"`
-
-	// For process: base64-encoded Q_E (HPKE-encrypted query from client)
-	QE string `json:"qe,omitempty"`
-
-	// For store_encrypted: base64-encoded HPKE-encrypted cache-insert blob + signature
-	EncryptedBlob string `json:"encrypted_blob,omitempty"`
-	Signature     string `json:"signature,omitempty"`
-}
-
-// Response is the outgoing IPC message to proxy.
-type Response struct {
-	Status    string `json:"status"`
-	Response  string `json:"response,omitempty"`    // base64, encrypted response blob (hit or dummy)
-	Error     string `json:"error,omitempty"`       // error description
-	PubKey    string `json:"pubkey,omitempty"`      // base64, for get_pubkey
-	StartedAt string `json:"started_at,omitempty"` // RFC3339, enclave start time
-
-	// Batch queue stats (health endpoint)
-	QueueDepth            int   `json:"queue_depth,omitempty"`
-	TotalCommits          int64 `json:"total_commits,omitempty"`
-	TotalEntriesCommitted int64 `json:"total_entries_committed,omitempty"`
+// BinaryResponse is the binary IPC response from the enclave.
+// Wire format: [4B BE total_len][1B status][payload bytes]
+type BinaryResponse struct {
+	Status  byte
+	Payload []byte
 }
 
 // Error codes for IPC responses.

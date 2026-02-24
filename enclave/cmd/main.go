@@ -9,11 +9,13 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -136,6 +138,9 @@ func main() {
 	// Remove stale socket
 	os.Remove(cfg.SocketPath)
 
+	// Ensure pad buckets are sorted (PadToBucket requires ascending order)
+	sort.Ints(cfg.PadBuckets)
+
 	// Create handler
 	handler := &EnclaveHandler{
 		keypair:             keypair,
@@ -155,6 +160,9 @@ func main() {
 		batchSize:          cfg.BatchSize,
 		batchCommitProb:    cfg.BatchCommitProb,
 	}
+	handler.batchCh = make(chan struct{}, 16)
+	go handler.batchWorker()
+
 	log.Printf("Defensive mode: ACTIVE (warmup threshold=%d)", cfg.WarmupThreshold)
 	log.Printf("Batch config: size=%d, commit_prob=%.2f, queue_max=%d",
 		cfg.BatchSize, cfg.BatchCommitProb, cfg.QueueMaxSize)
@@ -295,70 +303,80 @@ type EnclaveHandler struct {
 	batchCommitProb       float64
 	totalCommits          atomic.Int64
 	totalEntriesCommitted atomic.Int64
+	batchCh               chan struct{} // signals background worker to commit a batch
 }
 
 // HandleProcess decrypts Q_E, looks up cache, returns encrypted response or dummy.
-func (h *EnclaveHandler) HandleProcess(qe string) *enclave.Response {
-	// Decode Q_E
-	qeBytes, err := base64.StdEncoding.DecodeString(qe)
-	if err != nil {
-		return &enclave.Response{
-			Status: enclave.StatusError,
-			Error:  enclave.ErrInvalidBlob,
-		}
-	}
+// qe is raw HPKE-encrypted bytes (no base64).
+func (h *EnclaveHandler) HandleProcess(qe []byte) *enclave.BinaryResponse {
+	tTotal := time.Now()
 
 	// Decrypt Q_E and derive session key k_r
 	// Key rotation takes priority: if HPKE decryption fails (wrong key or corrupted),
 	// return key_rotated so the client re-attests.
-	query, kr, err := h.keypair.DecryptQueryE(qeBytes)
+	tOp := time.Now()
+	query, kr, err := h.keypair.DecryptQueryE(qe)
 	if err != nil {
 		log.Printf("DecryptQueryE failed (key rotation?): %v", err)
-		return &enclave.Response{
-			Status: enclave.StatusKeyRotated,
-		}
+		return &enclave.BinaryResponse{Status: enclave.BinStatusKeyRotated}
 	}
+	durDecrypt := time.Since(tOp)
 
 	h.mu.Lock()
 	inDefensiveMode := h.defensiveMode
 	h.mu.Unlock()
 
-	var resp *enclave.Response
+	var resp *enclave.BinaryResponse
+	var durCacheGet, durEncrypt, durPad, durDummy time.Duration
+	isHit := false
 
 	// Defensive mode: decrypt succeeded (needed for protocol), but return dummy.
 	// Indistinguishable from a normal cache miss to the proxy.
 	if inDefensiveMode {
 		_ = kr // kr derived but not used — defensive mode returns dummy
+		tOp = time.Now()
 		dummy := enclave.GenerateDummyResponse(enclave.DummyInnerSize)
+		durDummy = time.Since(tOp)
+		tOp = time.Now()
 		padded, padErr := enclave.PadToBucket(dummy, h.padBuckets)
+		durPad = time.Since(tOp)
 		if padErr != nil {
 			log.Printf("PadToBucket(defensive dummy) failed: %v", padErr)
 			padded = dummy // fallback — should never happen
 		}
 		h.logCacheOp("miss(defensive)", string(query))
-		resp = &enclave.Response{
-			Status:   enclave.StatusProcessed,
-			Response: base64.StdEncoding.EncodeToString(padded),
+		resp = &enclave.BinaryResponse{
+			Status:  enclave.BinStatusProcessed,
+			Payload: padded,
 		}
 	} else {
 		canonicalQuery := string(query)
 
 		// Cache lookup with logical time
 		tLatest := h.tLatest.Load()
-		if cachedResp, ok := h.cache.Get(canonicalQuery, tLatest); ok {
+		tOp = time.Now()
+		cachedResp, ok := h.cache.Get(canonicalQuery, tLatest)
+		durCacheGet = time.Since(tOp)
+
+		if ok {
+			isHit = true
 			// Cache hit — encrypt under session key k_r, then pad to bucket
+			tOp = time.Now()
 			encrypted, encErr := enclave.EncryptCachedResponse(kr, cachedResp)
+			durEncrypt = time.Since(tOp)
 			if encErr == nil {
+				tOp = time.Now()
 				encrypted, encErr = enclave.PadToBucket(encrypted, h.padBuckets)
+				durPad = time.Since(tOp)
 			}
 			if encErr != nil {
 				log.Printf("EncryptCachedResponse/PadToBucket failed: %v", encErr)
 				// Fall through to dummy
 			} else {
 				h.logCacheOp("hit", canonicalQuery)
-				resp = &enclave.Response{
-					Status:   enclave.StatusProcessed,
-					Response: base64.StdEncoding.EncodeToString(encrypted),
+				resp = &enclave.BinaryResponse{
+					Status:  enclave.BinStatusProcessed,
+					Payload: encrypted,
 				}
 			}
 		}
@@ -379,93 +397,70 @@ func (h *EnclaveHandler) HandleProcess(qe string) *enclave.Response {
 			h.mu.Unlock()
 
 			// Return dummy (indistinguishable from hit — same PadToBucket structure)
+			tOp = time.Now()
 			dummy := enclave.GenerateDummyResponse(enclave.DummyInnerSize)
+			durDummy = time.Since(tOp)
+			tOp = time.Now()
 			padded, padErr := enclave.PadToBucket(dummy, h.padBuckets)
+			durPad = time.Since(tOp)
 			if padErr != nil {
 				log.Printf("PadToBucket(miss dummy) failed: %v", padErr)
 				padded = dummy // fallback — should never happen
 			}
 			h.logCacheOp("miss", canonicalQuery)
-			resp = &enclave.Response{
-				Status:   enclave.StatusProcessed,
-				Response: base64.StdEncoding.EncodeToString(padded),
+			resp = &enclave.BinaryResponse{
+				Status:  enclave.BinStatusProcessed,
+				Payload: padded,
 			}
 		}
 	}
 
-	// Pseudorandom batch commit (D1: commits only on query path, D7: synchronous)
+	// Pseudorandom batch commit (D1: commits only on query path, async via batchWorker)
 	if cryptoRandFloat64() < h.batchCommitProb {
-		if n := h.insertionQueue.Len(); n > 0 {
-			commitSize := h.batchSize
-			if commitSize > n {
-				commitSize = n
-			}
-			batch := h.insertionQueue.DrainBatch(commitSize)
-			if len(batch) > 0 {
-				h.cache.PutBatch(batch)
-				h.totalCommits.Add(1)
-				h.totalEntriesCommitted.Add(int64(len(batch)))
-
-				// Re-check warm-up threshold after commit
-				h.mu.Lock()
-				if h.defensiveMode && h.cache.Size() >= h.warmupThreshold {
-					h.defensiveMode = false
-					log.Printf("[enclave] warm-up complete: cache size %d >= threshold %d",
-						h.cache.Size(), h.warmupThreshold)
-				}
-				h.mu.Unlock()
-			}
+		select {
+		case h.batchCh <- struct{}{}:
+		default:
+			// channel full — worker is behind, skip this signal
 		}
 	}
+
+	log.Printf("[enclave-timing] hit=%v hpke_decrypt=%dµs cache_get=%dµs encrypt_response=%dµs pad=%dµs gen_dummy=%dµs total=%dµs",
+		isHit, durDecrypt.Microseconds(), durCacheGet.Microseconds(),
+		durEncrypt.Microseconds(), durPad.Microseconds(), durDummy.Microseconds(),
+		time.Since(tTotal).Microseconds())
 
 	return resp
 }
 
 // HandleStoreEncrypted decrypts cache-insert bundle, verifies signature, stores in cache.
-func (h *EnclaveHandler) HandleStoreEncrypted(encryptedBlob, signature string) *enclave.Response {
-	// Decode base64
-	ciphertext, err := base64.StdEncoding.DecodeString(encryptedBlob)
-	if err != nil {
-		return &enclave.Response{
-			Status: enclave.StatusError,
-			Error:  enclave.ErrInvalidBlob,
-		}
-	}
-
+// blob and sig are raw bytes (no base64).
+func (h *EnclaveHandler) HandleStoreEncrypted(blob, sig []byte) *enclave.BinaryResponse {
 	// Decrypt with enclave's private key
-	plaintext, err := h.keypair.Decrypt(ciphertext)
+	plaintext, err := h.keypair.Decrypt(blob)
 	if err != nil {
 		log.Printf("StoreEncrypted: decrypt failed: %v", err)
-		return &enclave.Response{
-			Status: enclave.StatusError,
-			Error:  enclave.ErrDecryptFailed,
+		return &enclave.BinaryResponse{
+			Status:  enclave.BinStatusError,
+			Payload: []byte(enclave.ErrDecryptFailed),
 		}
 	}
 
 	// Verify signature if signing key is configured
 	if len(h.targetSigningPubKey) > 0 {
-		if signature == "" {
-			return &enclave.Response{
-				Status: enclave.StatusError,
-				Error:  enclave.ErrInvalidSignature,
-			}
-		}
-
-		sigBytes, err := base64.StdEncoding.DecodeString(signature)
-		if err != nil {
-			return &enclave.Response{
-				Status: enclave.StatusError,
-				Error:  enclave.ErrInvalidSignature,
+		if len(sig) == 0 {
+			return &enclave.BinaryResponse{
+				Status:  enclave.BinStatusError,
+				Payload: []byte(enclave.ErrInvalidSignature),
 			}
 		}
 
 		// Verify: Sign(H(plaintext_bundle))
 		hash := sha256.Sum256(plaintext)
-		if !ed25519.Verify(h.targetSigningPubKey, hash[:], sigBytes) {
+		if !ed25519.Verify(h.targetSigningPubKey, hash[:], sig) {
 			log.Printf("StoreEncrypted: signature verification failed")
-			return &enclave.Response{
-				Status: enclave.StatusError,
-				Error:  enclave.ErrInvalidSignature,
+			return &enclave.BinaryResponse{
+				Status:  enclave.BinStatusError,
+				Payload: []byte(enclave.ErrInvalidSignature),
 			}
 		}
 	}
@@ -474,9 +469,9 @@ func (h *EnclaveHandler) HandleStoreEncrypted(encryptedBlob, signature string) *
 	entries, err := enclave.ParseMultiBundle(plaintext)
 	if err != nil {
 		log.Printf("StoreEncrypted: parse multi-bundle failed: %v", err)
-		return &enclave.Response{
-			Status: enclave.StatusError,
-			Error:  enclave.ErrInvalidBlob,
+		return &enclave.BinaryResponse{
+			Status:  enclave.BinStatusError,
+			Payload: []byte(enclave.ErrInvalidBlob),
 		}
 	}
 
@@ -518,13 +513,13 @@ func (h *EnclaveHandler) HandleStoreEncrypted(encryptedBlob, signature string) *
 	log.Printf("StoreEncrypted: enqueued %d/%d entries", enqueued, len(entries))
 
 	if enqueued == 0 {
-		return &enclave.Response{
-			Status: enclave.StatusError,
-			Error:  enclave.ErrStaleTimestamp,
+		return &enclave.BinaryResponse{
+			Status:  enclave.BinStatusError,
+			Payload: []byte(enclave.ErrStaleTimestamp),
 		}
 	}
 
-	return &enclave.Response{Status: enclave.StatusOK}
+	return &enclave.BinaryResponse{Status: enclave.BinStatusOK}
 }
 
 // validateTimestamp checks the timestamp against the δ-window and advances tLatest.
@@ -550,27 +545,91 @@ func (h *EnclaveHandler) validateTimestamp(ts int64) error {
 	return nil
 }
 
-func (h *EnclaveHandler) HandleGetPubKey() *enclave.Response {
+func (h *EnclaveHandler) HandleGetPubKey() *enclave.BinaryResponse {
 	pubBytes, err := h.keypair.PublicKeyBytes()
 	if err != nil {
-		return &enclave.Response{
-			Status: enclave.StatusError,
-			Error:  enclave.ErrInternal,
+		return &enclave.BinaryResponse{
+			Status:  enclave.BinStatusError,
+			Payload: []byte(enclave.ErrInternal),
 		}
 	}
-	return &enclave.Response{
-		Status: enclave.StatusOK,
-		PubKey: base64.StdEncoding.EncodeToString(pubBytes),
+	return &enclave.BinaryResponse{
+		Status:  enclave.BinStatusOK,
+		Payload: pubBytes,
 	}
 }
 
-func (h *EnclaveHandler) HandleHealth() *enclave.Response {
-	return &enclave.Response{
-		Status:                enclave.StatusOK,
+// healthStats is JSON-encoded into the health response payload.
+type healthStats struct {
+	StartedAt             string `json:"started_at"`
+	QueueDepth            int    `json:"queue_depth"`
+	TotalCommits          int64  `json:"total_commits"`
+	TotalEntriesCommitted int64  `json:"total_entries_committed"`
+}
+
+func (h *EnclaveHandler) HandleHealth() *enclave.BinaryResponse {
+	stats := healthStats{
 		StartedAt:             h.startedAt,
 		QueueDepth:            h.insertionQueue.Len(),
 		TotalCommits:          h.totalCommits.Load(),
 		TotalEntriesCommitted: h.totalEntriesCommitted.Load(),
+	}
+	payload, _ := json.Marshal(stats)
+	return &enclave.BinaryResponse{
+		Status:  enclave.BinStatusOK,
+		Payload: payload,
+	}
+}
+
+// batchWorker drains the insertion queue and commits batches to cache in the background.
+// Uses signal coalescing (A) to prevent back-to-back batch commits from piled-up signals,
+// and runtime.Gosched (B) between puts to reduce within-batch mutex starvation of Gets.
+func (h *EnclaveHandler) batchWorker() {
+	for range h.batchCh {
+		// A: Coalesce — drain any extra buffered signals so we don't
+		// run back-to-back batches when multiple coin flips land together.
+		for {
+			select {
+			case <-h.batchCh:
+			default:
+				goto process
+			}
+		}
+	process:
+		n := h.insertionQueue.Len()
+		if n == 0 {
+			continue
+		}
+		commitSize := h.batchSize
+		if commitSize > n {
+			commitSize = n
+		}
+		batch := h.insertionQueue.DrainBatch(commitSize)
+		if len(batch) == 0 {
+			continue
+		}
+
+		// B: Per-entry puts with Gosched yields so pending Gets can acquire the ORAM lock.
+		t0 := time.Now()
+		for _, e := range batch {
+			h.cache.Put(e.Query, e.Response, e.InsertedAt, e.TTL)
+			runtime.Gosched()
+		}
+		dur := time.Since(t0)
+
+		h.totalCommits.Add(1)
+		h.totalEntriesCommitted.Add(int64(len(batch)))
+
+		// Re-check warm-up threshold after commit
+		h.mu.Lock()
+		if h.defensiveMode && h.cache.Size() >= h.warmupThreshold {
+			h.defensiveMode = false
+			log.Printf("[enclave] warm-up complete: cache size %d >= threshold %d",
+				h.cache.Size(), h.warmupThreshold)
+		}
+		h.mu.Unlock()
+
+		log.Printf("[batch-timing] entries=%d duration=%dµs", len(batch), dur.Microseconds())
 	}
 }
 

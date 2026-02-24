@@ -2,58 +2,67 @@ package codohproxy
 
 import (
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"sync"
 	"time"
+
+	"github.com/coredns/coredns/enclave"
 )
 
 // EnclaveClient communicates with the SGX enclave over Unix socket.
-// Each IPC call opens a new per-request connection (~50µs for Unix socket).
+// Maintains a small connection pool to amortize dial cost across requests.
 type EnclaveClient struct {
 	socketPath string
 	mu         sync.Mutex
 	healthy    bool
+	pool       chan net.Conn
 }
 
-// IPC Message Types (must match enclave/types.go)
-const (
-	msgTypeProcess        = "process"
-	msgTypeStoreEncrypted = "store_encrypted"
-	msgTypeGetPubKey      = "get_pubkey"
-	msgTypeHealth         = "health"
-)
-
-// IPC Response Status
-const (
-	statusError      = "error"
-	statusOK         = "ok"
-	statusKeyRotated = "key_rotated"
-)
-
-// EnclaveRequest is the IPC request to the enclave.
-type EnclaveRequest struct {
-	Type          string `json:"type"`
-	QE            string `json:"qe,omitempty"`             // base64 Q_E for process
-	EncryptedBlob string `json:"encrypted_blob,omitempty"` // base64 HPKE-encrypted cache-insert blob
-	Signature     string `json:"signature,omitempty"`       // base64 Ed25519 signature
+// enclaveResponse is the parsed binary IPC response from the enclave.
+type enclaveResponse struct {
+	Status  byte
+	Payload []byte
 }
 
-// EnclaveResponse is the IPC response from the enclave.
-type EnclaveResponse struct {
-	Status   string `json:"status"`
-	Response string `json:"response,omitempty"` // base64, encrypted response blob (hit or dummy)
-	Error    string `json:"error,omitempty"`
-	PubKey   string `json:"pubkey,omitempty"` // base64, for get_pubkey
-}
-
-// NewEnclaveClient creates a new enclave client.
+// NewEnclaveClient creates a new enclave client with a connection pool.
 func NewEnclaveClient(socketPath string) *EnclaveClient {
 	return &EnclaveClient{
 		socketPath: socketPath,
 		healthy:    false,
+		pool:       make(chan net.Conn, 4),
+	}
+}
+
+// Close drains the connection pool and closes all idle connections.
+func (c *EnclaveClient) Close() {
+	for {
+		select {
+		case conn := <-c.pool:
+			conn.Close()
+		default:
+			return
+		}
+	}
+}
+
+// getConn returns a pooled connection or dials a new one.
+func (c *EnclaveClient) getConn() (net.Conn, error) {
+	select {
+	case conn := <-c.pool:
+		return conn, nil
+	default:
+		return net.DialTimeout("unix", c.socketPath, 5*time.Second)
+	}
+}
+
+// putConn returns a connection to the pool, or closes it if the pool is full.
+func (c *EnclaveClient) putConn(conn net.Conn) {
+	select {
+	case c.pool <- conn:
+	default:
+		conn.Close()
 	}
 }
 
@@ -71,111 +80,136 @@ func (c *EnclaveClient) setHealthy(h bool) {
 	c.mu.Unlock()
 }
 
-// GetPublicKey retrieves the enclave's HPKE public key.
-func (c *EnclaveClient) GetPublicKey() (string, error) {
-	resp, err := c.sendRequest(&EnclaveRequest{Type: msgTypeGetPubKey})
+// GetPublicKey retrieves the enclave's HPKE public key as raw bytes.
+func (c *EnclaveClient) GetPublicKey() ([]byte, error) {
+	resp, err := c.sendBinaryRequest(enclave.BinMsgGetPubKey, nil)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	if resp.Status != statusOK {
-		return "", fmt.Errorf("get pubkey failed: %s", resp.Error)
+	if resp.Status != enclave.BinStatusOK {
+		return nil, fmt.Errorf("get pubkey failed: %s", string(resp.Payload))
 	}
-	return resp.PubKey, nil
+	return resp.Payload, nil
 }
 
-// ProcessQE sends a Q_E to the enclave for HPKE decryption + cache lookup.
+// ProcessQE sends raw Q_E bytes to the enclave for HPKE decryption + cache lookup.
 // Returns the enclave response (hit with encrypted cached response, or miss with dummy).
-func (c *EnclaveClient) ProcessQE(qe string) (*EnclaveResponse, error) {
-	return c.sendRequest(&EnclaveRequest{
-		Type: msgTypeProcess,
-		QE:   qe,
-	})
+func (c *EnclaveClient) ProcessQE(qe []byte) (*enclaveResponse, error) {
+	return c.sendBinaryRequest(enclave.BinMsgProcess, qe)
 }
 
-// StoreCacheInsert sends an HPKE-encrypted cache-insert bundle + signature to the enclave.
-// Fire-and-forget: caller doesn't need to check the response.
-func (c *EnclaveClient) StoreCacheInsert(encryptedBlob, signature string) error {
-	resp, err := c.sendRequest(&EnclaveRequest{
-		Type:          msgTypeStoreEncrypted,
-		EncryptedBlob: encryptedBlob,
-		Signature:     signature,
-	})
+// StoreCacheInsert sends raw HPKE-encrypted cache-insert blob + signature to the enclave.
+// Wire payload: [4B BE blob_len][blob][sig]
+func (c *EnclaveClient) StoreCacheInsert(blob, sig []byte) error {
+	payload := make([]byte, 4+len(blob)+len(sig))
+	binary.BigEndian.PutUint32(payload[:4], uint32(len(blob)))
+	copy(payload[4:], blob)
+	copy(payload[4+len(blob):], sig)
+
+	resp, err := c.sendBinaryRequest(enclave.BinMsgStoreEncrypted, payload)
 	if err != nil {
 		return err
 	}
-	if resp.Status != statusOK {
-		return fmt.Errorf("store cache insert failed: %s", resp.Error)
+	if resp.Status != enclave.BinStatusOK {
+		return fmt.Errorf("store cache insert failed: %s", string(resp.Payload))
 	}
 	return nil
 }
 
 // CheckHealth checks if the enclave is responding.
 func (c *EnclaveClient) CheckHealth() error {
-	resp, err := c.sendRequest(&EnclaveRequest{Type: msgTypeHealth})
+	resp, err := c.sendBinaryRequest(enclave.BinMsgHealth, nil)
 	if err != nil {
 		c.setHealthy(false)
 		return err
 	}
-	if resp.Status != statusOK {
+	if resp.Status != enclave.BinStatusOK {
 		c.setHealthy(false)
-		return fmt.Errorf("health check failed: %s", resp.Error)
+		return fmt.Errorf("health check failed: %s", string(resp.Payload))
 	}
 	c.setHealthy(true)
 	return nil
 }
 
-// sendRequest opens a new Unix socket connection, sends the request, reads the response, and closes.
-func (c *EnclaveClient) sendRequest(req *EnclaveRequest) (*EnclaveResponse, error) {
-	conn, err := net.DialTimeout("unix", c.socketPath, 5*time.Second)
+// sendBinaryRequest sends a binary IPC request and reads the response.
+// Wire format: [4B BE total_len][1B msgType][payload]
+// Response:    [4B BE total_len][1B status][payload]
+func (c *EnclaveClient) sendBinaryRequest(msgType byte, payload []byte) (*enclaveResponse, error) {
+	tStart := time.Now()
+
+	conn, err := c.getConn()
 	if err != nil {
 		c.setHealthy(false)
 		return nil, fmt.Errorf("connect to enclave: %w", err)
 	}
-	defer conn.Close()
+	tDial := time.Since(tStart)
 
-	conn.SetDeadline(time.Now().Add(10 * time.Second))
-
-	// Marshal request
-	payload, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("marshal request: %w", err)
-	}
-
-	// Write length prefix + payload
-	if err := binary.Write(conn, binary.BigEndian, uint32(len(payload))); err != nil {
+	// Write: [4B len][1B type][payload]
+	totalLen := 1 + len(payload)
+	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	if err := binary.Write(conn, binary.BigEndian, uint32(totalLen)); err != nil {
+		conn.Close()
 		c.setHealthy(false)
 		return nil, fmt.Errorf("write length: %w", err)
 	}
-	if _, err := conn.Write(payload); err != nil {
+	if _, err := conn.Write([]byte{msgType}); err != nil {
+		conn.Close()
 		c.setHealthy(false)
-		return nil, fmt.Errorf("write payload: %w", err)
+		return nil, fmt.Errorf("write type: %w", err)
 	}
+	if len(payload) > 0 {
+		if _, err := conn.Write(payload); err != nil {
+			conn.Close()
+			c.setHealthy(false)
+			return nil, fmt.Errorf("write payload: %w", err)
+		}
+	}
+	tWrite := time.Since(tStart) - tDial
 
-	// Read response length
-	var length uint32
-	if err := binary.Read(conn, binary.BigEndian, &length); err != nil {
+	// Read response: [4B len][1B status][payload]
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	var respLen uint32
+	if err := binary.Read(conn, binary.BigEndian, &respLen); err != nil {
+		conn.Close()
 		c.setHealthy(false)
 		return nil, fmt.Errorf("read length: %w", err)
 	}
 
 	const maxIPCResponseSize = 1 << 16
-	if length > maxIPCResponseSize {
+	if respLen > maxIPCResponseSize {
+		conn.Close()
 		c.setHealthy(false)
-		return nil, fmt.Errorf("response too large: %d", length)
+		return nil, fmt.Errorf("response too large: %d", respLen)
+	}
+	if respLen < 1 {
+		conn.Close()
+		c.setHealthy(false)
+		return nil, fmt.Errorf("response too short")
 	}
 
-	// Read response payload
-	respPayload := make([]byte, length)
-	if _, err := io.ReadFull(conn, respPayload); err != nil {
+	buf := make([]byte, respLen)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		conn.Close()
 		c.setHealthy(false)
 		return nil, fmt.Errorf("read payload: %w", err)
 	}
+	tEnclave := time.Since(tStart) - tDial - tWrite
 
-	var resp EnclaveResponse
-	if err := json.Unmarshal(respPayload, &resp); err != nil {
-		return nil, fmt.Errorf("unmarshal response: %w", err)
+	// Clear deadlines and return to pool
+	conn.SetDeadline(time.Time{})
+	c.putConn(conn)
+
+	resp := &enclaveResponse{
+		Status:  buf[0],
+		Payload: buf[1:],
+	}
+
+	tTotal := time.Since(tStart)
+	if msgType == enclave.BinMsgProcess {
+		fmt.Printf("[ipc-timing] conn=%dµs write=%dµs enclave=%dµs total=%dµs\n",
+			tDial.Microseconds(), tWrite.Microseconds(), tEnclave.Microseconds(), tTotal.Microseconds())
 	}
 
 	c.setHealthy(true)
-	return &resp, nil
+	return resp, nil
 }

@@ -2,6 +2,7 @@ package codohproxy
 
 import (
 	"bytes"
+	"encoding/base64"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,10 +15,10 @@ import (
 	"github.com/coredns/coredns/enclave"
 )
 
-// mockEnclaveHandler implements enclave.RequestHandler for testing.
+// mockEnclaveHandler implements enclave.RequestHandler for testing (binary IPC).
 type mockEnclaveHandler struct {
-	processFunc        func(qe string) *enclave.Response
-	storeEncryptedFunc func(blob, sig string) *enclave.Response
+	processFunc        func(qe []byte) *enclave.BinaryResponse
+	storeEncryptedFunc func(blob, sig []byte) *enclave.BinaryResponse
 
 	// Captured store_encrypted calls
 	mu         sync.Mutex
@@ -25,38 +26,44 @@ type mockEnclaveHandler struct {
 }
 
 type storeCall struct {
-	Blob string
-	Sig  string
+	Blob []byte
+	Sig  []byte
 }
 
-func (m *mockEnclaveHandler) HandleProcess(qe string) *enclave.Response {
+func (m *mockEnclaveHandler) HandleProcess(qe []byte) *enclave.BinaryResponse {
 	return m.processFunc(qe)
 }
 
-func (m *mockEnclaveHandler) HandleStoreEncrypted(blob, sig string) *enclave.Response {
+func (m *mockEnclaveHandler) HandleStoreEncrypted(blob, sig []byte) *enclave.BinaryResponse {
 	m.mu.Lock()
-	m.storeCalls = append(m.storeCalls, storeCall{Blob: blob, Sig: sig})
+	// Copy slices since they may reference IPC buffer
+	blobCopy := make([]byte, len(blob))
+	copy(blobCopy, blob)
+	sigCopy := make([]byte, len(sig))
+	copy(sigCopy, sig)
+	m.storeCalls = append(m.storeCalls, storeCall{Blob: blobCopy, Sig: sigCopy})
 	m.mu.Unlock()
 	if m.storeEncryptedFunc != nil {
 		return m.storeEncryptedFunc(blob, sig)
 	}
-	return &enclave.Response{Status: enclave.StatusOK}
+	return &enclave.BinaryResponse{Status: enclave.BinStatusOK}
 }
 
-func (m *mockEnclaveHandler) HandleGetPubKey() *enclave.Response {
-	return &enclave.Response{Status: enclave.StatusOK, PubKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}
+func (m *mockEnclaveHandler) HandleGetPubKey() *enclave.BinaryResponse {
+	// Return 32 bytes of zeros as a mock public key
+	return &enclave.BinaryResponse{Status: enclave.BinStatusOK, Payload: make([]byte, 32)}
 }
 
-func (m *mockEnclaveHandler) HandleHealth() *enclave.Response {
-	return &enclave.Response{Status: enclave.StatusOK}
+func (m *mockEnclaveHandler) HandleHealth() *enclave.BinaryResponse {
+	return &enclave.BinaryResponse{Status: enclave.BinStatusOK, Payload: []byte(`{"started_at":"2024-01-01T00:00:00Z"}`)}
 }
 
 func TestProxyHandler_KeyRotated(t *testing.T) {
 	// 1. Start mock enclave on temp Unix socket using the real IPC server.
 	socketPath := filepath.Join(t.TempDir(), "test-enclave.sock")
 	handler := &mockEnclaveHandler{
-		processFunc: func(qe string) *enclave.Response {
-			return &enclave.Response{Status: enclave.StatusKeyRotated}
+		processFunc: func(qe []byte) *enclave.BinaryResponse {
+			return &enclave.BinaryResponse{Status: enclave.BinStatusKeyRotated}
 		},
 	}
 	ipcServer, err := enclave.NewIPCServer(socketPath, handler)
@@ -117,13 +124,13 @@ func TestProxyHandler_KeyRotated(t *testing.T) {
 }
 
 func TestProxyHandler_CacheMiss_TwoChunkResponse(t *testing.T) {
-	// Verify that a normal cache miss (status:"miss" with dummy blob) produces
+	// Verify that a normal cache miss (processed with dummy blob) produces
 	// a two-chunk response with application/codoh-response content type.
 	socketPath := filepath.Join(t.TempDir(), "test-enclave.sock")
-	dummyBlob := "AQIDBA==" // base64 of {0x01, 0x02, 0x03, 0x04}
+	dummyPayload := []byte{0x01, 0x02, 0x03, 0x04}
 	handler := &mockEnclaveHandler{
-		processFunc: func(qe string) *enclave.Response {
-			return &enclave.Response{Status: enclave.StatusProcessed, Response: dummyBlob}
+		processFunc: func(qe []byte) *enclave.BinaryResponse {
+			return &enclave.BinaryResponse{Status: enclave.BinStatusProcessed, Payload: dummyPayload}
 		},
 	}
 	ipcServer, err := enclave.NewIPCServer(socketPath, handler)
@@ -169,23 +176,34 @@ func TestProxyHandler_CacheMiss_TwoChunkResponse(t *testing.T) {
 		t.Fatalf("expected %s, got %q", codohResponseContentType, ct)
 	}
 
-	// Two-chunk format: [2-byte len][chunk1][chunk2]
-	if len(body) < 2 {
-		t.Fatalf("body too short: %d bytes", len(body))
-	}
-	chunk1Len := int(body[0])<<8 | int(body[1])
-	if 2+chunk1Len > len(body) {
-		t.Fatalf("chunk1 len %d exceeds body (%d bytes)", chunk1Len, len(body)-2)
-	}
-	chunk1 := body[2 : 2+chunk1Len]
-	chunk2 := body[2+chunk1Len:]
+	// Tagged chunk format: [1B type][2B BE len][data] per chunk
+	// Both enclave and target chunks should be present (order may vary).
+	var gotEnclave, gotTarget []byte
 
-	expectedChunk1 := []byte{0x01, 0x02, 0x03, 0x04}
-	if !bytes.Equal(chunk1, expectedChunk1) {
-		t.Fatalf("chunk1 mismatch: got %x, want %x", chunk1, expectedChunk1)
+	for len(body) >= 3 {
+		chunkType := body[0]
+		chunkLen := int(body[1])<<8 | int(body[2])
+		if 3+chunkLen > len(body) {
+			t.Fatalf("chunk type=%d len=%d exceeds remaining body (%d bytes)", chunkType, chunkLen, len(body)-3)
+		}
+		chunkData := body[3 : 3+chunkLen]
+		body = body[3+chunkLen:]
+
+		switch chunkType {
+		case ChunkTypeEnclave:
+			gotEnclave = chunkData
+		case ChunkTypeTarget:
+			gotTarget = chunkData
+		default:
+			t.Fatalf("unexpected chunk type: %d", chunkType)
+		}
 	}
-	if !bytes.Equal(chunk2, targetBody) {
-		t.Fatalf("chunk2 mismatch: got %x, want %x", chunk2, targetBody)
+
+	if !bytes.Equal(gotEnclave, dummyPayload) {
+		t.Fatalf("enclave chunk mismatch: got %x, want %x", gotEnclave, dummyPayload)
+	}
+	if !bytes.Equal(gotTarget, targetBody) {
+		t.Fatalf("target chunk mismatch: got %x, want %x", gotTarget, targetBody)
 	}
 }
 
@@ -214,8 +232,8 @@ func newCacheInsertProxy(t *testing.T, handler *mockEnclaveHandler) (*odohProxy,
 
 func TestCacheInsertHandler_ValidPOST(t *testing.T) {
 	handler := &mockEnclaveHandler{
-		processFunc: func(qe string) *enclave.Response {
-			return &enclave.Response{Status: enclave.StatusProcessed}
+		processFunc: func(qe []byte) *enclave.BinaryResponse {
+			return &enclave.BinaryResponse{Status: enclave.BinStatusProcessed}
 		},
 	}
 	proxy, cleanup := newCacheInsertProxy(t, handler)
@@ -234,24 +252,26 @@ func TestCacheInsertHandler_ValidPOST(t *testing.T) {
 		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, respBody)
 	}
 
-	// Verify enclave received the store_encrypted call with correct values
+	// Verify enclave received the store_encrypted call with correct raw bytes
 	handler.mu.Lock()
 	defer handler.mu.Unlock()
 	if len(handler.storeCalls) != 1 {
 		t.Fatalf("expected 1 store call, got %d", len(handler.storeCalls))
 	}
-	if handler.storeCalls[0].Blob != "AQIDBA==" {
-		t.Errorf("blob mismatch: got %q", handler.storeCalls[0].Blob)
+	expectedBlob, _ := base64.StdEncoding.DecodeString("AQIDBA==")
+	expectedSig, _ := base64.StdEncoding.DecodeString("BQYHCA==")
+	if !bytes.Equal(handler.storeCalls[0].Blob, expectedBlob) {
+		t.Errorf("blob mismatch: got %x, want %x", handler.storeCalls[0].Blob, expectedBlob)
 	}
-	if handler.storeCalls[0].Sig != "BQYHCA==" {
-		t.Errorf("sig mismatch: got %q", handler.storeCalls[0].Sig)
+	if !bytes.Equal(handler.storeCalls[0].Sig, expectedSig) {
+		t.Errorf("sig mismatch: got %x, want %x", handler.storeCalls[0].Sig, expectedSig)
 	}
 }
 
 func TestCacheInsertHandler_InvalidJSON(t *testing.T) {
 	handler := &mockEnclaveHandler{
-		processFunc: func(qe string) *enclave.Response {
-			return &enclave.Response{Status: enclave.StatusProcessed}
+		processFunc: func(qe []byte) *enclave.BinaryResponse {
+			return &enclave.BinaryResponse{Status: enclave.BinStatusProcessed}
 		},
 	}
 	proxy, cleanup := newCacheInsertProxy(t, handler)
@@ -269,8 +289,8 @@ func TestCacheInsertHandler_InvalidJSON(t *testing.T) {
 
 func TestCacheInsertHandler_MissingBlob(t *testing.T) {
 	handler := &mockEnclaveHandler{
-		processFunc: func(qe string) *enclave.Response {
-			return &enclave.Response{Status: enclave.StatusProcessed}
+		processFunc: func(qe []byte) *enclave.BinaryResponse {
+			return &enclave.BinaryResponse{Status: enclave.BinStatusProcessed}
 		},
 	}
 	proxy, cleanup := newCacheInsertProxy(t, handler)
@@ -289,11 +309,11 @@ func TestCacheInsertHandler_MissingBlob(t *testing.T) {
 
 func TestCacheInsertHandler_EnclaveIPCFail(t *testing.T) {
 	handler := &mockEnclaveHandler{
-		processFunc: func(qe string) *enclave.Response {
-			return &enclave.Response{Status: enclave.StatusProcessed}
+		processFunc: func(qe []byte) *enclave.BinaryResponse {
+			return &enclave.BinaryResponse{Status: enclave.BinStatusProcessed}
 		},
-		storeEncryptedFunc: func(blob, sig string) *enclave.Response {
-			return &enclave.Response{Status: enclave.StatusError, Error: "decrypt_failed"}
+		storeEncryptedFunc: func(blob, sig []byte) *enclave.BinaryResponse {
+			return &enclave.BinaryResponse{Status: enclave.BinStatusError, Payload: []byte("decrypt_failed")}
 		},
 	}
 	proxy, cleanup := newCacheInsertProxy(t, handler)

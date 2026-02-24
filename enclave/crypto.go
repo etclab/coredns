@@ -3,15 +3,30 @@ package enclave
 import (
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/rand"
+	crypto_rand "crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"sort"
+	math_rand "math/rand"
+	"sync"
 
 	"github.com/cloudflare/circl/hpke"
 	"github.com/cloudflare/circl/kem"
 )
+
+// padRngPool provides per-goroutine math/rand PRNGs seeded from crypto/rand.
+// Used for non-security-critical padding fill in PadToBucket and GenerateDummyResponse.
+// The padding bytes are inside HPKE/AES-GCM ciphertext — only bucket size matters
+// for G2/G3, not fill randomness. A sync.Pool eliminates mutex contention under
+// concurrent enclave query processing.
+var padRngPool = sync.Pool{
+	New: func() any {
+		var seed [8]byte
+		crypto_rand.Read(seed[:])
+		s := int64(binary.LittleEndian.Uint64(seed[:]))
+		return math_rand.New(math_rand.NewSource(s))
+	},
+}
 
 // HPKE suite: DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, AES-128-GCM
 var (
@@ -158,7 +173,7 @@ func EncryptCachedResponse(kr, response []byte) ([]byte, error) {
 	}
 
 	nonce := make([]byte, gcm.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
+	if _, err := crypto_rand.Read(nonce); err != nil {
 		return nil, fmt.Errorf("generate nonce: %w", err)
 	}
 
@@ -177,12 +192,14 @@ func EncryptCachedResponse(kr, response []byte) ([]byte, error) {
 // Value: 12 (nonce) + 256 (median DNS response) + 16 (GCM tag) = 284.
 const DummyInnerSize = 284
 
-// GenerateDummyResponse returns size bytes from crypto/rand.
-// Used to generate dummy inner payloads that are subsequently wrapped
-// with PadToBucket to match the structure of real encrypted responses.
+// GenerateDummyResponse returns size bytes of random data for dummy inner payloads
+// that are subsequently wrapped with PadToBucket to match the structure of real
+// encrypted responses. Uses math/rand (padding is inside ciphertext, not security-critical).
 func GenerateDummyResponse(size int) []byte {
 	buf := make([]byte, size)
-	rand.Read(buf)
+	rng := padRngPool.Get().(*math_rand.Rand)
+	rng.Read(buf)
+	padRngPool.Put(rng)
 	return buf
 }
 
@@ -205,13 +222,10 @@ func PadToBucket(data []byte, buckets []int) ([]byte, error) {
 		return nil, errors.New("data too large for 2-byte length prefix")
 	}
 
-	sorted := make([]int, len(buckets))
-	copy(sorted, buckets)
-	sort.Ints(sorted)
-
-	// Find the smallest bucket that fits
+	// Find the smallest bucket that fits.
+	// Caller MUST pass buckets in ascending sorted order.
 	targetSize := 0
-	for _, b := range sorted {
+	for _, b := range buckets {
 		if b >= needed {
 			targetSize = b
 			break
@@ -220,7 +234,7 @@ func PadToBucket(data []byte, buckets []int) ([]byte, error) {
 
 	// If no bucket fits, round up to next multiple of largest bucket
 	if targetSize == 0 {
-		largest := sorted[len(sorted)-1]
+		largest := buckets[len(buckets)-1]
 		targetSize = ((needed + largest - 1) / largest) * largest
 	}
 
@@ -228,10 +242,12 @@ func PadToBucket(data []byte, buckets []int) ([]byte, error) {
 	binary.LittleEndian.PutUint16(out[:2], uint16(len(data)))
 	copy(out[2:], data)
 
-	// Fill remaining bytes with random padding
+	// Fill remaining bytes with fast PRNG padding (not security-critical — inside ciphertext)
 	padStart := 2 + len(data)
 	if padStart < targetSize {
-		rand.Read(out[padStart:])
+		rng := padRngPool.Get().(*math_rand.Rand)
+		rng.Read(out[padStart:])
+		padRngPool.Put(rng)
 	}
 
 	return out, nil

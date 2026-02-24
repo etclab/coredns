@@ -1,10 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
 	"fmt"
 	"sync"
 	"testing"
@@ -26,7 +26,7 @@ func marshalSingleBundle(t *testing.T, b *enclave.CacheInsertBundle) []byte {
 
 func newTestHandler(replayDelta float64) *EnclaveHandler {
 	keypair, _ := enclave.GenerateKeypair()
-	return &EnclaveHandler{
+	h := &EnclaveHandler{
 		keypair:            keypair,
 		cache:              enclave.NewLRUCache(100),
 		replayDelta:        replayDelta,
@@ -41,6 +41,9 @@ func newTestHandler(replayDelta float64) *EnclaveHandler {
 		batchSize:          100,
 		batchCommitProb:    1.0, // always commit in tests for deterministic behavior
 	}
+	h.batchCh = make(chan struct{}, 16)
+	go h.batchWorker()
+	return h
 }
 
 // flushQueue forces all queued entries into cache via PutBatch.
@@ -165,6 +168,30 @@ func TestValidateTimestamp_ConcurrentSafety(t *testing.T) {
 
 // --- HandleStoreEncrypted replay rejection integration test ---
 
+// makeStoreReq builds an encrypted+signed store_encrypted request.
+// Returns raw ciphertext and raw signature bytes.
+func makeStoreReq(t *testing.T, h *EnclaveHandler, sigPriv ed25519.PrivateKey, query string, ts int64, ttl uint32) (ct, sig []byte) {
+	t.Helper()
+	bundle := &enclave.CacheInsertBundle{
+		TTL:            ttl,
+		Timestamp:      ts,
+		CanonicalQuery: query,
+		DNSResponse:    []byte{0xAB, 0xCD},
+	}
+	bundleBytes := marshalSingleBundle(t, bundle)
+
+	pubBytes, _ := h.keypair.PublicKeyBytes()
+	ciphertext, err := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
+	if err != nil {
+		t.Fatalf("EncryptForEnclave: %v", err)
+	}
+
+	hash := sha256.Sum256(bundleBytes)
+	sigBytes := ed25519.Sign(sigPriv, hash[:])
+
+	return ciphertext, sigBytes
+}
+
 func TestHandleStoreEncrypted_RejectsReplay(t *testing.T) {
 	// Generate signing key
 	sigPub, sigPriv, err := ed25519.GenerateKey(rand.Reader)
@@ -175,39 +202,14 @@ func TestHandleStoreEncrypted_RejectsReplay(t *testing.T) {
 	h := newTestHandler(3.0)
 	h.targetSigningPubKey = sigPub
 
-	// Helper: build an encrypted+signed store_encrypted request
-	makeStoreReq := func(query string, ts int64, ttl uint32) (encBlob, sig string) {
-		bundle := &enclave.CacheInsertBundle{
-			TTL:            ttl,
-			Timestamp:      ts,
-			CanonicalQuery: query,
-			DNSResponse:    []byte{0xAB, 0xCD},
-		}
-		bundleBytes := marshalSingleBundle(t, bundle)
-
-		// Encrypt to enclave's public key using the target's encrypt helper
-		pubBytes, _ := h.keypair.PublicKeyBytes()
-		ciphertext, err := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
-		if err != nil {
-			t.Fatalf("EncryptForEnclave: %v", err)
-		}
-
-		// Sign H(plaintext_bundle)
-		hash := sha256.Sum256(bundleBytes)
-		sigBytes := ed25519.Sign(sigPriv, hash[:])
-
-		return base64.StdEncoding.EncodeToString(ciphertext),
-			base64.StdEncoding.EncodeToString(sigBytes)
-	}
-
 	tLatest := int64(0)
 	expectedResp := []byte{0xAB, 0xCD}
 
 	// Insert 1: ts=1000 → accepted, tLatest advances to 1000
-	blob1, sig1 := makeStoreReq("example.com.:1", 1000, 300)
-	resp := h.HandleStoreEncrypted(blob1, sig1)
-	if resp.Status != enclave.StatusOK {
-		t.Fatalf("insert 1 should succeed, got status=%s error=%s", resp.Status, resp.Error)
+	ct1, sig1 := makeStoreReq(t, h, sigPriv, "example.com.:1", 1000, 300)
+	resp := h.HandleStoreEncrypted(ct1, sig1)
+	if resp.Status != enclave.BinStatusOK {
+		t.Fatalf("insert 1 should succeed, got status=0x%02x payload=%s", resp.Status, string(resp.Payload))
 	}
 	tLatest = 1000
 	if got := h.tLatest.Load(); got != tLatest {
@@ -225,10 +227,10 @@ func TestHandleStoreEncrypted_RejectsReplay(t *testing.T) {
 	}
 
 	// Insert 2: ts=1005 → accepted, tLatest advances to 1005
-	blob2, sig2 := makeStoreReq("other.com.:1", 1005, 300)
-	resp = h.HandleStoreEncrypted(blob2, sig2)
-	if resp.Status != enclave.StatusOK {
-		t.Fatalf("insert 2 should succeed, got status=%s error=%s", resp.Status, resp.Error)
+	ct2, sig2 := makeStoreReq(t, h, sigPriv, "other.com.:1", 1005, 300)
+	resp = h.HandleStoreEncrypted(ct2, sig2)
+	if resp.Status != enclave.BinStatusOK {
+		t.Fatalf("insert 2 should succeed, got status=0x%02x payload=%s", resp.Status, string(resp.Payload))
 	}
 	tLatest = 1005
 	flushQueue(h)
@@ -240,25 +242,22 @@ func TestHandleStoreEncrypted_RejectsReplay(t *testing.T) {
 		t.Fatalf("cached response mismatch: got %x, want %x", cached, expectedResp)
 	}
 
-	// Literal replay: proxy re-sends (blob1, sig1) verbatim after tLatest advanced.
-	// This is the actual threat — same ciphertext, same signature, re-delivered.
-	// HPKE base-mode decryption succeeds again (no stateful nonce), signature still
-	// verifies, so the δ-check must be the thing that catches it.
-	// ts=1000 < 1005-3=1002 → REJECTED with stale_timestamp (not decrypt_failed)
-	resp = h.HandleStoreEncrypted(blob1, sig1)
-	if resp.Status != enclave.StatusError {
-		t.Fatalf("literal replay should be rejected, got status=%s", resp.Status)
+	// Literal replay: proxy re-sends (ct1, sig1) verbatim after tLatest advanced.
+	// ts=1000 < 1005-3=1002 → REJECTED with stale_timestamp
+	resp = h.HandleStoreEncrypted(ct1, sig1)
+	if resp.Status != enclave.BinStatusError {
+		t.Fatalf("literal replay should be rejected, got status=0x%02x", resp.Status)
 	}
-	if resp.Error != enclave.ErrStaleTimestamp {
+	if string(resp.Payload) != enclave.ErrStaleTimestamp {
 		t.Fatalf("literal replay must fail on stale_timestamp (not %s) — "+
-			"confirms δ-check catches it, not HPKE stateful rejection", resp.Error)
+			"confirms δ-check catches it, not HPKE stateful rejection", string(resp.Payload))
 	}
 
 	// Insert 3: ts=1003 → 1003 < 1005-3=1002? No → accepted (within δ window)
-	blob3, sig3 := makeStoreReq("recent.com.:1", 1003, 300)
-	resp = h.HandleStoreEncrypted(blob3, sig3)
-	if resp.Status != enclave.StatusOK {
-		t.Fatalf("insert within δ should succeed, got status=%s error=%s", resp.Status, resp.Error)
+	ct3, sig3 := makeStoreReq(t, h, sigPriv, "recent.com.:1", 1003, 300)
+	resp = h.HandleStoreEncrypted(ct3, sig3)
+	if resp.Status != enclave.BinStatusOK {
+		t.Fatalf("insert within δ should succeed, got status=0x%02x payload=%s", resp.Status, string(resp.Payload))
 	}
 	flushQueue(h)
 
@@ -280,8 +279,8 @@ func TestHandleStoreEncrypted_RejectsReplay(t *testing.T) {
 
 // --- Sprint 3: Defensive Mode Tests ---
 
-// makeProcessReq builds a Q_E encrypted under the handler's pk_E.
-func makeProcessReq(t *testing.T, h *EnclaveHandler, query string) string {
+// makeProcessReq builds a raw Q_E encrypted under the handler's pk_E.
+func makeProcessReq(t *testing.T, h *EnclaveHandler, query string) []byte {
 	t.Helper()
 	pubBytes, _ := h.keypair.PublicKeyBytes()
 	pk, err := enclave.ParsePublicKeyBytes(pubBytes)
@@ -293,7 +292,7 @@ func makeProcessReq(t *testing.T, h *EnclaveHandler, query string) string {
 	if err != nil {
 		t.Fatalf("EncryptQueryE: %v", err)
 	}
-	return base64.StdEncoding.EncodeToString(qe)
+	return qe
 }
 
 func TestDefensiveMode_BootReturnsDummy(t *testing.T) {
@@ -307,10 +306,10 @@ func TestDefensiveMode_BootReturnsDummy(t *testing.T) {
 	qe := makeProcessReq(t, h, "example.com.:1")
 	resp := h.HandleProcess(qe)
 
-	if resp.Status != enclave.StatusProcessed {
-		t.Fatalf("defensive mode should return processed, got status=%s", resp.Status)
+	if resp.Status != enclave.BinStatusProcessed {
+		t.Fatalf("defensive mode should return processed, got status=0x%02x", resp.Status)
 	}
-	if resp.Response == "" {
+	if len(resp.Payload) == 0 {
 		t.Fatal("defensive mode should return a dummy blob")
 	}
 }
@@ -324,22 +323,10 @@ func TestDefensiveMode_ExitsOnWarmupThreshold(t *testing.T) {
 
 	makeStore := func(query string, ts int64) {
 		t.Helper()
-		bundle := &enclave.CacheInsertBundle{
-			TTL: 300, Timestamp: ts,
-			CanonicalQuery: query,
-			DNSResponse:    []byte{0xAB},
-		}
-		bundleBytes := marshalSingleBundle(t, bundle)
-		pubBytes, _ := h.keypair.PublicKeyBytes()
-		ct, _ := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
-		hash := sha256.Sum256(bundleBytes)
-		sig := ed25519.Sign(sigPriv, hash[:])
-		resp := h.HandleStoreEncrypted(
-			base64.StdEncoding.EncodeToString(ct),
-			base64.StdEncoding.EncodeToString(sig),
-		)
-		if resp.Status != enclave.StatusOK {
-			t.Fatalf("store %s failed: %s %s", query, resp.Status, resp.Error)
+		ct, sig := makeStoreReq(t, h, sigPriv, query, ts, 300)
+		resp := h.HandleStoreEncrypted(ct, sig)
+		if resp.Status != enclave.BinStatusOK {
+			t.Fatalf("store %s failed: 0x%02x %s", query, resp.Status, string(resp.Payload))
 		}
 	}
 
@@ -352,8 +339,8 @@ func TestDefensiveMode_ExitsOnWarmupThreshold(t *testing.T) {
 	// commits 2 entries → cache.Size()=2 < 3 → still defensive
 	qe := makeProcessReq(t, h, "a.com.:1")
 	resp := h.HandleProcess(qe)
-	if resp.Status != enclave.StatusProcessed {
-		t.Fatalf("should still return processed before threshold (2 < 3), got %s", resp.Status)
+	if resp.Status != enclave.BinStatusProcessed {
+		t.Fatalf("should still return processed before threshold (2 < 3), got 0x%02x", resp.Status)
 	}
 
 	// 3rd store → queued
@@ -363,15 +350,15 @@ func TestDefensiveMode_ExitsOnWarmupThreshold(t *testing.T) {
 	// commits 1 entry → cache.Size()=3 >= 3 → exits defensive mode
 	qe = makeProcessReq(t, h, "a.com.:1")
 	resp = h.HandleProcess(qe)
-	if resp.Status != enclave.StatusProcessed {
-		t.Fatalf("expected processed (defensive response determined before commit), got %s", resp.Status)
+	if resp.Status != enclave.BinStatusProcessed {
+		t.Fatalf("expected processed (defensive response determined before commit), got 0x%02x", resp.Status)
 	}
 
 	// Now defensive mode exited. Next HandleProcess should return processed (hit).
 	qe = makeProcessReq(t, h, "a.com.:1")
 	resp = h.HandleProcess(qe)
-	if resp.Status != enclave.StatusProcessed {
-		t.Fatalf("expected processed after warm-up exit (3 >= 3), got status=%s", resp.Status)
+	if resp.Status != enclave.BinStatusProcessed {
+		t.Fatalf("expected processed after warm-up exit (3 >= 3), got status=0x%02x", resp.Status)
 	}
 }
 
@@ -386,8 +373,8 @@ func TestOmissionDetection_EntersDefensiveMode(t *testing.T) {
 	// Verify normal mode works — cache hit
 	qe := makeProcessReq(t, h, "cached.com.:1")
 	resp := h.HandleProcess(qe)
-	if resp.Status != enclave.StatusProcessed {
-		t.Fatalf("expected processed before omission, got %s", resp.Status)
+	if resp.Status != enclave.BinStatusProcessed {
+		t.Fatalf("expected processed before omission, got 0x%02x", resp.Status)
 	}
 
 	// Generate 6 cache misses (> threshold of 5) to trigger omission detection
@@ -400,18 +387,12 @@ func TestOmissionDetection_EntersDefensiveMode(t *testing.T) {
 	// Defensive mode active + cache cleared: previously-cached entry now returns processed (dummy)
 	qe = makeProcessReq(t, h, "cached.com.:1")
 	resp = h.HandleProcess(qe)
-	if resp.Status != enclave.StatusProcessed {
-		t.Fatalf("expected processed after omission (defensive mode + cache cleared), got %s", resp.Status)
+	if resp.Status != enclave.BinStatusProcessed {
+		t.Fatalf("expected processed after omission (defensive mode + cache cleared), got 0x%02x", resp.Status)
 	}
 }
 
 func TestOutstandingTTL_Cleanup(t *testing.T) {
-	// Verify that stale outstanding entries are evicted by inline TTL cleanup,
-	// preventing them from falsely triggering omission detection.
-	//
-	// Strategy: create old outstanding entries, then advance tLatest far enough
-	// that cleanup evicts them. Then add new entries up to (but not exceeding)
-	// the threshold. If old entries survived, total would exceed → omission.
 	h := newTestHandler(3.0)
 	h.outstandingTTLSecs = 300
 	h.omissionThreshold = 8
@@ -431,26 +412,13 @@ func TestOutstandingTTL_Cleanup(t *testing.T) {
 	sigPub, sigPriv, _ := ed25519.GenerateKey(rand.Reader)
 	h.targetSigningPubKey = sigPub
 
-	bundle := &enclave.CacheInsertBundle{
-		TTL: 3600, Timestamp: 500,
-		CanonicalQuery: "stored.com.:1",
-		DNSResponse:    []byte{0xAB},
-	}
-	bundleBytes := marshalSingleBundle(t, bundle)
-	pubBytes, _ := h.keypair.PublicKeyBytes()
-	ct, _ := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
-	hash := sha256.Sum256(bundleBytes)
-	sig := ed25519.Sign(sigPriv, hash[:])
-	resp := h.HandleStoreEncrypted(
-		base64.StdEncoding.EncodeToString(ct),
-		base64.StdEncoding.EncodeToString(sig),
-	)
-	if resp.Status != enclave.StatusOK {
-		t.Fatalf("store failed: %s %s", resp.Status, resp.Error)
+	ct, sig := makeStoreReq(t, h, sigPriv, "stored.com.:1", 500, 3600)
+	resp := h.HandleStoreEncrypted(ct, sig)
+	if resp.Status != enclave.BinStatusOK {
+		t.Fatalf("store failed: 0x%02x %s", resp.Status, string(resp.Payload))
 	}
 
 	// 5 more unique misses at tLatest=500 → outstanding should be 5 (not 10)
-	// Note: with batchCommitProb=1.0, each HandleProcess also commits queued entries.
 	for i := 0; i < 5; i++ {
 		qe := makeProcessReq(t, h, fmt.Sprintf("new%d.com.:1", i))
 		h.HandleProcess(qe)
@@ -460,18 +428,12 @@ func TestOutstandingTTL_Cleanup(t *testing.T) {
 	// If cleanup worked, outstanding=5 ≤ 8 → no omission → sentinel still reachable.
 	qe := makeProcessReq(t, h, "sentinel.com.:1")
 	resp2 := h.HandleProcess(qe)
-	if resp2.Status != enclave.StatusProcessed {
-		t.Fatalf("expected processed (TTL cleanup should prevent omission), got %s", resp2.Status)
+	if resp2.Status != enclave.BinStatusProcessed {
+		t.Fatalf("expected processed (TTL cleanup should prevent omission), got 0x%02x", resp2.Status)
 	}
 }
 
 func TestOutstandingQuery_RemovedOnStore(t *testing.T) {
-	// Verify that a store for an outstanding query removes it from tracking,
-	// preventing it from counting toward the omission threshold.
-	//
-	// Strategy: accumulate outstanding entries near the threshold, then store
-	// one of them (removing it). Add more misses up to what WOULD exceed the
-	// threshold if the entry survived. If removal works → no omission.
 	h := newTestHandler(3.0)
 	h.omissionThreshold = 3
 	h.tLatest.Store(1000)
@@ -483,41 +445,26 @@ func TestOutstandingQuery_RemovedOnStore(t *testing.T) {
 	h.HandleProcess(qe)
 
 	// Store for "a.com.:1" → removes from outstanding, puts in cache.
-	// Outstanding = {b} = 1.
 	sigPub, sigPriv, _ := ed25519.GenerateKey(rand.Reader)
 	h.targetSigningPubKey = sigPub
 
-	bundle := &enclave.CacheInsertBundle{
-		TTL: 300, Timestamp: 1001,
-		CanonicalQuery: "a.com.:1",
-		DNSResponse:    []byte{0xAB},
-	}
-	bundleBytes := marshalSingleBundle(t, bundle)
-	pubBytes, _ := h.keypair.PublicKeyBytes()
-	ct, _ := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
-	hash := sha256.Sum256(bundleBytes)
-	sig := ed25519.Sign(sigPriv, hash[:])
-	resp := h.HandleStoreEncrypted(
-		base64.StdEncoding.EncodeToString(ct),
-		base64.StdEncoding.EncodeToString(sig),
-	)
-	if resp.Status != enclave.StatusOK {
-		t.Fatalf("store failed: %s %s", resp.Status, resp.Error)
+	ct, sig := makeStoreReq(t, h, sigPriv, "a.com.:1", 1001, 300)
+	resp := h.HandleStoreEncrypted(ct, sig)
+	if resp.Status != enclave.BinStatusOK {
+		t.Fatalf("store failed: 0x%02x %s", resp.Status, string(resp.Payload))
 	}
 
-	// 2 more unique misses: outstanding = {b, c, d} = 3. (3 > 3? No.)
-	// Without removal: outstanding = {a, b, c, d} = 4. (4 > 3? Yes → omission.)
+	// 2 more unique misses
 	qe = makeProcessReq(t, h, "c.com.:1")
 	h.HandleProcess(qe)
 	qe = makeProcessReq(t, h, "d.com.:1")
 	h.HandleProcess(qe)
 
 	// If removal worked: "a.com.:1" is cached and no omission → processed (hit).
-	// If removal failed: omission triggered → cache cleared → processed (dummy).
 	qe = makeProcessReq(t, h, "a.com.:1")
 	resp2 := h.HandleProcess(qe)
-	if resp2.Status != enclave.StatusProcessed {
-		t.Fatalf("expected processed (store should remove from outstanding, preventing omission), got %s", resp2.Status)
+	if resp2.Status != enclave.BinStatusProcessed {
+		t.Fatalf("expected processed (store should remove from outstanding, preventing omission), got 0x%02x", resp2.Status)
 	}
 }
 
@@ -529,11 +476,10 @@ func TestKeyRotation_ReturnedOnHPKEFailure(t *testing.T) {
 	otherPubBytes, _ := otherKeypair.PublicKeyBytes()
 	otherPub, _ := enclave.ParsePublicKeyBytes(otherPubBytes)
 	qe, _, _ := enclave.EncryptQueryE(otherPub, []byte("example.com.:1"))
-	qeB64 := base64.StdEncoding.EncodeToString(qe)
 
-	resp := h.HandleProcess(qeB64)
-	if resp.Status != enclave.StatusKeyRotated {
-		t.Fatalf("expected key_rotated on HPKE failure, got status=%s error=%s", resp.Status, resp.Error)
+	resp := h.HandleProcess(qe)
+	if resp.Status != enclave.BinStatusKeyRotated {
+		t.Fatalf("expected key_rotated on HPKE failure, got status=0x%02x", resp.Status)
 	}
 }
 
@@ -545,12 +491,11 @@ func TestKeyRotation_DuringDefensiveMode(t *testing.T) {
 	otherPubBytes, _ := otherKeypair.PublicKeyBytes()
 	otherPub, _ := enclave.ParsePublicKeyBytes(otherPubBytes)
 	qe, _, _ := enclave.EncryptQueryE(otherPub, []byte("example.com.:1"))
-	qeB64 := base64.StdEncoding.EncodeToString(qe)
 
 	// Key rotation takes priority over defensive mode
-	resp := h.HandleProcess(qeB64)
-	if resp.Status != enclave.StatusKeyRotated {
-		t.Fatalf("key rotation should take priority in defensive mode, got status=%s", resp.Status)
+	resp := h.HandleProcess(qe)
+	if resp.Status != enclave.BinStatusKeyRotated {
+		t.Fatalf("key rotation should take priority in defensive mode, got status=0x%02x", resp.Status)
 	}
 }
 
@@ -558,24 +503,20 @@ func TestHealthEndpoint_IncludesStartedAt(t *testing.T) {
 	h := newTestHandler(3.0)
 	resp := h.HandleHealth()
 
-	if resp.Status != enclave.StatusOK {
-		t.Fatalf("health should return ok, got %s", resp.Status)
+	if resp.Status != enclave.BinStatusOK {
+		t.Fatalf("health should return ok, got 0x%02x", resp.Status)
 	}
-	if resp.StartedAt == "" {
-		t.Fatal("health response should include started_at")
+	// Payload is JSON-encoded healthStats
+	if len(resp.Payload) == 0 {
+		t.Fatal("health response should include payload")
 	}
-	// Verify it's valid RFC3339
-	if _, err := time.Parse(time.RFC3339, resp.StartedAt); err != nil {
-		t.Fatalf("started_at should be RFC3339, got %q: %v", resp.StartedAt, err)
+	// Just verify it contains started_at
+	if !bytes.Contains(resp.Payload, []byte("started_at")) {
+		t.Fatalf("health payload should contain started_at, got: %s", string(resp.Payload))
 	}
 }
 
 func TestDefensiveMode_NoOutstandingTrackingDuringDefensive(t *testing.T) {
-	// Verify that queries during defensive mode do NOT add to outstanding tracking.
-	//
-	// Strategy: send many queries during defensive mode (more than omission threshold),
-	// then exit defensive mode via stores. If entries leaked into the outstanding map,
-	// the first post-recovery miss would push past the threshold and re-trigger omission.
 	h := newTestHandlerDefensive(3.0)
 	h.warmupThreshold = 5
 	h.omissionThreshold = 5
@@ -586,8 +527,8 @@ func TestDefensiveMode_NoOutstandingTrackingDuringDefensive(t *testing.T) {
 		query := fmt.Sprintf("defensive%d.com.:1", i)
 		qe := makeProcessReq(t, h, query)
 		resp := h.HandleProcess(qe)
-		if resp.Status != enclave.StatusProcessed {
-			t.Fatalf("expected processed during defensive mode, got %s", resp.Status)
+		if resp.Status != enclave.BinStatusProcessed {
+			t.Fatalf("expected processed during defensive mode, got 0x%02x", resp.Status)
 		}
 	}
 
@@ -597,26 +538,14 @@ func TestDefensiveMode_NoOutstandingTrackingDuringDefensive(t *testing.T) {
 
 	for i := 0; i < 5; i++ {
 		query := fmt.Sprintf("stored%d.com.:1", i)
-		bundle := &enclave.CacheInsertBundle{
-			TTL: 300, Timestamp: int64(1001 + i),
-			CanonicalQuery: query, DNSResponse: []byte{0xAB},
-		}
-		bundleBytes := marshalSingleBundle(t, bundle)
-		pubBytes, _ := h.keypair.PublicKeyBytes()
-		ct, _ := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
-		hash := sha256.Sum256(bundleBytes)
-		sig := ed25519.Sign(sigPriv, hash[:])
-		resp := h.HandleStoreEncrypted(
-			base64.StdEncoding.EncodeToString(ct),
-			base64.StdEncoding.EncodeToString(sig),
-		)
-		if resp.Status != enclave.StatusOK {
-			t.Fatalf("store %s failed: %s %s", query, resp.Status, resp.Error)
+		ct, sig := makeStoreReq(t, h, sigPriv, query, int64(1001+i), 300)
+		resp := h.HandleStoreEncrypted(ct, sig)
+		if resp.Status != enclave.BinStatusOK {
+			t.Fatalf("store %s failed: 0x%02x %s", query, resp.Status, string(resp.Payload))
 		}
 	}
 
 	// Send 3 new misses (under threshold of 5).
-	// If 10 entries leaked from defensive mode: outstanding=10+3=13 > 5 → omission.
 	for i := 0; i < 3; i++ {
 		qe := makeProcessReq(t, h, fmt.Sprintf("postrecovery%d.com.:1", i))
 		h.HandleProcess(qe)
@@ -625,14 +554,12 @@ func TestDefensiveMode_NoOutstandingTrackingDuringDefensive(t *testing.T) {
 	// If no leakage: outstanding=3 ≤ 5 → no omission → stored entry is processed (hit).
 	qe := makeProcessReq(t, h, "stored0.com.:1")
 	resp := h.HandleProcess(qe)
-	if resp.Status != enclave.StatusProcessed {
-		t.Fatalf("expected processed (no outstanding leakage during defensive mode), got %s", resp.Status)
+	if resp.Status != enclave.BinStatusProcessed {
+		t.Fatalf("expected processed (no outstanding leakage during defensive mode), got 0x%02x", resp.Status)
 	}
 }
 
 func TestDefensiveMode_FullCycle(t *testing.T) {
-	// Full state machine cycle verified purely through response statuses:
-	// boot(defensive) → stores → exit → hit → omission → defensive → stores → exit → hit
 	h := newTestHandlerDefensive(3.0)
 	h.warmupThreshold = 3
 	h.omissionThreshold = 3
@@ -644,21 +571,10 @@ func TestDefensiveMode_FullCycle(t *testing.T) {
 	storeOne := func(query string) {
 		t.Helper()
 		ts++
-		bundle := &enclave.CacheInsertBundle{
-			TTL: 300, Timestamp: ts,
-			CanonicalQuery: query, DNSResponse: []byte{0xAB},
-		}
-		bundleBytes := marshalSingleBundle(t, bundle)
-		pubBytes, _ := h.keypair.PublicKeyBytes()
-		ct, _ := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
-		hash := sha256.Sum256(bundleBytes)
-		sig := ed25519.Sign(sigPriv, hash[:])
-		resp := h.HandleStoreEncrypted(
-			base64.StdEncoding.EncodeToString(ct),
-			base64.StdEncoding.EncodeToString(sig),
-		)
-		if resp.Status != enclave.StatusOK {
-			t.Fatalf("store %s failed: %s %s", query, resp.Status, resp.Error)
+		ct, sig := makeStoreReq(t, h, sigPriv, query, ts, 300)
+		resp := h.HandleStoreEncrypted(ct, sig)
+		if resp.Status != enclave.BinStatusOK {
+			t.Fatalf("store %s failed: 0x%02x %s", query, resp.Status, string(resp.Payload))
 		}
 	}
 
@@ -668,17 +584,16 @@ func TestDefensiveMode_FullCycle(t *testing.T) {
 	storeOne("c.com.:1")
 
 	// Phase 2: HandleProcess triggers batch commit (prob=1.0), exits defensive mode.
-	// First call: defensive → dummy response, then commits 3 entries → exits warmup.
 	qe := makeProcessReq(t, h, "a.com.:1")
 	resp := h.HandleProcess(qe)
-	if resp.Status != enclave.StatusProcessed {
-		t.Fatalf("phase 2a: expected processed (defensive response before commit), got %s", resp.Status)
+	if resp.Status != enclave.BinStatusProcessed {
+		t.Fatalf("phase 2a: expected processed (defensive response before commit), got 0x%02x", resp.Status)
 	}
 	// Second call: normal mode → cache hit proves defensive mode exited.
 	qe = makeProcessReq(t, h, "a.com.:1")
 	resp = h.HandleProcess(qe)
-	if resp.Status != enclave.StatusProcessed {
-		t.Fatalf("phase 2b: expected processed after recovery, got %s", resp.Status)
+	if resp.Status != enclave.BinStatusProcessed {
+		t.Fatalf("phase 2b: expected processed after recovery, got 0x%02x", resp.Status)
 	}
 
 	// Phase 3: Trigger omission detection — 4 unique misses (> threshold=3)
@@ -687,11 +602,11 @@ func TestDefensiveMode_FullCycle(t *testing.T) {
 		h.HandleProcess(qe)
 	}
 
-	// Previously-cached entry now returns processed (dummy) → defensive mode re-entered + cache cleared
+	// Previously-cached entry now returns processed (dummy)
 	qe = makeProcessReq(t, h, "a.com.:1")
 	resp = h.HandleProcess(qe)
-	if resp.Status != enclave.StatusProcessed {
-		t.Fatalf("phase 3: expected processed (defensive mode after omission), got %s", resp.Status)
+	if resp.Status != enclave.BinStatusProcessed {
+		t.Fatalf("phase 3: expected processed (defensive mode after omission), got 0x%02x", resp.Status)
 	}
 
 	// Phase 4: Second recovery via 3 new stores (queued)
@@ -700,26 +615,21 @@ func TestDefensiveMode_FullCycle(t *testing.T) {
 	storeOne("f.com.:1")
 
 	// Phase 5: HandleProcess commits and exits defensive mode.
-	// First call: defensive → dummy, commits 3 entries → exits warmup.
 	qe = makeProcessReq(t, h, "d.com.:1")
 	resp = h.HandleProcess(qe)
-	if resp.Status != enclave.StatusProcessed {
-		t.Fatalf("phase 5a: expected processed (defensive response before commit), got %s", resp.Status)
+	if resp.Status != enclave.BinStatusProcessed {
+		t.Fatalf("phase 5a: expected processed (defensive response before commit), got 0x%02x", resp.Status)
 	}
-	// Second call: normal mode → cache hit proves defensive mode exited again.
 	qe = makeProcessReq(t, h, "d.com.:1")
 	resp = h.HandleProcess(qe)
-	if resp.Status != enclave.StatusProcessed {
-		t.Fatalf("phase 5b: expected processed after second recovery, got %s", resp.Status)
+	if resp.Status != enclave.BinStatusProcessed {
+		t.Fatalf("phase 5b: expected processed after second recovery, got 0x%02x", resp.Status)
 	}
 }
 
 // --- Concurrent tests (run with -race) ---
 
 func TestDefensiveMode_ConcurrentMissesAndStores(t *testing.T) {
-	// Concurrent HandleProcess (misses) and HandleStoreEncrypted (stores)
-	// racing on a handler starting in defensive mode. Verifies no panics,
-	// no data races, and that stores eventually exit defensive mode.
 	h := newTestHandlerDefensive(100.0) // wide δ so all stores accepted
 	h.warmupThreshold = 20
 	h.omissionThreshold = 200 // high — testing recovery, not omission
@@ -747,32 +657,17 @@ func TestDefensiveMode_ConcurrentMissesAndStores(t *testing.T) {
 			defer wg.Done()
 			ts := int64(1000 + idx)
 			query := fmt.Sprintf("cstore%d.com.:1", idx)
-			bundle := &enclave.CacheInsertBundle{
-				TTL: 300, Timestamp: ts,
-				CanonicalQuery: query, DNSResponse: []byte{0xAB},
-			}
-			bundleBytes := marshalSingleBundle(t, bundle)
-			pubBytes, _ := h.keypair.PublicKeyBytes()
-			ct, _ := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
-			hash := sha256.Sum256(bundleBytes)
-			sig := ed25519.Sign(sigPriv, hash[:])
-			h.HandleStoreEncrypted(
-				base64.StdEncoding.EncodeToString(ct),
-				base64.StdEncoding.EncodeToString(sig),
-			)
+			ct, sig := makeStoreReq(t, h, sigPriv, query, ts, 300)
+			h.HandleStoreEncrypted(ct, sig)
 		}(i)
 	}
 
 	wg.Wait()
 
 	// After all goroutines: flush remaining queue entries and verify handler is usable.
-	// With batching, some entries may still be in queue if HandleProcess calls
-	// happened before stores enqueued. Flush to get accurate cache size.
 	flushQueue(h)
 
 	// With 30 stores and threshold=20, defensive mode should have exited
-	// (either during HandleProcess commits or after our flush).
-	// Some stores may be replay-rejected depending on scheduling.
 	h.mu.Lock()
 	if h.defensiveMode && h.cache.Size() >= h.warmupThreshold {
 		h.defensiveMode = false
@@ -780,25 +675,19 @@ func TestDefensiveMode_ConcurrentMissesAndStores(t *testing.T) {
 	h.mu.Unlock()
 
 	if h.cache.Size() >= h.warmupThreshold {
-		// Defensive mode should have exited — verify with a processed response
 		qe := makeProcessReq(t, h, "cstore0.com.:1")
 		resp := h.HandleProcess(qe)
-		if resp.Status != enclave.StatusProcessed {
-			t.Fatalf("expected processed after concurrent recovery (cache=%d), got %s",
+		if resp.Status != enclave.BinStatusProcessed {
+			t.Fatalf("expected processed after concurrent recovery (cache=%d), got 0x%02x",
 				h.cache.Size(), resp.Status)
 		}
 	} else {
-		// Not enough stores survived replay rejection — still defensive.
-		// This is OK; the main value is -race detecting no data races.
 		t.Logf("cache size %d < threshold %d (replay rejection); race-safety verified",
 			h.cache.Size(), h.warmupThreshold)
 	}
 }
 
 func TestDefensiveMode_ConcurrentOmissionTrigger(t *testing.T) {
-	// Many goroutines send unique misses concurrently, racing to trigger
-	// omission detection. Verifies no panics, no data races, and that
-	// the handler reaches defensive mode.
 	h := newTestHandler(3.0) // starts in normal mode
 	h.omissionThreshold = 5
 	h.tLatest.Store(1000)
@@ -809,11 +698,11 @@ func TestDefensiveMode_ConcurrentOmissionTrigger(t *testing.T) {
 	// Verify sentinel is reachable before the storm
 	qe := makeProcessReq(t, h, "sentinel.com.:1")
 	resp := h.HandleProcess(qe)
-	if resp.Status != enclave.StatusProcessed {
-		t.Fatalf("expected processed before concurrent misses, got %s", resp.Status)
+	if resp.Status != enclave.BinStatusProcessed {
+		t.Fatalf("expected processed before concurrent misses, got 0x%02x", resp.Status)
 	}
 
-	// 20 goroutines all send unique misses — at least one push will exceed threshold
+	// 20 goroutines all send unique misses
 	var wg sync.WaitGroup
 	for i := 0; i < 20; i++ {
 		wg.Add(1)
@@ -826,40 +715,26 @@ func TestDefensiveMode_ConcurrentOmissionTrigger(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Sentinel should now be unreachable: defensive mode active + cache cleared
+	// Sentinel should now be unreachable
 	qe = makeProcessReq(t, h, "sentinel.com.:1")
 	resp = h.HandleProcess(qe)
-	if resp.Status != enclave.StatusProcessed {
-		t.Fatalf("expected processed after concurrent omission trigger, got %s", resp.Status)
+	if resp.Status != enclave.BinStatusProcessed {
+		t.Fatalf("expected processed after concurrent omission trigger, got 0x%02x", resp.Status)
 	}
 }
 
 // --- Sprint 4: Batch Cache Update Tests ---
 
 func TestBatch_StoreEnqueuesNotCaches(t *testing.T) {
-	// Verify that HandleStoreEncrypted enqueues entries, NOT placing them in cache directly.
 	sigPub, sigPriv, _ := ed25519.GenerateKey(rand.Reader)
 	h := newTestHandler(3.0)
-	h.batchCommitProb = 0 // disable auto-commit to test pure enqueueing
+	h.batchCommitProb = 0 // disable auto-commit
 	h.targetSigningPubKey = sigPub
 
-	bundle := &enclave.CacheInsertBundle{
-		TTL: 300, Timestamp: 1000,
-		CanonicalQuery: "queued.com.:1",
-		DNSResponse:    []byte{0xAB},
-	}
-	bundleBytes := marshalSingleBundle(t, bundle)
-	pubBytes, _ := h.keypair.PublicKeyBytes()
-	ct, _ := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
-	hash := sha256.Sum256(bundleBytes)
-	sig := ed25519.Sign(sigPriv, hash[:])
-
-	resp := h.HandleStoreEncrypted(
-		base64.StdEncoding.EncodeToString(ct),
-		base64.StdEncoding.EncodeToString(sig),
-	)
-	if resp.Status != enclave.StatusOK {
-		t.Fatalf("store should succeed, got %s %s", resp.Status, resp.Error)
+	ct, sig := makeStoreReq(t, h, sigPriv, "queued.com.:1", 1000, 300)
+	resp := h.HandleStoreEncrypted(ct, sig)
+	if resp.Status != enclave.BinStatusOK {
+		t.Fatalf("store should succeed, got 0x%02x %s", resp.Status, string(resp.Payload))
 	}
 
 	// Entry should NOT be in cache
@@ -874,7 +749,6 @@ func TestBatch_StoreEnqueuesNotCaches(t *testing.T) {
 }
 
 func TestBatch_HandleProcessCommitsQueue(t *testing.T) {
-	// Verify that HandleProcess coin flip triggers batch commit.
 	sigPub, sigPriv, _ := ed25519.GenerateKey(rand.Reader)
 	h := newTestHandler(3.0)
 	h.batchCommitProb = 1.0 // always commit
@@ -885,29 +759,20 @@ func TestBatch_HandleProcessCommitsQueue(t *testing.T) {
 	// Enqueue 3 entries
 	for i := 0; i < 3; i++ {
 		query := fmt.Sprintf("batch%d.com.:1", i)
-		bundle := &enclave.CacheInsertBundle{
-			TTL: 300, Timestamp: int64(1000 + i),
-			CanonicalQuery: query,
-			DNSResponse:    []byte{0xAB},
-		}
-		bundleBytes := marshalSingleBundle(t, bundle)
-		pubBytes, _ := h.keypair.PublicKeyBytes()
-		ct, _ := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
-		hash := sha256.Sum256(bundleBytes)
-		sig := ed25519.Sign(sigPriv, hash[:])
-		h.HandleStoreEncrypted(
-			base64.StdEncoding.EncodeToString(ct),
-			base64.StdEncoding.EncodeToString(sig),
-		)
+		ct, sig := makeStoreReq(t, h, sigPriv, query, int64(1000+i), 300)
+		h.HandleStoreEncrypted(ct, sig)
 	}
 
 	if h.cache.Size() != 0 {
 		t.Fatalf("cache should be empty before commit, got size=%d", h.cache.Size())
 	}
 
-	// HandleProcess triggers commit (prob=1.0)
+	// HandleProcess triggers commit (prob=1.0) via async batchWorker
 	qe := makeProcessReq(t, h, "unrelated.com.:1")
 	h.HandleProcess(qe)
+
+	// Wait for batchWorker goroutine to process the commit signal
+	time.Sleep(50 * time.Millisecond)
 
 	// All 3 entries should now be in cache
 	if h.cache.Size() != 3 {
@@ -922,7 +787,6 @@ func TestBatch_HandleProcessCommitsQueue(t *testing.T) {
 }
 
 func TestBatch_OmissionDropsOnEnqueue(t *testing.T) {
-	// Verify that outstanding count drops on enqueue (not on commit).
 	sigPub, sigPriv, _ := ed25519.GenerateKey(rand.Reader)
 	h := newTestHandler(3.0)
 	h.batchCommitProb = 0 // disable commit to isolate enqueue behavior
@@ -942,20 +806,8 @@ func TestBatch_OmissionDropsOnEnqueue(t *testing.T) {
 	h.mu.Unlock()
 
 	// Store for "miss0.com.:1" → removed from outstanding on enqueue
-	bundle := &enclave.CacheInsertBundle{
-		TTL: 300, Timestamp: 1001,
-		CanonicalQuery: "miss0.com.:1",
-		DNSResponse:    []byte{0xAB},
-	}
-	bundleBytes := marshalSingleBundle(t, bundle)
-	pubBytes, _ := h.keypair.PublicKeyBytes()
-	ct, _ := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
-	hash := sha256.Sum256(bundleBytes)
-	sig := ed25519.Sign(sigPriv, hash[:])
-	h.HandleStoreEncrypted(
-		base64.StdEncoding.EncodeToString(ct),
-		base64.StdEncoding.EncodeToString(sig),
-	)
+	ct, sig := makeStoreReq(t, h, sigPriv, "miss0.com.:1", 1001, 300)
+	h.HandleStoreEncrypted(ct, sig)
 
 	h.mu.Lock()
 	if len(h.outstandingQueries) != 1 {
@@ -975,28 +827,18 @@ func TestBatch_HealthEndpointReturnsQueueStats(t *testing.T) {
 
 	// Enqueue 2 entries
 	for i := 0; i < 2; i++ {
-		bundle := &enclave.CacheInsertBundle{
-			TTL: 300, Timestamp: int64(1000 + i),
-			CanonicalQuery: fmt.Sprintf("health%d.com.:1", i),
-			DNSResponse:    []byte{0xAB},
-		}
-		bundleBytes := marshalSingleBundle(t, bundle)
-		pubBytes, _ := h.keypair.PublicKeyBytes()
-		ct, _ := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
-		hash := sha256.Sum256(bundleBytes)
-		sig := ed25519.Sign(sigPriv, hash[:])
-		h.HandleStoreEncrypted(
-			base64.StdEncoding.EncodeToString(ct),
-			base64.StdEncoding.EncodeToString(sig),
-		)
+		ct, sig := makeStoreReq(t, h, sigPriv, fmt.Sprintf("health%d.com.:1", i), int64(1000+i), 300)
+		h.HandleStoreEncrypted(ct, sig)
 	}
 
 	resp := h.HandleHealth()
-	if resp.QueueDepth != 2 {
-		t.Fatalf("expected queue_depth=2, got %d", resp.QueueDepth)
+	// Parse JSON payload for queue stats
+	payload := string(resp.Payload)
+	if !bytes.Contains(resp.Payload, []byte(`"queue_depth":2`)) {
+		t.Fatalf("expected queue_depth=2 in payload, got: %s", payload)
 	}
-	if resp.TotalCommits != 0 {
-		t.Fatalf("expected total_commits=0, got %d", resp.TotalCommits)
+	if !bytes.Contains(resp.Payload, []byte(`"total_commits":0`)) {
+		t.Fatalf("expected total_commits=0 in payload, got: %s", payload)
 	}
 
 	// Manually commit and check stats update
@@ -1005,20 +847,23 @@ func TestBatch_HealthEndpointReturnsQueueStats(t *testing.T) {
 	qe := makeProcessReq(t, h, "trigger.com.:1")
 	h.HandleProcess(qe)
 
+	// Wait for batchWorker goroutine to process the commit signal
+	time.Sleep(50 * time.Millisecond)
+
 	resp = h.HandleHealth()
-	if resp.QueueDepth != 0 {
-		t.Fatalf("expected queue_depth=0 after commit, got %d", resp.QueueDepth)
+	payload = string(resp.Payload)
+	if !bytes.Contains(resp.Payload, []byte(`"queue_depth":0`)) {
+		t.Fatalf("expected queue_depth=0 after commit, got: %s", payload)
 	}
-	if resp.TotalCommits != 1 {
-		t.Fatalf("expected total_commits=1, got %d", resp.TotalCommits)
+	if !bytes.Contains(resp.Payload, []byte(`"total_commits":1`)) {
+		t.Fatalf("expected total_commits=1, got: %s", payload)
 	}
-	if resp.TotalEntriesCommitted != 2 {
-		t.Fatalf("expected total_entries_committed=2, got %d", resp.TotalEntriesCommitted)
+	if !bytes.Contains(resp.Payload, []byte(`"total_entries_committed":2`)) {
+		t.Fatalf("expected total_entries_committed=2, got: %s", payload)
 	}
 }
 
 func TestBatch_QueueOverflow(t *testing.T) {
-	// Verify head-drop behavior when queue is full.
 	sigPub, sigPriv, _ := ed25519.GenerateKey(rand.Reader)
 	h := newTestHandler(100.0) // wide delta
 	h.batchCommitProb = 0      // no auto-commit
@@ -1026,20 +871,8 @@ func TestBatch_QueueOverflow(t *testing.T) {
 	h.insertionQueue = enclave.NewInsertionQueue(3) // small queue
 
 	for i := 0; i < 5; i++ {
-		bundle := &enclave.CacheInsertBundle{
-			TTL: 300, Timestamp: int64(1000 + i),
-			CanonicalQuery: fmt.Sprintf("overflow%d.com.:1", i),
-			DNSResponse:    []byte{byte(i)},
-		}
-		bundleBytes := marshalSingleBundle(t, bundle)
-		pubBytes, _ := h.keypair.PublicKeyBytes()
-		ct, _ := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
-		hash := sha256.Sum256(bundleBytes)
-		sig := ed25519.Sign(sigPriv, hash[:])
-		h.HandleStoreEncrypted(
-			base64.StdEncoding.EncodeToString(ct),
-			base64.StdEncoding.EncodeToString(sig),
-		)
+		ct, sig := makeStoreReq(t, h, sigPriv, fmt.Sprintf("overflow%d.com.:1", i), int64(1000+i), 300)
+		h.HandleStoreEncrypted(ct, sig)
 	}
 
 	// Queue should be at max capacity (3), with oldest 2 evicted
@@ -1064,9 +897,6 @@ func TestBatch_QueueOverflow(t *testing.T) {
 }
 
 func TestBatch_DefensiveNotFalseTriggeredByDelay(t *testing.T) {
-	// With batching, there's a delay between store (enqueue) and cache commit.
-	// Outstanding queries are removed on enqueue (D2), so this delay should NOT
-	// cause false omission detection.
 	sigPub, sigPriv, _ := ed25519.GenerateKey(rand.Reader)
 	h := newTestHandler(3.0)
 	h.batchCommitProb = 0 // deliberate: no commit to test maximum delay
@@ -1085,20 +915,8 @@ func TestBatch_DefensiveNotFalseTriggeredByDelay(t *testing.T) {
 
 	// Store responses for all 3 (removed from outstanding on enqueue)
 	for i := 0; i < 3; i++ {
-		bundle := &enclave.CacheInsertBundle{
-			TTL: 300, Timestamp: int64(1001 + i),
-			CanonicalQuery: fmt.Sprintf("q%d.com.:1", i),
-			DNSResponse:    []byte{0xAB},
-		}
-		bundleBytes := marshalSingleBundle(t, bundle)
-		pubBytes, _ := h.keypair.PublicKeyBytes()
-		ct, _ := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
-		hash := sha256.Sum256(bundleBytes)
-		sig := ed25519.Sign(sigPriv, hash[:])
-		h.HandleStoreEncrypted(
-			base64.StdEncoding.EncodeToString(ct),
-			base64.StdEncoding.EncodeToString(sig),
-		)
+		ct, sig := makeStoreReq(t, h, sigPriv, fmt.Sprintf("q%d.com.:1", i), int64(1001+i), 300)
+		h.HandleStoreEncrypted(ct, sig)
 	}
 
 	// 3 more misses — outstanding should be 3 (not 6), no omission
@@ -1110,28 +928,29 @@ func TestBatch_DefensiveNotFalseTriggeredByDelay(t *testing.T) {
 	// Sentinel should still be reachable (no omission triggered)
 	qe := makeProcessReq(t, h, "sentinel.com.:1")
 	resp := h.HandleProcess(qe)
-	if resp.Status != enclave.StatusProcessed {
-		t.Fatalf("expected processed (no false omission from batch delay), got %s", resp.Status)
+	if resp.Status != enclave.BinStatusProcessed {
+		t.Fatalf("expected processed (no false omission from batch delay), got 0x%02x", resp.Status)
 	}
 }
 
 // --- Sprint 5: Multi-entry bundle tests ---
 
 // marshalMultiBundle builds an encrypted+signed multi-entry store request.
-func marshalMultiBundle(t *testing.T, h *EnclaveHandler, sigPriv ed25519.PrivateKey, entries []enclave.CacheInsertBundle) (blob, sig string) {
+// Returns raw ciphertext and raw signature bytes.
+func marshalMultiBundle(t *testing.T, h *EnclaveHandler, sigPriv ed25519.PrivateKey, entries []enclave.CacheInsertBundle) (ct, sig []byte) {
 	t.Helper()
 	bundleBytes, err := enclave.MarshalMultiBundle(entries)
 	if err != nil {
 		t.Fatalf("MarshalMultiBundle: %v", err)
 	}
 	pubBytes, _ := h.keypair.PublicKeyBytes()
-	ct, err := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
+	ciphertext, err := codohtarget.EncryptForEnclave(pubBytes, bundleBytes)
 	if err != nil {
 		t.Fatalf("EncryptForEnclave: %v", err)
 	}
 	hash := sha256.Sum256(bundleBytes)
 	sigBytes := ed25519.Sign(sigPriv, hash[:])
-	return base64.StdEncoding.EncodeToString(ct), base64.StdEncoding.EncodeToString(sigBytes)
+	return ciphertext, sigBytes
 }
 
 func TestMultiEntry_FourEntriesAllEnqueued(t *testing.T) {
@@ -1147,10 +966,10 @@ func TestMultiEntry_FourEntriesAllEnqueued(t *testing.T) {
 		{TTL: 180, Timestamp: 1000, CanonicalQuery: "cover3.com.:1", DNSResponse: []byte{0x04}},
 	}
 
-	blob, sig := marshalMultiBundle(t, h, sigPriv, entries)
-	resp := h.HandleStoreEncrypted(blob, sig)
-	if resp.Status != enclave.StatusOK {
-		t.Fatalf("expected ok, got %s %s", resp.Status, resp.Error)
+	ct, sig := marshalMultiBundle(t, h, sigPriv, entries)
+	resp := h.HandleStoreEncrypted(ct, sig)
+	if resp.Status != enclave.BinStatusOK {
+		t.Fatalf("expected ok, got 0x%02x %s", resp.Status, string(resp.Payload))
 	}
 
 	if h.insertionQueue.Len() != 4 {
@@ -1175,15 +994,15 @@ func TestMultiEntry_OneStaleThreeEnqueued(t *testing.T) {
 
 	entries := []enclave.CacheInsertBundle{
 		{TTL: 300, Timestamp: 1001, CanonicalQuery: "fresh1.com.:1", DNSResponse: []byte{0x01}},
-		{TTL: 60, Timestamp: 990, CanonicalQuery: "stale.com.:1", DNSResponse: []byte{0x02}}, // 990 < 1000-3=997 → stale
+		{TTL: 60, Timestamp: 990, CanonicalQuery: "stale.com.:1", DNSResponse: []byte{0x02}}, // stale
 		{TTL: 120, Timestamp: 1002, CanonicalQuery: "fresh2.com.:1", DNSResponse: []byte{0x03}},
 		{TTL: 180, Timestamp: 1001, CanonicalQuery: "fresh3.com.:1", DNSResponse: []byte{0x04}},
 	}
 
-	blob, sig := marshalMultiBundle(t, h, sigPriv, entries)
-	resp := h.HandleStoreEncrypted(blob, sig)
-	if resp.Status != enclave.StatusOK {
-		t.Fatalf("expected ok (3/4 enqueued), got %s %s", resp.Status, resp.Error)
+	ct, sig := marshalMultiBundle(t, h, sigPriv, entries)
+	resp := h.HandleStoreEncrypted(ct, sig)
+	if resp.Status != enclave.BinStatusOK {
+		t.Fatalf("expected ok (3/4 enqueued), got 0x%02x %s", resp.Status, string(resp.Payload))
 	}
 
 	if h.insertionQueue.Len() != 3 {
@@ -1225,10 +1044,10 @@ func TestMultiEntry_OutstandingRealRemovedCoverNoop(t *testing.T) {
 		{TTL: 120, Timestamp: 1001, CanonicalQuery: "cover2.com.:1", DNSResponse: []byte{0x03}},
 	}
 
-	blob, sig := marshalMultiBundle(t, h, sigPriv, entries)
-	resp := h.HandleStoreEncrypted(blob, sig)
-	if resp.Status != enclave.StatusOK {
-		t.Fatalf("expected ok, got %s %s", resp.Status, resp.Error)
+	ct, sig := marshalMultiBundle(t, h, sigPriv, entries)
+	resp := h.HandleStoreEncrypted(ct, sig)
+	if resp.Status != enclave.BinStatusOK {
+		t.Fatalf("expected ok, got 0x%02x %s", resp.Status, string(resp.Payload))
 	}
 
 	h.mu.Lock()
@@ -1238,9 +1057,6 @@ func TestMultiEntry_OutstandingRealRemovedCoverNoop(t *testing.T) {
 	if _, exists := h.outstandingQueries["real.com.:1"]; exists {
 		t.Fatal("real.com.:1 should be removed from outstanding after store")
 	}
-
-	// cover queries were never in outstanding → delete is no-op, no panic
-	// (implicitly tested by reaching this point without error)
 }
 
 func TestMultiEntry_SingleEntryCount1(t *testing.T) {
@@ -1253,10 +1069,10 @@ func TestMultiEntry_SingleEntryCount1(t *testing.T) {
 		{TTL: 300, Timestamp: 1000, CanonicalQuery: "only.com.:1", DNSResponse: []byte{0xFF}},
 	}
 
-	blob, sig := marshalMultiBundle(t, h, sigPriv, entries)
-	resp := h.HandleStoreEncrypted(blob, sig)
-	if resp.Status != enclave.StatusOK {
-		t.Fatalf("expected ok, got %s %s", resp.Status, resp.Error)
+	ct, sig := marshalMultiBundle(t, h, sigPriv, entries)
+	resp := h.HandleStoreEncrypted(ct, sig)
+	if resp.Status != enclave.BinStatusOK {
+		t.Fatalf("expected ok, got 0x%02x %s", resp.Status, string(resp.Payload))
 	}
 
 	if h.insertionQueue.Len() != 1 {
@@ -1275,19 +1091,19 @@ func TestMultiEntry_AllStaleReturnsError(t *testing.T) {
 	h.targetSigningPubKey = sigPub
 	h.tLatest.Store(1000)
 
-	// All entries stale: ts=990 < 1000-3=997
+	// All entries stale
 	entries := []enclave.CacheInsertBundle{
 		{TTL: 300, Timestamp: 990, CanonicalQuery: "old1.com.:1", DNSResponse: []byte{0x01}},
 		{TTL: 60, Timestamp: 991, CanonicalQuery: "old2.com.:1", DNSResponse: []byte{0x02}},
 	}
 
-	blob, sig := marshalMultiBundle(t, h, sigPriv, entries)
-	resp := h.HandleStoreEncrypted(blob, sig)
-	if resp.Status != enclave.StatusError {
-		t.Fatalf("expected error when all entries stale, got %s", resp.Status)
+	ct, sig := marshalMultiBundle(t, h, sigPriv, entries)
+	resp := h.HandleStoreEncrypted(ct, sig)
+	if resp.Status != enclave.BinStatusError {
+		t.Fatalf("expected error when all entries stale, got 0x%02x", resp.Status)
 	}
-	if resp.Error != enclave.ErrStaleTimestamp {
-		t.Fatalf("expected %q, got %q", enclave.ErrStaleTimestamp, resp.Error)
+	if string(resp.Payload) != enclave.ErrStaleTimestamp {
+		t.Fatalf("expected %q, got %q", enclave.ErrStaleTimestamp, string(resp.Payload))
 	}
 }
 
@@ -1300,18 +1116,13 @@ func TestHandleProcess_HitResponseIsBucketSized(t *testing.T) {
 
 	qe := makeProcessReq(t, h, "padtest.com.:1")
 	resp := h.HandleProcess(qe)
-	if resp.Status != enclave.StatusProcessed {
-		t.Fatalf("expected processed, got %s", resp.Status)
+	if resp.Status != enclave.BinStatusProcessed {
+		t.Fatalf("expected processed, got 0x%02x", resp.Status)
 	}
 
-	decoded, err := base64.StdEncoding.DecodeString(resp.Response)
-	if err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-
-	// Must be exactly the default bucket size (16384)
-	if len(decoded) != enclave.DefaultPadBuckets[0] {
-		t.Fatalf("hit response size=%d, want %d (bucket size)", len(decoded), enclave.DefaultPadBuckets[0])
+	// Payload is raw bytes, must be exactly the default bucket size (16384)
+	if len(resp.Payload) != enclave.DefaultPadBuckets[0] {
+		t.Fatalf("hit response size=%d, want %d (bucket size)", len(resp.Payload), enclave.DefaultPadBuckets[0])
 	}
 }
 
@@ -1321,17 +1132,12 @@ func TestHandleProcess_MissResponseIsBucketSized(t *testing.T) {
 
 	qe := makeProcessReq(t, h, "nonexistent.com.:1")
 	resp := h.HandleProcess(qe)
-	if resp.Status != enclave.StatusProcessed {
-		t.Fatalf("expected processed, got %s", resp.Status)
+	if resp.Status != enclave.BinStatusProcessed {
+		t.Fatalf("expected processed, got 0x%02x", resp.Status)
 	}
 
-	decoded, err := base64.StdEncoding.DecodeString(resp.Response)
-	if err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-
-	if len(decoded) != enclave.DefaultPadBuckets[0] {
-		t.Fatalf("miss response size=%d, want %d (max bucket)", len(decoded), enclave.DefaultPadBuckets[0])
+	if len(resp.Payload) != enclave.DefaultPadBuckets[0] {
+		t.Fatalf("miss response size=%d, want %d (max bucket)", len(resp.Payload), enclave.DefaultPadBuckets[0])
 	}
 }
 
@@ -1352,20 +1158,14 @@ func TestHandleProcess_HitDecryptableAfterUnpad(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EncryptQueryE: %v", err)
 	}
-	qeB64 := base64.StdEncoding.EncodeToString(qeRaw)
 
-	resp := h.HandleProcess(qeB64)
-	if resp.Status != enclave.StatusProcessed {
-		t.Fatalf("expected processed, got %s", resp.Status)
+	resp := h.HandleProcess(qeRaw)
+	if resp.Status != enclave.BinStatusProcessed {
+		t.Fatalf("expected processed, got 0x%02x", resp.Status)
 	}
 
-	decoded, err := base64.StdEncoding.DecodeString(resp.Response)
-	if err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-
-	// Unpad → Decrypt → verify original DNS response
-	unpadded, err := enclave.UnpadFromBucket(decoded)
+	// Payload is raw padded bytes — Unpad → Decrypt → verify original DNS response
+	unpadded, err := enclave.UnpadFromBucket(resp.Payload)
 	if err != nil {
 		t.Fatalf("UnpadFromBucket: %v", err)
 	}
