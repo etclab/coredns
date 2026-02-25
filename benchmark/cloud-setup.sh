@@ -119,42 +119,87 @@ setup_proxy() {
     fi
     ((step++))
 
-    # Install EGo if SGX available and ego missing
-    if $SGX_AVAILABLE && ! command -v ego &>/dev/null; then
+    # Install EGo if SGX available and ego missing or broken (snap version lacks OE SDK)
+    if $SGX_AVAILABLE && { ! command -v ego &>/dev/null || [[ "$(which ego 2>/dev/null)" == /snap/* ]]; }; then
         echo "[$step/N] Installing EGo SDK..."
+
+        # Remove snap ego if present (lacks OE SDK, CGo symbols won't link)
+        if [[ "$(which ego 2>/dev/null)" == /snap/* ]]; then
+            echo "  Removing broken snap ego-dev..."
+            sudo snap remove ego-dev 2>/dev/null || true
+        fi
+
+        # Add Intel SGX repo (EGo .deb depends on SGX runtime packages)
         sudo mkdir -p /etc/apt/keyrings
-        wget -qO- https://download.01.org/intel-sgx/sgx_repo/ubuntu/intel-sgx-deb.key | sudo tee /etc/apt/keyrings/intel-sgx-keyring.asc >/dev/null
-        echo "deb [signed-by=/etc/apt/keyrings/intel-sgx-keyring.asc arch=amd64] https://download.01.org/intel-sgx/sgx_repo/ubuntu $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/intel-sgx.list >/dev/null
-        sudo snap install ego-dev --classic 2>/dev/null || {
-            echo "  Installing ego via apt..."
-            wget -qO- https://github.com/edgelesssys/ego/releases/latest/download/ego_amd64.deb -O /tmp/ego.deb
-            sudo dpkg -i /tmp/ego.deb || sudo apt-get -f install -y
-            rm -f /tmp/ego.deb
-        }
+        wget -qO- https://download.01.org/intel-sgx/sgx_repo/ubuntu/intel-sgx-deb.key \
+            | sudo tee /etc/apt/keyrings/intel-sgx-keyring.asc >/dev/null
+        echo "deb [signed-by=/etc/apt/keyrings/intel-sgx-keyring.asc arch=amd64] https://download.01.org/intel-sgx/sgx_repo/ubuntu $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/intel-sgx.list >/dev/null
+        sudo apt-get update -qq
+
+        # Install EGo .deb + build deps (per official README)
+        local ego_version="1.8.1"
+        local ego_deb="ego_${ego_version}_amd64_ubuntu-$(lsb_release -rs).deb"
+        wget -q "https://github.com/edgelesssys/ego/releases/download/v${ego_version}/${ego_deb}" -O /tmp/ego.deb
+        sudo apt-get install -y /tmp/ego.deb build-essential libssl-dev
+        rm -f /tmp/ego.deb
+
         echo "  EGo: $(ego version 2>/dev/null || echo 'installed')"
     elif $SGX_AVAILABLE; then
         echo "[$step/N] EGo SDK: already installed"
     fi
     ((step++))
 
+    # Install Azure DCAP client (SGX quote provider) + add user to sgx_prv group
+    if $SGX_AVAILABLE; then
+        if ! dpkg -s az-dcap-client &>/dev/null; then
+            echo "[$step/N] Installing Azure DCAP client..."
+            # Add Microsoft repo key if not present
+            if [[ ! -f /usr/share/keyrings/msft.gpg ]]; then
+                wget -qO- https://packages.microsoft.com/keys/microsoft.asc \
+                    | sudo gpg --dearmor -o /usr/share/keyrings/msft.gpg
+            fi
+            echo "deb [signed-by=/usr/share/keyrings/msft.gpg arch=amd64] https://packages.microsoft.com/ubuntu/22.04/prod jammy main" \
+                | sudo tee /etc/apt/sources.list.d/msprod.list >/dev/null
+            sudo apt-get update -qq
+            sudo apt-get install -y az-dcap-client
+        else
+            echo "[$step/N] Azure DCAP client: already installed"
+        fi
+
+        # Ensure user is in sgx_prv group (needed for quote generation)
+        if ! id -nG | grep -qw sgx_prv; then
+            echo "  Adding $USER to sgx_prv group..."
+            sudo usermod -aG sgx_prv "$USER"
+            echo "  NOTE: Group change requires logout/login or 'newgrp sgx_prv' to take effect"
+        fi
+    fi
+    ((step++))
+
     # Build SGX enclave
     if $SGX_AVAILABLE && command -v ego-go &>/dev/null; then
         echo "[$step/N] Building SGX enclave..."
-        (cd "$ROOT_DIR/enclave" && ego-go build -tags ego -o enclave ./cmd 2>&1 | tail -5)
-        (cd "$ROOT_DIR/enclave" && ego sign enclave.json 2>&1 | tail -5)
+        if ! (cd "$ROOT_DIR/enclave" && ego-go build -tags ego -o enclave ./cmd); then
+            echo "FATAL: SGX enclave build failed"
+            exit 1
+        fi
+        if ! (cd "$ROOT_DIR/enclave" && ego sign enclave.json); then
+            echo "FATAL: ego sign failed"
+            exit 1
+        fi
         echo "  Enclave SGX: $ROOT_DIR/enclave/enclave"
     fi
     ((step++))
 
     # Build enclave-sim (always, as fallback)
     echo "[$step/N] Building enclave-sim..."
-    (cd "$ROOT_DIR" && go build -o enclave-sim ./enclave/cmd 2>&1 | tail -5)
+    (cd "$ROOT_DIR" && go build -o enclave-sim ./enclave/cmd)
     echo "  Enclave sim: $ROOT_DIR/enclave-sim"
     ((step++))
 
     # Build coredns-test (server binary for proxy role)
     echo "[$step/N] Building coredns-test..."
-    (cd "$ROOT_DIR" && go build -o coredns-test . 2>&1 | tail -5)
+    (cd "$ROOT_DIR" && go build -o coredns-test .)
     echo "  Server: $ROOT_DIR/coredns-test"
     ((step++))
 
@@ -181,11 +226,13 @@ setup_proxy() {
     fi
 
     # Build Config 3 binaries
-    (cd "$worktree_dir" && go build -o coredns-test . 2>&1 | tail -5)
-    (cd "$worktree_dir" && go build -o enclave-sim ./enclave/cmd 2>&1 | tail -5)
+    (cd "$worktree_dir" && go build -o coredns-test .)
+    (cd "$worktree_dir" && go build -o enclave-sim ./enclave/cmd)
     if $SGX_AVAILABLE && command -v ego-go &>/dev/null; then
-        (cd "$worktree_dir/enclave" && ego-go build -tags ego -o enclave ./cmd 2>&1 | tail -5 && ego sign enclave.json 2>&1 | tail -5) || \
-            echo "  WARNING: Config 3 SGX build failed"
+        if ! (cd "$worktree_dir/enclave" && ego-go build -tags ego -o enclave ./cmd && ego sign enclave.json); then
+            echo "FATAL: Config 3 SGX enclave build failed"
+            exit 1
+        fi
     fi
     echo "  Config 3 worktree: $worktree_dir"
     ((step++))
@@ -214,7 +261,7 @@ setup_target() {
 
     # Build coredns-test
     echo "[$step/N] Building coredns-test..."
-    (cd "$ROOT_DIR" && go build -o coredns-test . 2>&1 | tail -5)
+    (cd "$ROOT_DIR" && go build -o coredns-test .)
     echo "  Server: $ROOT_DIR/coredns-test"
     ((step++))
 
@@ -256,6 +303,33 @@ setup_target() {
     else
         echo "  top-10k-resolvable.csv: exists ($(wc -l < "$SCRIPT_DIR/top-10k-resolvable.csv") domains)"
     fi
+    ((step++))
+
+    # Config 3 worktree (cloud-run.sh uses $wt/coredns-test on target VM)
+    echo "[$step/N] Setting up Config 3 worktree..."
+    local worktree_dir="$SCRIPT_DIR/worktrees/config3-proxy"
+    if [[ ! -d "$worktree_dir" ]]; then
+        mkdir -p "$SCRIPT_DIR/worktrees"
+        git -C "$ROOT_DIR" worktree add "$worktree_dir" e81a315ec3a91dee1bad2cc2bbf139ebee145ab8 2>&1 | tail -3
+
+        # Apply compatibility patches (same as proxy role)
+        if grep -q 'go 1.25.5' "$worktree_dir/go.mod"; then
+            sed -i 's/^go 1.25.5/go 1.25.1/' "$worktree_dir/go.mod"
+            sed -i 's|pathoram-go v0.1.[01]|pathoram-go v0.1.2|' "$worktree_dir/go.mod"
+            (cd "$worktree_dir" && GOFLAGS=-mod=mod go mod tidy 2>&1 | tail -3)
+        fi
+        if grep -q 'codoh-enclave-v1' "$worktree_dir/enclave/crypto.go"; then
+            sed -i 's/codoh-enclave-v1/codoh transport key/' "$worktree_dir/enclave/crypto.go"
+            sed -i 's/X-ODoH-Blob/X-CoDOH-Query/g' "$worktree_dir/enclave/cmd/proxy_mode.go"
+        fi
+        if grep -q 'codoh-enclave-v1' "$worktree_dir/plugin/codohtarget/enclave_encrypt.go" 2>/dev/null; then
+            sed -i 's/codoh-enclave-v1/codoh transport key/' "$worktree_dir/plugin/codohtarget/enclave_encrypt.go"
+        fi
+    fi
+
+    # Build only coredns-test (target doesn't need enclave binaries)
+    (cd "$worktree_dir" && go build -o coredns-test .)
+    echo "  Config 3 worktree: $worktree_dir"
     ((step++))
 
     # Generate TLS certs
@@ -301,7 +375,7 @@ setup_client() {
         echo "Clone it: cd $(dirname "$ROOT_DIR") && git clone <repo-url> codoh-client"
         exit 1
     fi
-    (cd "$CLIENT_DIR" && go build -o odoh-client ./cmd 2>&1 | tail -5)
+    (cd "$CLIENT_DIR" && go build -o odoh-client ./cmd)
     echo "  Client: $CLIENT_DIR/odoh-client"
     ((step++))
 

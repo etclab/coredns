@@ -12,7 +12,7 @@ TARGET_IP=         # Any Azure VM — runs codohtarget + resolver
 
 # SSH settings
 SSH_USER="${SSH_USER:-azureuser}"
-SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_rsa}"
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
 
 # Remote project root (where repo is cloned on VMs)
 REMOTE_ROOT="/home/${SSH_USER}/Projects/codoh/coredns"
@@ -25,3 +25,8 @@ SGX_MODE="${SGX_MODE:-true}"
 
 # Git branch to checkout on remote VMs
 GIT_BRANCH="${GIT_BRANCH:-codoh-design-v2}"
+
+# Azure NSG settings (for cloud-open-ports.sh)
+RESOURCE_GROUP=       # Azure resource group name
+PROXY_NSG=            # NSG name attached to proxy VM
+TARGET_NSG=           # NSG name attached to target VM

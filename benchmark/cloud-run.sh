@@ -250,7 +250,7 @@ distribute_files() {
 #######################################
 remote_cleanup() {
     echo "Cleaning up remote processes..."
-    ssh_proxy "pkill -9 -f coredns-test 2>/dev/null; pkill -9 -f enclave-sim 2>/dev/null; pkill -9 -f 'ego-host.*enclave' 2>/dev/null; pkill -9 -f erthost 2>/dev/null; rm -f /tmp/codoh-enclave.sock 2>/dev/null" 2>/dev/null || true
+    ssh_proxy "pkill -9 -f coredns-test 2>/dev/null; pkill -9 -f enclave-sim 2>/dev/null; pkill -9 -f 'ego.*enclave' 2>/dev/null; pkill -9 -f erthost 2>/dev/null; rm -f /tmp/codoh-enclave.sock 2>/dev/null" 2>/dev/null || true
     ssh_target "pkill -9 -f coredns-test 2>/dev/null" 2>/dev/null || true
     sleep 2
 }
@@ -312,13 +312,13 @@ start_config_2() {
 
     # Target VM: ODoH target
     echo "  Starting ODoH target on $TARGET_IP:9443..."
-    ssh_target "nohup $REMOTE_ROOT/coredns-test -conf $CLOUD_CF/Corefile.odoh-target \
-        > /tmp/bench-odoh-target.log 2>&1 &"
+    ssh_target "cd $REMOTE_ROOT && (nohup ./coredns-test -conf $CLOUD_CF/Corefile.odoh-target \
+        > /tmp/bench-odoh-target.log 2>&1 </dev/null &)"
 
     # Proxy VM: ODoH proxy
     echo "  Starting ODoH proxy on $PROXY_IP:9080..."
-    ssh_proxy "nohup $REMOTE_ROOT/coredns-test -conf $CLOUD_CF/Corefile.odoh-proxy \
-        > /tmp/bench-odoh-proxy.log 2>&1 &"
+    ssh_proxy "cd $REMOTE_ROOT && (nohup ./coredns-test -conf $CLOUD_CF/Corefile.odoh-proxy \
+        > /tmp/bench-odoh-proxy.log 2>&1 </dev/null &)"
 
     wait_for_remote "$PROXY_IP" 9080
     wait_for_remote "$TARGET_IP" 9443
@@ -330,8 +330,8 @@ start_config_3() {
 
     # Target VM: CODoH-base target (worktree binary)
     echo "  Starting CODoH-base target on $TARGET_IP:10444..."
-    ssh_target "nohup $wt/coredns-test -conf $CLOUD_CF/Corefile.codoh-base-target \
-        > /tmp/bench-codoh-base-target.log 2>&1 &"
+    ssh_target "cd $wt && (nohup ./coredns-test -conf $CLOUD_CF/Corefile.codoh-base-target \
+        > /tmp/bench-codoh-base-target.log 2>&1 </dev/null &)"
 
     # Proxy VM: enclave-proxy
     local enclave_bin="$wt/enclave-sim"
@@ -351,13 +351,13 @@ start_config_3() {
     fi
 
     echo "  Starting enclave-proxy on $PROXY_IP:10443..."
-    ssh_proxy "nohup $enclave_bin \
+    ssh_proxy "cd $wt && (nohup $enclave_bin \
         -mode proxy \
         -https-port 10443 \
         -tls-cert $cert_flag \
         -tls-key $key_flag \
         -target https://$TARGET_IP:10444 \
-        > /tmp/bench-enclave-proxy.log 2>&1 &"
+        > /tmp/bench-enclave-proxy.log 2>&1 </dev/null &)"
 
     wait_for_remote "$PROXY_IP" 10443
     wait_for_remote "$TARGET_IP" 10444
@@ -378,21 +378,31 @@ start_config_ipc() {
     fi
 
     echo "  Starting enclave on proxy VM..."
-    ssh_proxy "nohup bash -c '$enclave_cmd > /tmp/bench-enclave.log 2>&1' &"
-    wait_for_remote_attest 60
+    ssh_proxy "cd $REMOTE_ROOT && (nohup bash -c '$enclave_cmd' > /tmp/bench-enclave.log 2>&1 </dev/null &)"
+
+    if [[ "$SGX_MODE" == "true" ]]; then
+        # SGX: attestation server on 8444 starts first, IPC socket created after target provisions
+        wait_for_remote_attest 60
+    else
+        # Simulation: no attestation server, IPC socket created immediately
+        wait_for_remote_socket 30
+    fi
 
     # Target VM: codohtarget
     echo "  Starting CODoH target on $TARGET_IP:8443..."
-    ssh_target "nohup bash -c '$target_env $REMOTE_ROOT/coredns-test -conf $CLOUD_CF/Corefile.target > /tmp/bench-codoh-target.log 2>&1' &"
-    wait_for_remote_socket 30
+    ssh_target "cd $REMOTE_ROOT && (nohup bash -c '$target_env ./coredns-test -conf $CLOUD_CF/Corefile.target' > /tmp/bench-codoh-target.log 2>&1 </dev/null &)"
+
+    if [[ "$SGX_MODE" == "true" ]]; then
+        # SGX: IPC socket created after target provisions via 8444
+        wait_for_remote_socket 30
+    fi
+    wait_for_remote "$TARGET_IP" 8443
 
     # Proxy VM: codohproxy
     echo "  Starting CODoH proxy on $PROXY_IP:8080..."
-    ssh_proxy "nohup $REMOTE_ROOT/coredns-test -conf $CLOUD_CF/Corefile.proxy \
-        > /tmp/bench-codoh-proxy.log 2>&1 &"
-
+    ssh_proxy "cd $REMOTE_ROOT && (nohup ./coredns-test -conf $CLOUD_CF/Corefile.proxy \
+        > /tmp/bench-codoh-proxy.log 2>&1 </dev/null &)"
     wait_for_remote "$PROXY_IP" 8080
-    wait_for_remote "$TARGET_IP" 8443
 }
 
 #######################################

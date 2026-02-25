@@ -460,18 +460,24 @@ Client VM ──HTTPS──▶ Proxy VM (SGX) ──HTTPS──▶ Target VM
                       (Unix socket)
 ```
 
-**Setup:**
+**Setup (one-shot from client VM):**
 
 ```bash
 # 1. Configure IPs
 cp benchmark/cloud-env.sh benchmark/cloud-env.local.sh
 # Edit cloud-env.local.sh: set PROXY_IP, TARGET_IP
 
-# 2. Provision each VM (run ON the VM)
+# 2. Provision all VMs (run from client VM only)
+# Clones repos, installs Go/EGo, builds binaries on proxy + target via SSH
+./benchmark/cloud-provision.sh
+
+# Or provision each VM manually (run ON the VM)
 ./benchmark/cloud-setup.sh proxy    # on DCsv3 (SGX) VM
 ./benchmark/cloud-setup.sh target   # on target VM
 ./benchmark/cloud-setup.sh client   # on client VM
 ```
+
+**Prerequisites:** SSH key auth to proxy/target, `gh auth login` on all VMs (with HTTPS protocol: `gh config set git_protocol https`).
 
 **Running (from client VM):**
 
@@ -517,6 +523,7 @@ cp benchmark/cloud-env.sh benchmark/cloud-env.local.sh
 | File | Purpose |
 |------|---------|
 | `benchmark/cloud-env.sh` | Template env (copy to `cloud-env.local.sh`) |
+| `benchmark/cloud-provision.sh` | One-shot bootstrapper (clones repos + provisions all VMs from client) |
 | `benchmark/cloud-setup.sh` | Per-VM provisioner (`proxy\|target\|client`) |
 | `benchmark/cloud-run.sh` | Cross-VM orchestrator (runs from client VM) |
 | `benchmark/cloud-collect-logs.sh` | Post-run log fetcher |
