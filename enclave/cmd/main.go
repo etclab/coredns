@@ -308,37 +308,27 @@ type EnclaveHandler struct {
 // HandleProcess decrypts Q_E, looks up cache, returns encrypted response or dummy.
 // qe is raw HPKE-encrypted bytes (no base64).
 func (h *EnclaveHandler) HandleProcess(qe []byte) *enclave.BinaryResponse {
-	tTotal := time.Now()
-
 	// Decrypt Q_E and derive session key k_r
 	// Key rotation takes priority: if HPKE decryption fails (wrong key or corrupted),
 	// return key_rotated so the client re-attests.
-	tOp := time.Now()
 	query, kr, err := h.keypair.DecryptQueryE(qe)
 	if err != nil {
 		log.Printf("DecryptQueryE failed (key rotation?): %v", err)
 		return &enclave.BinaryResponse{Status: enclave.BinStatusKeyRotated}
 	}
-	durDecrypt := time.Since(tOp)
 
 	h.mu.Lock()
 	inDefensiveMode := h.defensiveMode
 	h.mu.Unlock()
 
 	var resp *enclave.BinaryResponse
-	var durCacheGet, durEncrypt, durPad, durDummy time.Duration
-	isHit := false
 
 	// Defensive mode: decrypt succeeded (needed for protocol), but return dummy.
 	// Indistinguishable from a normal cache miss to the proxy.
 	if inDefensiveMode {
 		_ = kr // kr derived but not used — defensive mode returns dummy
-		tOp = time.Now()
 		dummy := enclave.GenerateDummyResponse(enclave.DummyInnerSize)
-		durDummy = time.Since(tOp)
-		tOp = time.Now()
 		padded, padErr := enclave.PadToBucket(dummy, h.padBuckets)
-		durPad = time.Since(tOp)
 		if padErr != nil {
 			log.Printf("PadToBucket(defensive dummy) failed: %v", padErr)
 			padded = dummy // fallback — should never happen
@@ -353,20 +343,13 @@ func (h *EnclaveHandler) HandleProcess(qe []byte) *enclave.BinaryResponse {
 
 		// Cache lookup with logical time
 		tLatest := h.tLatest.Load()
-		tOp = time.Now()
 		cachedResp, ok := h.cache.Get(canonicalQuery, tLatest)
-		durCacheGet = time.Since(tOp)
 
 		if ok {
-			isHit = true
 			// Cache hit — encrypt under session key k_r, then pad to bucket
-			tOp = time.Now()
 			encrypted, encErr := enclave.EncryptCachedResponse(kr, cachedResp)
-			durEncrypt = time.Since(tOp)
 			if encErr == nil {
-				tOp = time.Now()
 				encrypted, encErr = enclave.PadToBucket(encrypted, h.padBuckets)
-				durPad = time.Since(tOp)
 			}
 			if encErr != nil {
 				log.Printf("EncryptCachedResponse/PadToBucket failed: %v", encErr)
@@ -396,12 +379,8 @@ func (h *EnclaveHandler) HandleProcess(qe []byte) *enclave.BinaryResponse {
 			h.mu.Unlock()
 
 			// Return dummy (indistinguishable from hit — same PadToBucket structure)
-			tOp = time.Now()
 			dummy := enclave.GenerateDummyResponse(enclave.DummyInnerSize)
-			durDummy = time.Since(tOp)
-			tOp = time.Now()
 			padded, padErr := enclave.PadToBucket(dummy, h.padBuckets)
-			durPad = time.Since(tOp)
 			if padErr != nil {
 				log.Printf("PadToBucket(miss dummy) failed: %v", padErr)
 				padded = dummy // fallback — should never happen
@@ -422,11 +401,6 @@ func (h *EnclaveHandler) HandleProcess(qe []byte) *enclave.BinaryResponse {
 			// channel full — worker is behind, skip this signal
 		}
 	}
-
-	log.Printf("[enclave-timing] hit=%v hpke_decrypt=%dµs cache_get=%dµs encrypt_response=%dµs pad=%dµs gen_dummy=%dµs total=%dµs",
-		isHit, durDecrypt.Microseconds(), durCacheGet.Microseconds(),
-		durEncrypt.Microseconds(), durPad.Microseconds(), durDummy.Microseconds(),
-		time.Since(tTotal).Microseconds())
 
 	return resp
 }
@@ -608,9 +582,7 @@ func (h *EnclaveHandler) batchWorker() {
 			continue
 		}
 
-		t0 := time.Now()
 		h.cache.PutBatch(batch)
-		dur := time.Since(t0)
 
 		h.totalCommits.Add(1)
 		h.totalEntriesCommitted.Add(int64(len(batch)))
@@ -623,8 +595,6 @@ func (h *EnclaveHandler) batchWorker() {
 				h.cache.Size(), h.warmupThreshold)
 		}
 		h.mu.Unlock()
-
-		log.Printf("[batch-timing] entries=%d duration=%dµs", len(batch), dur.Microseconds())
 	}
 }
 

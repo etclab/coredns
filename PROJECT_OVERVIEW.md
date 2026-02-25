@@ -109,14 +109,18 @@ Client              Proxy                 Enclave              Target
    |                   |                     | Enqueue for batch  |
    |                   |                     |                    |
    |<-- response ------|                     |                    |
-   |  (hit: cached via k_r; miss: ODoH)     |                    |
+   |  (tagged chunks: enclave + target)      |                    |
 ```
 
 **Key properties:**
 - Proxy fans out Q_E to enclave and Q_T to target in parallel
 - On cache miss, enclave returns a dummy response indistinguishable from a hit (same size)
-- Client determines hit vs miss by Content-Type (`application/codoh-cached` vs `application/oblivious-dns-message`)
+- Proxy streams both results as tagged chunks (`application/codoh-response`): `[1B type][2B BE len][data]...` — whichever leg (enclave or target) finishes first is flushed immediately
+- Chunk types: `ChunkTypeEnclave=1` (cache hit or dummy), `ChunkTypeTarget=2` (ODoH response)
+- Client parses both chunks; uses enclave chunk on hit, target chunk on miss
+- If enclave errors, proxy degrades to plain ODoH (`application/oblivious-dns-message`)
 - Response key `k_r` is derived via HPKE Export from the Q_E context — implicitly bound to the ephemeral KEM key
+- **Config 3 (proxy mode)** uses `application/codoh-cached` (single response, no tagged chunks)
 
 ### Cache-Insert Bundle
 
@@ -181,13 +185,14 @@ SGX has no trusted clock. The enclave maintains `t_latest` (highest timestamp se
 | Outstanding query TTL cleanup | enclave/cmd/main.go | Inline eviction using logical time (tLatest - OutstandingTTLSecs) |
 | Key rotation signaling | enclave/cmd/main.go, enclave/types.go | HPKE failure returns `key_rotated` status |
 | Health with restart metadata | enclave/cmd/main.go | `started_at` (RFC3339) in health response |
-| Batched cache updates | enclave/insertion_queue.go, enclave/cmd/main.go | Bounded FIFO queue, pseudorandom batch commit on query path (crypto/rand), PutBatch on Cache interface |
+| Batched cache updates | enclave/insertion_queue.go, enclave/cmd/main.go | Bounded FIFO queue, signal-coalescing batchWorker goroutine, PutBatch on Cache interface |
 | | | |
 | **Proxy Plugin** | | |
 | Parallel fan-out (enclave + target) | plugin/codohproxy/proxy.go | Concurrent goroutines |
-| /enclave-keys endpoint | plugin/codohproxy/proxy.go | Serves pk_E |
+| Tagged chunk streaming | plugin/codohproxy/proxy.go | `application/codoh-response`: [1B type][2B len][data] per chunk |
+| /enclave-keys endpoint | plugin/codohproxy/proxy.go | Serves pk_E (cached in-memory) |
 | /proxy endpoint | plugin/codohproxy/proxy.go | Main CODoH relay |
-| Enclave IPC client | plugin/codohproxy/enclave_client.go | Unix socket client |
+| Enclave IPC client | plugin/codohproxy/enclave_client.go | Unix socket client, connection pool (cap 4) |
 | Key rotation header forwarding | plugin/codohproxy/proxy.go | Sets X-CoDOH-Key-Rotated header on key_rotated status |
 | Bypass mode | plugin/codohproxy/proxy.go | Falls back to plain ODoH |
 | Prometheus metrics | plugin/codohproxy/metrics.go | |
@@ -313,8 +318,9 @@ codohtarget {
 
 | Content-Type | Description |
 |--------------|-------------|
-| application/oblivious-dns-message | Standard ODoH (RFC 9230) |
-| application/codoh-cached | Cached response from enclave (AES-GCM under k_r) |
+| application/oblivious-dns-message | Standard ODoH (RFC 9230); also used as degraded fallback when enclave fails |
+| application/codoh-response | IPC mode (Config 4): tagged chunks `[1B type][2B BE len][data]...` containing enclave + target responses |
+| application/codoh-cached | Proxy mode only (Config 3): cached response from enclave (AES-GCM under k_r) |
 
 ---
 
@@ -343,13 +349,13 @@ Error codes: invalid_blob, decrypt_failed, hpke_error,
 Max message size: 64 KiB (maxIPCMessageSize)
 ```
 
-**Note:** Hit vs miss is NOT distinguished at the IPC layer. The enclave always returns `processed` (0x01) with either a real encrypted response or a same-size dummy. The proxy distinguishes hit/miss at the HTTP layer via Content-Type (`application/codoh-cached` vs `application/oblivious-dns-message`).
+**Note:** Hit vs miss is NOT distinguished at the IPC layer. The enclave always returns `processed` (0x01) with either a real encrypted response or a same-size dummy. In IPC mode, the proxy streams both chunks to the client via `application/codoh-response`; the client determines hit vs miss by attempting decryption of the enclave chunk with `k_r`.
 
 ---
 
 ## Operating Modes
 
-### IPC Mode (Configs 4-7) — 3-process architecture
+### IPC Mode (Config 4) — 3-process architecture
 
 ```
 Client → Proxy (codohproxy plugin) → Target (codohtarget plugin) → Upstream DNS
@@ -390,7 +396,9 @@ coredns/
 │   ├── attestation.go         # HTTPS attestation server (/attest, /provision)
 │   ├── attestation_sgx.go     # SGX-specific: quote generation, attested TLS
 │   ├── attestation_sim.go     # Simulation fallbacks
-│   └── enclave.json           # EGo manifest
+│   ├── enclave.json           # EGo manifest (dev, CODOH_* fromHost)
+│   ├── enclave-prod.json      # EGo manifest (prod, no env passthrough)
+│   └── Makefile               # Build targets (build, sign, run, sim, dev)
 │
 ├── plugin/
 │   ├── codohproxy/            # Proxy plugin
@@ -413,10 +421,11 @@ coredns/
 │       └── metrics.go         # Prometheus metrics
 │
 ├── benchmark/                  # Benchmarking tools
-│   ├── configs/               # Config profiles (sourceable, 9 files)
-│   │   ├── {1..7}-*.sh        # Main configs: doh, odoh, codoh-base, codoh-ipc, codoh-oram, codoh-cover, codoh-full
-│   │   ├── 4b-codoh-batch.sh  # Variant: IPC + batching only
-│   │   └── 4p-codoh-pad.sh    # Variant: IPC + padding only
+│   ├── configs/               # Config profiles (sourceable, 4 files)
+│   │   ├── 1-doh.sh           # DoH baseline
+│   │   ├── 2-odoh.sh          # ODoH baseline
+│   │   ├── 3-codoh-base.sh    # CODoH-base (2-proc proxy mode, worktree)
+│   │   └── 4-codoh-full.sh    # CODoH-full (3-proc IPC, full defense stack)
 │   ├── setup.sh               # Shared setup/teardown helpers
 │   ├── run-all.sh             # Multi-config orchestrator
 │   └── top-1m.csv             # Domain list (+ subsets: top-10, top-1k, etc.)
@@ -450,7 +459,7 @@ All scripts require SGX hardware and EGo SDK.
 ```bash
 ./benchmark/run-all.sh                 # All configs
 ./benchmark/run-all.sh --quick         # 100 iterations, cold only
-./benchmark/run-all.sh --configs 1,3,4,5
+./benchmark/run-all.sh --configs 1,3,4
 ```
 
 ### Manual Testing (SGX, Config 4)

@@ -33,8 +33,9 @@ if [[ "${1:-}" == "--clean" ]]; then
     # Remove Config 3 worktree
     if [[ -d "$SCRIPT_DIR/worktrees/config3-proxy" ]]; then
         git -C "$ROOT_DIR" worktree remove "$SCRIPT_DIR/worktrees/config3-proxy" --force 2>/dev/null || true
-        rm -rf "$SCRIPT_DIR/worktrees"
     fi
+
+    rm -rf "$SCRIPT_DIR/worktrees"
 
     echo "  Removed: coredns-test, enclave-sim, enclave/enclave, odoh-client"
     echo "  Removed: Config 3 worktree"
@@ -156,37 +157,16 @@ fi
 
 # Generate resolvable domain subsets (filters out NXDOMAIN/SERVFAIL/timeout).
 # This isolates CODoH overhead from upstream DNS failure variance.
-# Requires Unbound running on 127.0.0.1:5353.
-if [[ ! -f "$SCRIPT_DIR/top-1k-resolvable.csv" ]] || [[ ! -f "$SCRIPT_DIR/top-1m-10k-resolvable.csv" ]]; then
-    if dig +short @127.0.0.1 -p 5353 google.com > /dev/null 2>&1; then
-        echo "  Filtering resolvable domains (this takes a few minutes)..."
+# Uses Google's resolver (8.8.8.8) — Unbound isn't needed for filtering.
+if [[ ! -f "$SCRIPT_DIR/top-1k-resolvable.csv" ]] || [[ ! -f "$SCRIPT_DIR/top-10k-resolvable.csv" ]]; then
+    echo "  Filtering resolvable domains (this takes a few minutes)..."
 
-        # top-1k resolvable
-        if [[ ! -f "$SCRIPT_DIR/top-1k-resolvable.csv" ]]; then
-            echo "    Filtering top-1k..."
-            while IFS= read -r line; do
-                domain=$(echo "$line" | cut -d',' -f2)
-                if dig +short +time=2 +tries=1 @127.0.0.1 -p 5353 "$domain" A 2>/dev/null | grep -q '^[0-9]'; then
-                    echo "$line"
-                fi
-            done < "$SCRIPT_DIR/top-1k.csv" > "$SCRIPT_DIR/top-1k-resolvable.csv"
-            echo "    top-1k-resolvable.csv: $(wc -l < "$SCRIPT_DIR/top-1k-resolvable.csv") of 1000"
-        fi
+    if [[ ! -f "$SCRIPT_DIR/top-1k-resolvable.csv" ]]; then
+        "$SCRIPT_DIR/filter-resolvable.sh" --count 1000 --resolver 8.8.8.8:53
+    fi
 
-        # top-1m first 10K resolvable
-        if [[ ! -f "$SCRIPT_DIR/top-1m-10k-resolvable.csv" ]]; then
-            echo "    Filtering top-10k..."
-            head -10000 "$SCRIPT_DIR/top-1m.csv" | while IFS= read -r line; do
-                domain=$(echo "$line" | cut -d',' -f2)
-                if dig +short +time=2 +tries=1 @127.0.0.1 -p 5353 "$domain" A 2>/dev/null | grep -q '^[0-9]'; then
-                    echo "$line"
-                fi
-            done > "$SCRIPT_DIR/top-1m-10k-resolvable.csv"
-            echo "    top-1m-10k-resolvable.csv: $(wc -l < "$SCRIPT_DIR/top-1m-10k-resolvable.csv") of 10000"
-        fi
-    else
-        echo "  WARNING: Unbound not running — skipping resolvable domain filtering."
-        echo "  Set up Unbound first, then re-run setup.sh to generate filtered lists."
+    if [[ ! -f "$SCRIPT_DIR/top-10k-resolvable.csv" ]]; then
+        "$SCRIPT_DIR/filter-resolvable.sh" --count 10000 --resolver 8.8.8.8:53
     fi
 fi
 

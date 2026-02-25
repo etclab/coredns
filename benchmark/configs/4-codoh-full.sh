@@ -1,24 +1,30 @@
 #!/bin/bash
-# Config 4b: CODoH IPC + batched insertions (ablation)
-# Architecture: Same as Config 4 (3-process IPC, LRU cache)
-# Adds: Batched cache insertions only (no ORAM, no covers, no padding)
-# Purpose: Isolate marginal cost of batching mechanism
+# Config 4: CODoH full defense stack
+# Architecture: 3-process IPC (enclave + proxy + target)
+# Adds: ORAM cache + cover responses + batched insertions + bucketed padding
+# This is the production configuration matching the paper's complete design.
 
-CONFIG_NAME="codoh-batch"
-CONFIG_NUM="4b"
+CONFIG_NAME="codoh-full"
+CONFIG_NUM=4
 CONFIG_PROTOCOL="codoh"
 
 start_config() {
     local root_dir=$1 cert_path=$2 output_dir=$3
 
-    # Start enclave (LRU cache + batching)
-    echo "Starting enclave (LRU cache, batching)..."
+    # Start enclave (ORAM cache, full defenses)
+    echo "Starting enclave (ORAM N=${CODOH_CACHE_SIZE:-1024}, padding, batching)..."
     if [[ "${SGX_MODE:-false}" == "true" ]]; then
+        CODOH_USE_ORAM=true \
+        CODOH_CACHE_SIZE="${CODOH_CACHE_SIZE:-1024}" \
+        CODOH_PAD_BUCKETS=16384 \
         CODOH_BATCH_SIZE="${CODOH_BATCH_SIZE:-10}" \
         CODOH_BATCH_COMMIT_PROB="${CODOH_BATCH_COMMIT_PROB:-0.1}" \
             ego run "$root_dir/enclave/enclave" \
             > "$output_dir/enclave.log" 2>&1 &
     else
+        CODOH_USE_ORAM=true \
+        CODOH_CACHE_SIZE="${CODOH_CACHE_SIZE:-1024}" \
+        CODOH_PAD_BUCKETS=16384 \
         CODOH_BATCH_SIZE="${CODOH_BATCH_SIZE:-10}" \
         CODOH_BATCH_COMMIT_PROB="${CODOH_BATCH_COMMIT_PROB:-0.1}" \
             "$root_dir/enclave-sim" \
@@ -26,8 +32,13 @@ start_config() {
     fi
     wait_for_enclave_attest
 
-    echo "Starting CODoH target on port 8443..."
-    "$root_dir/coredns-test" -conf "$COREFILE_DIR/Corefile.target" \
+    echo "Starting CODoH target on port 8443 (covers k=${CODOH_COVER_COUNT:-3})..."
+    CODOH_COVER_COUNT="${CODOH_COVER_COUNT:-3}" \
+    CODOH_COVER_DOMAIN_FILE="$root_dir/benchmark/top-1k-resolvable.csv" \
+    CODOH_PROXY_CALLBACK_URL="https://${PROXY_IP:-127.0.0.1}:8080" \
+    CODOH_COVER_RESOLVER="$UPSTREAM_RESOLVER" \
+    CODOH_COVER_TIMEOUT_MS=2000 \
+        "$root_dir/coredns-test" -conf "$COREFILE_DIR/Corefile.target" \
         > "$output_dir/codoh-target.log" 2>&1 &
     wait_for_enclave_socket
 

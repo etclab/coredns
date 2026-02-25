@@ -165,7 +165,6 @@ func (s *ProxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 			log.Printf("Failed to encrypt cached response: %v", err)
 			// Fall through to miss path
 		} else {
-			log.Printf("Cache HIT for %s", query)
 			w.Header().Set("Content-Type", "application/codoh-cached")
 			w.Write(encrypted)
 			return
@@ -173,8 +172,6 @@ func (s *ProxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Cache miss — forward ODoH body to target
-	log.Printf("Cache MISS for %s", query)
-
 	odohBody, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "failed to read request body", http.StatusBadRequest)

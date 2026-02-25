@@ -294,7 +294,7 @@ For quote verification on the target side, build with `-tags sgxverify` (require
 
 ## What's Implemented
 
-### CODoH IPC Mode (Configs 4-7)
+### CODoH IPC Mode (Config 4)
 
 Full 3-process architecture with enclave-based caching, HPKE encryption, and Ed25519 signature verification.
 
@@ -411,7 +411,7 @@ Compare protocol configurations with the multi-config orchestrator.
 ### Quick Start
 
 ```bash
-# Run all configs (1-5,7)
+# Run all configs (1-4)
 ./benchmark/run-all.sh
 
 # Quick mode (100 iterations, cold only)
@@ -420,8 +420,8 @@ Compare protocol configurations with the multi-config orchestrator.
 # Specific configs
 ./benchmark/run-all.sh --configs 1,3,4,5
 
-# SGX mode
-./benchmark/run-all.sh --sgx
+# Simulation mode (SGX is the default)
+./benchmark/run-all.sh --no-sgx
 ```
 
 ### Configurations
@@ -431,9 +431,7 @@ Compare protocol configurations with the multi-config orchestrator.
 | 1 | DoH baseline | DoH | Direct |
 | 2 | ODoH baseline | ODoH | 2-process (proxy + target) |
 | 3 | CODoH-base | CODoH | 2-process (enclave-proxy + target) |
-| 4 | CODoH token | CODoH | 3-process IPC (enclave + proxy + target) |
-| 5 | CODoH ORAM | CODoH | 3-process IPC with ORAM cache |
-| 7 | CODoH full | CODoH | 3-process IPC with ORAM cache |
+| 4 | CODoH-full | CODoH | 3-process IPC with full defense stack |
 
 ### Output Files
 
@@ -478,9 +476,9 @@ cp benchmark/cloud-env.sh benchmark/cloud-env.local.sh
 **Running (from client VM):**
 
 ```bash
-./benchmark/cloud-run.sh --quick                # smoke test (configs 2,4,7, 50q)
-./benchmark/cloud-run.sh --standard             # comparison (configs 2,3,7, 10Kq)
-./benchmark/cloud-run.sh --configs 2,3,7 --iterations 5000
+./benchmark/cloud-run.sh --quick                # smoke test (configs 2,3,4, 50q)
+./benchmark/cloud-run.sh --standard             # comparison (configs 2,3,4, 10Kq)
+./benchmark/cloud-run.sh --configs 2,3,4 --iterations 5000
 ./benchmark/cloud-run.sh --no-sgx               # simulation mode
 ```
 
@@ -488,9 +486,9 @@ cp benchmark/cloud-env.sh benchmark/cloud-env.local.sh
 
 | Flag | Description |
 |------|-------------|
-| `--configs 2,3,7` | Run specific configs only |
-| `--quick` | 50 queries, warm workload, configs 2,4,7 |
-| `--standard` | 10K queries, all workloads, configs 2,3,7 |
+| `--configs 2,3,4` | Run specific configs only |
+| `--quick` | 50 queries, warm workload, configs 2,3,4 |
+| `--standard` | 10K queries, all workloads, configs 2,3,4 |
 | `--no-sgx` | Use enclave-sim instead of SGX |
 | `--resolver cloudflare` | Upstream resolver (cloudflare/google/HOST:PORT) |
 | `--run-id NAME` | Name for results directory |
@@ -499,8 +497,8 @@ cp benchmark/cloud-env.sh benchmark/cloud-env.local.sh
 
 | Port | Process | VM | Configs |
 |------|---------|-----|---------|
-| 8080 | codohproxy | Proxy | 4-7 |
-| 8444 | enclave attestation | Proxy | 4-7 |
+| 8080 | codohproxy | Proxy | 4 |
+| 8444 | enclave attestation | Proxy | 4 |
 | 9080 | odohproxy | Proxy | 2 |
 | 10443 | enclave-proxy (config 3) | Proxy | 3 |
 | 7443 | DoH server | Target | 1 |

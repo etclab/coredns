@@ -2,24 +2,24 @@
 # CODoH Multi-Configuration Benchmark Orchestrator
 #
 # Run modes:
-#   --quick       Smoke test (10q all configs) + spot check (500q on configs 4,7)  ~5-8 min
-#   --standard    Core comparison (10Kq on configs 2,3,7)                          ~45-90 min
-#   (default)     Full benchmark (10Kq all configs + ablation + sweeps)            ~4-7 hrs
+#   --quick       Smoke test (50q all configs) + spot check (1Kq on configs 2,3,4)  ~5-8 min
+#   --standard    Core comparison (10Kq on configs 2,3,4)                          ~45-90 min
+#   (default)     Full benchmark (10Kq all configs + sweeps)                       ~2-4 hrs
 #
 # Usage:
 #   ./benchmark/run-all.sh [options]
 #
 # Options:
 #   --run-id NAME        Name for results directory (default: timestamp)
-#   --configs 1,3,5,7    Run only specified configs (default: mode-dependent)
+#   --configs 1,2,3,4    Run only specified configs (default: mode-dependent)
 #   --workloads cold,zipf,warm  Run only specified workloads (default: all)
 #   --iterations N       Queries per workload (default: 10000)
 #   --warmup N           Warm-up queries to discard (default: 100)
 #   --quick              Quick validation mode
 #   --standard           Standard comparison mode
 #   --no-sgx             Use simulation mode (default: SGX)
-#   --sweep-oram         Run ORAM capacity sweep (N=256,1024,2048 on configs 5,7)
-#   --sweep-cover        Run cover count sweep (k=1,3,5 on configs 6,7)
+#   --sweep-oram         Run ORAM capacity sweep (N=256,1024,2048 on config 4)
+#   --sweep-cover        Run cover count sweep (k=1,3,5 on config 4)
 #   --resolver NAME      Upstream resolver: unbound (default), cloudflare, google, or HOST:PORT
 #   --zipf-s S           Zipf skew parameter (default: 1.0)
 
@@ -44,7 +44,7 @@ RESOLVER="unbound"
 
 CLIENT_PATH="$(dirname "$ROOT_DIR")/codoh-client/odoh-client"
 CERT_PATH="$ROOT_DIR/localhost.pem"
-DOMAINS_1M="$SCRIPT_DIR/top-1m-10k-resolvable.csv"
+DOMAINS_1M="$SCRIPT_DIR/top-10k-resolvable.csv"
 DOMAINS_1K="$SCRIPT_DIR/top-1k-resolvable.csv"
 
 # Parse arguments
@@ -64,7 +64,7 @@ while [[ $# -gt 0 ]]; do
         --resolver)     RESOLVER="$2"; shift 2 ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--run-id NAME] [--configs 1,3,5] [--quick|--standard] [--no-sgx] [--resolver unbound|cloudflare|google|HOST:PORT] [--sweep-oram] [--sweep-cover]"
+            echo "Usage: $0 [--run-id NAME] [--configs 1,2,3,4] [--quick|--standard] [--no-sgx] [--resolver unbound|cloudflare|google|HOST:PORT] [--sweep-oram] [--sweep-cover]"
             exit 1
             ;;
     esac
@@ -73,16 +73,16 @@ done
 # Apply mode defaults
 case $RUN_MODE in
     quick)
-        [[ -z "$SELECTED_CONFIGS" ]] && SELECTED_CONFIGS="1,2,3,4,5,6,7"
+        [[ -z "$SELECTED_CONFIGS" ]] && SELECTED_CONFIGS="1,2,3,4"
         ITERATIONS=10         # Phase 1: smoke
         WARMUP_QUERIES=0
         SELECTED_WORKLOADS="warm"
         ;;
     standard)
-        [[ -z "$SELECTED_CONFIGS" ]] && SELECTED_CONFIGS="2,3,7"
+        [[ -z "$SELECTED_CONFIGS" ]] && SELECTED_CONFIGS="2,3,4"
         ;;
     full)
-        [[ -z "$SELECTED_CONFIGS" ]] && SELECTED_CONFIGS="1,2,3,4,4b,4p,5,6,7"
+        [[ -z "$SELECTED_CONFIGS" ]] && SELECTED_CONFIGS="1,2,3,4"
         ;;
 esac
 
@@ -426,10 +426,10 @@ run_quick() {
         echo "WARNING: Some configs failed smoke test!"
     fi
 
-    # Phase 2: Spot check — 1000 queries, all 3 workloads, configs 2, 4, 7
+    # Phase 2: Spot check — 1000 queries, all 3 workloads, configs 2, 3, 4
     echo ""
-    echo "=== Phase 2: Spot Check (1000 queries, all workloads, configs 2+4+7) ==="
-    for config_num in 2 4 7; do
+    echo "=== Phase 2: Spot Check (1000 queries, all workloads, configs 2+3+4) ==="
+    for config_num in 2 3 4; do
         run_config "$config_num" 1000 50 "$OUTPUT_RAW" "cold" "zipf" "warm"
     done
 }
@@ -438,7 +438,7 @@ run_quick() {
 # Standard mode
 #######################################
 run_standard() {
-    echo "=== Standard Comparison (configs 2,3,7) ==="
+    echo "=== Standard Comparison (configs 2,3,4) ==="
     for config_num in "${CONFIGS[@]}"; do
         run_config "$config_num" "$ITERATIONS" "$WARMUP_QUERIES" "$OUTPUT_RAW" "${WORKLOADS[@]}"
     done
@@ -462,13 +462,11 @@ run_full() {
         echo ""
         echo "--- ORAM Capacity Sweep ---"
         for oram_n in 256 2048; do  # 1024 already covered in main
-            for config_num in 5 7; do
-                export CODOH_CACHE_SIZE=$oram_n
-                local sweep_dir="$OUTPUT_RAW/sweep_oram_${oram_n}"
-                mkdir -p "$sweep_dir"
-                run_config "$config_num" "$ITERATIONS" "$WARMUP_QUERIES" "$sweep_dir" "${WORKLOADS[@]}"
-                unset CODOH_CACHE_SIZE
-            done
+            export CODOH_CACHE_SIZE=$oram_n
+            local sweep_dir="$OUTPUT_RAW/sweep_oram_${oram_n}"
+            mkdir -p "$sweep_dir"
+            run_config 4 "$ITERATIONS" "$WARMUP_QUERIES" "$sweep_dir" "${WORKLOADS[@]}"
+            unset CODOH_CACHE_SIZE
         done
     fi
 
@@ -477,13 +475,11 @@ run_full() {
         echo ""
         echo "--- Cover Count Sweep ---"
         for cover_k in 1 5; do  # k=3 already covered in main
-            for config_num in 6 7; do
-                export CODOH_COVER_COUNT=$cover_k
-                local sweep_dir="$OUTPUT_RAW/sweep_cover_${cover_k}"
-                mkdir -p "$sweep_dir"
-                run_config "$config_num" "$ITERATIONS" "$WARMUP_QUERIES" "$sweep_dir" "${WORKLOADS[@]}"
-                unset CODOH_COVER_COUNT
-            done
+            export CODOH_COVER_COUNT=$cover_k
+            local sweep_dir="$OUTPUT_RAW/sweep_cover_${cover_k}"
+            mkdir -p "$sweep_dir"
+            run_config 4 "$ITERATIONS" "$WARMUP_QUERIES" "$sweep_dir" "${WORKLOADS[@]}"
+            unset CODOH_COVER_COUNT
         done
     fi
 }

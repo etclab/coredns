@@ -22,15 +22,18 @@ All commands run from the **repository root** (`coredns/`).
 ### 1. Build everything
 
 ```bash
-./benchmark/setup.sh
+./benchmark/setup.sh          # full build
+./benchmark/setup.sh --clean  # remove all artifacts, then re-run without --clean
 ```
 
 This will:
 - Verify SGX hardware (fails if absent)
-- Build the SGX enclave, server (`coredns-test`), and client (`odoh-client`)
-- Generate TLS certificates
+- Build the SGX enclave, simulation binary, server (`coredns-test`), and client (`odoh-client`)
+- Generate TLS certificates (mkcert or self-signed openssl)
 - Download the Cisco Umbrella top-1M domain list
-- Create a git worktree for Config 3 (pinned to commit `e81a315`)
+- Filter resolvable domains via `filter-resolvable.sh` (requires Unbound; creates `top-1k-resolvable.csv` and `top-10k-resolvable.csv`)
+- Create a git worktree for Config 3 (pinned to commit `e81a315`) with compatibility patches
+- Build Config 3 binaries from the worktree
 
 Expected output ends with a "Setup Complete" summary listing all binary paths.
 
@@ -68,7 +71,7 @@ Run a quick smoke test to verify all configurations start and respond correctly:
 ./benchmark/run-all.sh --quick
 ```
 
-This sends 10 queries to each config (smoke test) then 500 queries to Configs 4 and 7 (spot check). Takes ~5-8 minutes. Check the output for any `FAIL` lines.
+Phase 1 (smoke): 50 warm queries to all 4 configs. Phase 2 (spot check): 1000 queries across all 3 workloads on Configs 2, 3, 4. Takes ~5-8 minutes. Check the output for any `FAIL` lines.
 
 ### 5. Run the benchmark
 
@@ -77,12 +80,14 @@ Choose a run mode:
 ```bash
 # Standard comparison (~1 hour)
 # Compares ODoH vs CODoH-base vs CODoH-full — the paper's core result
-./benchmark/run-all.sh --standard --sgx --run-id std-01
+./benchmark/run-all.sh --standard --run-id std-01
 
-# Full evaluation (~4-7 hours)
-# All 9 configs + ablation + parameter sweeps
-./benchmark/run-all.sh --sgx --run-id full-01 --sweep-oram --sweep-cover
+# Full evaluation (~2-4 hours)
+# All 4 configs + parameter sweeps
+./benchmark/run-all.sh --run-id full-01 --sweep-oram --sweep-cover
 ```
+
+SGX mode is the default. Use `--no-sgx` for simulation mode (development only).
 
 ### 6. Find the results
 
@@ -127,12 +132,7 @@ The benchmark incrementally adds privacy defenses to measure their individual ov
 | 1 | **DoH** | Baseline — plain DNS-over-HTTPS |
 | 2 | **ODoH** | + Oblivious proxy (HPKE encryption) |
 | 3 | **CODoH-base** | + Enclave with LRU cache (2-proc proxy mode) |
-| 4 | **CODoH-IPC** | + 3-proc IPC architecture, dummy responses, replay protection |
-| 5 | **CODoH-ORAM** | + ORAM cache (hides access patterns) |
-| 6 | **CODoH-cover** | + Cover responses (hides cache set membership) |
-| 7 | **CODoH-full** | + All defenses: ORAM + covers + batching + padding |
-
-Ablation configs **4b** (batching only) and **4p** (padding only) isolate cheap defenses.
+| 4 | **CODoH-full** | + All defenses: ORAM + covers + batching + padding (3-proc IPC) |
 
 ### Workloads
 
@@ -144,10 +144,10 @@ Ablation configs **4b** (batching only) and **4p** (padding only) isolate cheap 
 
 ### Parameter Sweeps
 
-| Sweep | Values | Configs | Purpose |
-|-------|--------|---------|---------|
-| ORAM capacity (N) | 256, 1024, 2048 | 5, 7 | ORAM scaling within SGX EPC |
-| Cover count (k) | 1, 3, 5 | 6, 7 | Privacy vs. performance tradeoff |
+| Sweep | Values | Config | Purpose |
+|-------|--------|--------|---------|
+| ORAM capacity (N) | 256, 1024, 2048 | 4 | ORAM scaling within SGX EPC |
+| Cover count (k) | 1, 3, 5 | 4 | Privacy vs. performance tradeoff |
 
 ---
 
@@ -157,17 +157,18 @@ Ablation configs **4b** (batching only) and **4p** (padding only) isolate cheap 
 ./benchmark/run-all.sh [OPTIONS]
 
 Modes (mutually exclusive):
-  --quick              Smoke test + spot check                    (~5-8 min)
+  --quick              Smoke (50q warm) + spot check (1Kq all wl)  (~5-8 min)
   --standard           Core 3-config comparison                   (~1 hour)
-  (default)            Full 9-config evaluation                   (~4-7 hrs)
+  (default)            Full 4-config evaluation                   (~2-4 hrs)
 
 Options:
   --run-id NAME        Name for results directory (default: auto-generated)
-  --sgx                Run enclaves with SGX (ego run). Required for paper results.
-  --configs 1,4,7      Run only specified configs
-  --workloads cold,warm Run only specified workloads
+  --no-sgx             Use simulation mode instead of SGX (default: SGX enabled)
+  --configs 1,2,3,4    Run only specified configs
+  --workloads cold,zipf,warm  Run only specified workloads (default: all three)
   --iterations N       Queries per workload (default: 10000)
   --warmup N           Warm-up queries to discard (default: 100)
+  --resolver NAME      Upstream: unbound (default), cloudflare, google, or HOST:PORT
   --sweep-oram         ORAM capacity sweep (N=256,1024,2048)
   --sweep-cover        Cover count sweep (k=1,3,5)
   --zipf-s S           Zipf skew parameter (default: 1.0)
@@ -178,7 +179,7 @@ Options:
 ## Troubleshooting
 
 **`setup.sh` fails with "SGX hardware required"**
-Your machine needs Intel SGX. Check `ls /dev/sgx*`. Without SGX, remove `--sgx` from run commands to use simulation mode (results won't match the paper).
+Your machine needs Intel SGX. Check `ls /dev/sgx*`. Without SGX, add `--no-sgx` to run commands to use simulation mode (results won't match the paper).
 
 **Unbound not responding on port 5353**
 Check for systemd-resolved conflict: `sudo systemctl stop systemd-resolved`. Verify config: `sudo unbound-checkconf`.
@@ -204,8 +205,8 @@ Increase parallelism: `./benchmark/prewarm-unbound.sh --parallel 100`
 |------|---------|
 | 5353 | Unbound (local resolver) |
 | 7443 | DoH server (Config 1) |
-| 8080 | CODoH proxy (Configs 4-7) |
-| 8443 | CODoH target (Configs 4-7) |
+| 8080 | CODoH proxy (Config 4) |
+| 8443 | CODoH target (Config 4) |
 | 8444 | Enclave attestation |
 | 9080 | ODoH proxy (Config 2) |
 | 9443 | ODoH target (Config 2) |
@@ -214,7 +215,7 @@ Increase parallelism: `./benchmark/prewarm-unbound.sh --parallel 100`
 
 ## Notes for Artifact Reviewers
 
-- All paper numbers use `--sgx`. Simulation mode (`enclave-sim`) is for development only.
+- All paper numbers use SGX mode (the default). Simulation mode (`--no-sgx` / `enclave-sim`) is for development only.
 - Config 3 runs from a pinned git worktree (`e81a315`) because the proxy-mode architecture diverged from the current IPC-based codebase. The crypto primitives are identical.
 - ORAM sweep sizes (256/1024/2048) are chosen to fit within the SGX EPC (~93MB). Larger ORAM trees cause EPC paging and unrepresentative results.
 - Unbound's `cache-min-ttl: 86400` ensures cached entries survive the entire benchmark session. Prewarm once before running.

@@ -246,29 +246,15 @@ setup_target() {
     esac
 
     if [[ ! -f "$SCRIPT_DIR/top-1k-resolvable.csv" ]]; then
-        echo "  Filtering top-1k (using $resolver_addr:$resolver_port)..."
-        while IFS= read -r line; do
-            domain=$(echo "$line" | cut -d',' -f2)
-            if dig +short +time=2 +tries=1 "@$resolver_addr" -p "$resolver_port" "$domain" A 2>/dev/null | grep -q '^[0-9]'; then
-                echo "$line"
-            fi
-        done < "$SCRIPT_DIR/top-1k.csv" > "$SCRIPT_DIR/top-1k-resolvable.csv"
-        echo "  top-1k-resolvable.csv: $(wc -l < "$SCRIPT_DIR/top-1k-resolvable.csv") domains"
+        "$SCRIPT_DIR/filter-resolvable.sh" --count 1000 --resolver "$resolver_addr:$resolver_port"
     else
         echo "  top-1k-resolvable.csv: exists ($(wc -l < "$SCRIPT_DIR/top-1k-resolvable.csv") domains)"
     fi
 
-    if [[ ! -f "$SCRIPT_DIR/top-1m-10k-resolvable.csv" ]]; then
-        echo "  Filtering top-10k (using $resolver_addr:$resolver_port, this takes a few minutes)..."
-        head -10000 "$SCRIPT_DIR/top-1m.csv" | while IFS= read -r line; do
-            domain=$(echo "$line" | cut -d',' -f2)
-            if dig +short +time=2 +tries=1 "@$resolver_addr" -p "$resolver_port" "$domain" A 2>/dev/null | grep -q '^[0-9]'; then
-                echo "$line"
-            fi
-        done > "$SCRIPT_DIR/top-1m-10k-resolvable.csv"
-        echo "  top-1m-10k-resolvable.csv: $(wc -l < "$SCRIPT_DIR/top-1m-10k-resolvable.csv") domains"
+    if [[ ! -f "$SCRIPT_DIR/top-10k-resolvable.csv" ]]; then
+        "$SCRIPT_DIR/filter-resolvable.sh" --count 10000 --resolver "$resolver_addr:$resolver_port"
     else
-        echo "  top-1m-10k-resolvable.csv: exists"
+        echo "  top-10k-resolvable.csv: exists ($(wc -l < "$SCRIPT_DIR/top-10k-resolvable.csv") domains)"
     fi
     ((step++))
 

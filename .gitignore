@@ -6,6 +6,7 @@ build/
 release/
 vendor/
 benchmark/results/
+benchmark/top-*-resolvable.csv
 coredns-test
 enclave-test
 

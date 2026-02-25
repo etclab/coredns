@@ -39,9 +39,9 @@ if [[ -f "$SCRIPT_DIR/top-1k-resolvable.csv" ]]; then
     cut -d',' -f2 "$SCRIPT_DIR/top-1k-resolvable.csv" >> "$DOMAINS_FILE"
 fi
 
-# top-1m first 10K resolvable (cold workload)
-if [[ -f "$SCRIPT_DIR/top-1m-10k-resolvable.csv" ]]; then
-    cut -d',' -f2 "$SCRIPT_DIR/top-1m-10k-resolvable.csv" >> "$DOMAINS_FILE"
+# top-10K resolvable (cold workload)
+if [[ -f "$SCRIPT_DIR/top-10k-resolvable.csv" ]]; then
+    cut -d',' -f2 "$SCRIPT_DIR/top-10k-resolvable.csv" >> "$DOMAINS_FILE"
 fi
 
 # warm workload domain

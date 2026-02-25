@@ -4,7 +4,7 @@
 # Runs from the CLIENT VM. SSH into proxy/target to start processes,
 # run benchmarks locally, collect results.
 #
-# Usage: ./benchmark/cloud-run.sh [--configs 2,3,7] [--resolver cloudflare] [--no-sgx] [--quick|--standard]
+# Usage: ./benchmark/cloud-run.sh [--configs 2,3,4] [--resolver cloudflare] [--no-sgx] [--quick|--standard]
 #
 # Prerequisites:
 #   1. Fill in benchmark/cloud-env.local.sh with PROXY_IP, TARGET_IP
@@ -65,7 +65,7 @@ while [[ $# -gt 0 ]]; do
         --resolver)     RESOLVER="$2"; shift 2 ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--configs 2,3,7] [--quick|--standard] [--no-sgx] [--resolver cloudflare|google|HOST:PORT]"
+            echo "Usage: $0 [--configs 2,3,4] [--quick|--standard] [--no-sgx] [--resolver cloudflare|google|HOST:PORT]"
             exit 1
             ;;
     esac
@@ -90,13 +90,13 @@ export SGX_MODE UPSTREAM_RESOLVER
 # Apply mode defaults
 case $RUN_MODE in
     quick)
-        [[ -z "$SELECTED_CONFIGS" ]] && SELECTED_CONFIGS="2,4,7"
+        [[ -z "$SELECTED_CONFIGS" ]] && SELECTED_CONFIGS="2,3,4"
         ITERATIONS=50
         WARMUP_QUERIES=10
         SELECTED_WORKLOADS="warm"
         ;;
     standard)
-        [[ -z "$SELECTED_CONFIGS" ]] && SELECTED_CONFIGS="2,3,7"
+        [[ -z "$SELECTED_CONFIGS" ]] && SELECTED_CONFIGS="2,3,4"
         ;;
 esac
 
@@ -119,7 +119,7 @@ scp_from_target() { scp $SSH_OPTS "$SSH_USER@$TARGET_IP:$1" "$2"; }
 
 CLIENT_PATH="$(dirname "$ROOT_DIR")/codoh-client/odoh-client"
 CERT_PATH="$ROOT_DIR/localhost.pem"
-DOMAINS_1M="$SCRIPT_DIR/top-1m-10k-resolvable.csv"
+DOMAINS_1M="$SCRIPT_DIR/top-10k-resolvable.csv"
 DOMAINS_1K="$SCRIPT_DIR/top-1k-resolvable.csv"
 
 IFS=',' read -ra CONFIGS <<< "$SELECTED_CONFIGS"
@@ -485,42 +485,7 @@ run_cloud_config() {
             target_arg="--target $TARGET_IP:10444"
             ;;
         4)
-            start_config_ipc 4 "" ""
-            protocol="codoh"
-            proxy_arg="--proxy $PROXY_IP:8080"
-            target_arg="--target $TARGET_IP:8443"
-            ;;
-        4b)
-            start_config_ipc "4b" \
-                "CODOH_BATCH_SIZE=${CODOH_BATCH_SIZE:-10} CODOH_BATCH_COMMIT_PROB=${CODOH_BATCH_COMMIT_PROB:-0.1}" \
-                ""
-            protocol="codoh"
-            proxy_arg="--proxy $PROXY_IP:8080"
-            target_arg="--target $TARGET_IP:8443"
-            ;;
-        4p)
-            start_config_ipc "4p" "CODOH_PAD_BUCKETS=16384" ""
-            protocol="codoh"
-            proxy_arg="--proxy $PROXY_IP:8080"
-            target_arg="--target $TARGET_IP:8443"
-            ;;
-        5)
-            start_config_ipc 5 \
-                "CODOH_USE_ORAM=true CODOH_CACHE_SIZE=${CODOH_CACHE_SIZE:-1024}" \
-                ""
-            protocol="codoh"
-            proxy_arg="--proxy $PROXY_IP:8080"
-            target_arg="--target $TARGET_IP:8443"
-            ;;
-        6)
-            start_config_ipc 6 "" \
-                "CODOH_COVER_COUNT=${CODOH_COVER_COUNT:-3} CODOH_COVER_DOMAIN_FILE=$REMOTE_ROOT/benchmark/top-1k-resolvable.csv CODOH_PROXY_CALLBACK_URL=https://$PROXY_IP:8080 CODOH_COVER_RESOLVER=$UPSTREAM_RESOLVER CODOH_COVER_TIMEOUT_MS=2000"
-            protocol="codoh"
-            proxy_arg="--proxy $PROXY_IP:8080"
-            target_arg="--target $TARGET_IP:8443"
-            ;;
-        7)
-            start_config_ipc 7 \
+            start_config_ipc 4 \
                 "CODOH_USE_ORAM=true CODOH_CACHE_SIZE=${CODOH_CACHE_SIZE:-1024} CODOH_PAD_BUCKETS=16384 CODOH_BATCH_SIZE=${CODOH_BATCH_SIZE:-10} CODOH_BATCH_COMMIT_PROB=${CODOH_BATCH_COMMIT_PROB:-0.1}" \
                 "CODOH_COVER_COUNT=${CODOH_COVER_COUNT:-3} CODOH_COVER_DOMAIN_FILE=$REMOTE_ROOT/benchmark/top-1k-resolvable.csv CODOH_PROXY_CALLBACK_URL=https://$PROXY_IP:8080 CODOH_COVER_RESOLVER=$UPSTREAM_RESOLVER CODOH_COVER_TIMEOUT_MS=2000"
             protocol="codoh"

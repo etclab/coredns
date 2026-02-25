@@ -135,14 +135,11 @@ func (c *EnclaveClient) CheckHealth() error {
 // Wire format: [4B BE total_len][1B msgType][payload]
 // Response:    [4B BE total_len][1B status][payload]
 func (c *EnclaveClient) sendBinaryRequest(msgType byte, payload []byte) (*enclaveResponse, error) {
-	tStart := time.Now()
-
 	conn, err := c.getConn()
 	if err != nil {
 		c.setHealthy(false)
 		return nil, fmt.Errorf("connect to enclave: %w", err)
 	}
-	tDial := time.Since(tStart)
 
 	// Write: [4B len][1B type][payload]
 	totalLen := 1 + len(payload)
@@ -164,8 +161,6 @@ func (c *EnclaveClient) sendBinaryRequest(msgType byte, payload []byte) (*enclav
 			return nil, fmt.Errorf("write payload: %w", err)
 		}
 	}
-	tWrite := time.Since(tStart) - tDial
-
 	// Read response: [4B len][1B status][payload]
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	var respLen uint32
@@ -193,8 +188,6 @@ func (c *EnclaveClient) sendBinaryRequest(msgType byte, payload []byte) (*enclav
 		c.setHealthy(false)
 		return nil, fmt.Errorf("read payload: %w", err)
 	}
-	tEnclave := time.Since(tStart) - tDial - tWrite
-
 	// Clear deadlines and return to pool
 	conn.SetDeadline(time.Time{})
 	c.putConn(conn)
@@ -202,12 +195,6 @@ func (c *EnclaveClient) sendBinaryRequest(msgType byte, payload []byte) (*enclav
 	resp := &enclaveResponse{
 		Status:  buf[0],
 		Payload: buf[1:],
-	}
-
-	tTotal := time.Since(tStart)
-	if msgType == enclave.BinMsgProcess {
-		fmt.Printf("[ipc-timing] conn=%dµs write=%dµs enclave=%dµs total=%dµs\n",
-			tDial.Microseconds(), tWrite.Microseconds(), tEnclave.Microseconds(), tTotal.Microseconds())
 	}
 
 	c.setHealthy(true)

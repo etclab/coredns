@@ -274,17 +274,12 @@ func (p *odohProxy) proxyHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	var durEnclaveIPC, durTargetHTTP time.Duration
-	var firstChunk time.Duration
-
 	select {
 	case encRes := <-enclaveCh:
-		durEnclaveIPC = encRes.dur
 		enclaveBlob, enclaveError := processEnclave(encRes)
 		if enclaveError != "" {
 			// Enclave failed first — wait for target, degrade to ODoH.
 			targetRes := <-targetCh
-			durTargetHTTP = targetRes.dur
 			if targetRes.err != nil {
 				http.Error(w, "Target request failed", http.StatusBadGateway)
 				proxyRequestsTotal.WithLabelValues("error").Inc()
@@ -295,14 +290,12 @@ func (p *odohProxy) proxyHandler(w http.ResponseWriter, r *http.Request) {
 			if enclaveError == "key_rotated" {
 				w.Header().Set("X-CoDOH-Key-Rotated", "true")
 			}
-			firstChunk = time.Since(start)
 			w.WriteHeader(http.StatusOK)
 			w.Write(targetRes.body)
 			proxyRequestsTotal.WithLabelValues("degraded").Inc()
 		} else {
 			// Enclave arrived first — write enclave chunk, then target.
 			w.Header().Set("Content-Type", codohResponseContentType)
-			firstChunk = time.Since(start)
 			w.WriteHeader(http.StatusOK)
 			writeTaggedChunk(w, ChunkTypeEnclave, enclaveBlob)
 			if flusher != nil {
@@ -310,7 +303,6 @@ func (p *odohProxy) proxyHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			targetRes := <-targetCh
-			durTargetHTTP = targetRes.dur
 			if targetRes.err != nil {
 				log.Errorf("Target failed (enclave chunk already sent): %v", targetRes.err)
 			} else {
@@ -320,11 +312,9 @@ func (p *odohProxy) proxyHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 	case targetRes := <-targetCh:
-		durTargetHTTP = targetRes.dur
 		if targetRes.err != nil {
 			// Target failed first — wait for enclave, try to salvage.
 			encRes := <-enclaveCh
-			durEnclaveIPC = encRes.dur
 			enclaveBlob, enclaveError := processEnclave(encRes)
 			if enclaveError != "" || len(enclaveBlob) == 0 {
 				http.Error(w, "Target request failed", http.StatusBadGateway)
@@ -333,14 +323,12 @@ func (p *odohProxy) proxyHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			// Write enclave-only response (client uses it on hit, fails on miss)
 			w.Header().Set("Content-Type", codohResponseContentType)
-			firstChunk = time.Since(start)
 			w.WriteHeader(http.StatusOK)
 			writeTaggedChunk(w, ChunkTypeEnclave, enclaveBlob)
 			proxyRequestsTotal.WithLabelValues("enclave_ok").Inc()
 		} else {
 			// Target arrived first — write target chunk, then enclave.
 			w.Header().Set("Content-Type", codohResponseContentType)
-			firstChunk = time.Since(start)
 			w.WriteHeader(http.StatusOK)
 			writeTaggedChunk(w, ChunkTypeTarget, targetRes.body)
 			if flusher != nil {
@@ -348,7 +336,6 @@ func (p *odohProxy) proxyHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			encRes := <-enclaveCh
-			durEnclaveIPC = encRes.dur
 			enclaveBlob, enclaveError := processEnclave(encRes)
 			if enclaveError == "" && len(enclaveBlob) > 0 {
 				writeTaggedChunk(w, ChunkTypeEnclave, enclaveBlob)
@@ -358,11 +345,7 @@ func (p *odohProxy) proxyHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	total := time.Since(start)
-	log.Infof("[proxy-timing] enclave_ipc=%dµs target_http=%dµs first_chunk=%dµs total=%dµs",
-		durEnclaveIPC.Microseconds(), durTargetHTTP.Microseconds(),
-		firstChunk.Microseconds(), total.Microseconds())
-	proxyLatencySeconds.Observe(total.Seconds())
+	proxyLatencySeconds.Observe(time.Since(start).Seconds())
 }
 
 // forwardToTarget forwards the request directly to the target (standard ODoH relay).
