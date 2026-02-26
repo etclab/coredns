@@ -537,37 +537,42 @@ run_cloud_config() {
     remote_cleanup
 
     # Start config-specific processes
-    local protocol proxy_arg target_arg
+    local config_name protocol proxy_arg target_arg
     local enclave_env="CODOH_USE_ORAM=true CODOH_CACHE_SIZE=${CODOH_CACHE_SIZE:-1024} CODOH_PAD_BUCKETS=16384 CODOH_BATCH_SIZE=${CODOH_BATCH_SIZE:-10} CODOH_BATCH_COMMIT_PROB=${CODOH_BATCH_COMMIT_PROB:-0.1}"
     local target_env="CODOH_COVER_COUNT=${CODOH_COVER_COUNT:-3} CODOH_COVER_DOMAIN_FILE=$REMOTE_ROOT/benchmark/top-1k-resolvable.csv CODOH_PROXY_CALLBACK_URL=https://$PROXY_IP:8080 CODOH_COVER_RESOLVER=$UPSTREAM_RESOLVER CODOH_COVER_TIMEOUT_MS=2000"
 
     case $config_num in
         1)
             start_config_1
+            config_name="doh"
             protocol="doh"
             proxy_arg=""
             target_arg="--target $TARGET_IP:7443"
             ;;
         2)
             start_config_2
+            config_name="odoh"
             protocol="odoh"
             proxy_arg="--proxy $PROXY_IP:9080"
             target_arg="--target $TARGET_IP:9443"
             ;;
         3)
             start_config_3
+            config_name="codoh-base"
             protocol="codoh-base"
             proxy_arg="--proxy $PROXY_IP:10443"
             target_arg="--target $TARGET_IP:10444"
             ;;
         4)
             start_config_4 "$enclave_env" "$target_env"
+            config_name="codoh-nosgx"
             protocol="codoh"
             proxy_arg="--proxy $PROXY_IP:8080"
             target_arg="--target $TARGET_IP:8443"
             ;;
         5)
             start_config_5 "$enclave_env" "$target_env"
+            config_name="codoh-full"
             protocol="codoh"
             proxy_arg="--proxy $PROXY_IP:8080"
             target_arg="--target $TARGET_IP:8443"
@@ -581,7 +586,7 @@ run_cloud_config() {
     # Run workloads
     local success=0 fail=0
     for workload in "${WORKLOADS[@]}"; do
-        if run_cloud_workload "config${config_num}" "$workload" "$protocol" \
+        if run_cloud_workload "$config_name" "$workload" "$protocol" \
             "$proxy_arg" "$target_arg" "$ITERATIONS" "$WARMUP_QUERIES" "$OUTPUT_RAW"; then
             ((success++)) || true
         else

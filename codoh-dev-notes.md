@@ -436,14 +436,36 @@ Compare protocol configurations with the multi-config orchestrator.
 
 ### Output Files
 
-Results saved to `benchmark/results/<timestamp>/`:
+Results saved to `benchmark/results/<run-id>/`:
 
 | File | Description |
 |------|-------------|
-| `<config>_cold.csv/json` | Sequential queries, empty cache |
-| `<config>_zipf.csv/json` | Zipf distribution, realistic cache behavior |
-| `<config>_warm.csv/json` | Single domain repeated, best-case cache |
-| `comparison.png` | Gnuplot comparison chart |
+| `raw/<config>_<workload>.csv` | Per-query latency trace |
+| `raw/<config>_<workload>.json` | Summary stats (p50/p95/p99, QPS, cache hit rate) |
+| `metadata.json` | Run parameters, system info, timestamps |
+
+Config names: `doh`, `odoh`, `codoh-base`, `codoh-nosgx`, `codoh-full`. Workloads: `cold`, `zipf`, `warm`.
+
+### Plotting
+
+Generate CDF plots (EPS+PDF) and LaTeX tables from a results directory:
+
+```bash
+./benchmark/plot.sh benchmark/results/<run-id>
+```
+
+Output goes to `benchmark/results/<run-id>/plots/`:
+
+| File | Description |
+|------|-------------|
+| `cdf_cold.eps/pdf` | CDF overlay, cold workload, all configs |
+| `cdf_zipf.eps/pdf` | CDF overlay, zipf workload |
+| `cdf_warm.eps/pdf` | CDF overlay, warm workload |
+| `table_comparison.tex` | LaTeX table fragment (p50/p95/p99, overhead vs ODoH) |
+| `table_sweep_oram.tex` | ORAM capacity sweep table (if sweep data exists) |
+| `table_sweep_cover.tex` | Cover count sweep table (if sweep data exists) |
+
+Requires: `python3`, `gnuplot`, `epstopdf` or `ps2pdf`. No pip dependencies.
 
 ### Requirements
 
