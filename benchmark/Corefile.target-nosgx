@@ -1,0 +1,16 @@
+# CODoH Target Server (no-SGX variant)
+# Same as Corefile.target but without enclave_url (no attestation provisioning)
+
+.:25356 {
+    codohtarget {
+        port 8443
+        tls_cert localhost.pem
+        tls_key localhost-key.pem
+        upstream 127.0.0.1:5353
+        signing_key /tmp/target-signing.pem
+        log_queries true
+    }
+
+    errors
+    log
+}

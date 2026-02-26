@@ -319,7 +319,7 @@ codohtarget {
 | Content-Type | Description |
 |--------------|-------------|
 | application/oblivious-dns-message | Standard ODoH (RFC 9230); also used as degraded fallback when enclave fails |
-| application/codoh-response | IPC mode (Config 4): tagged chunks `[1B type][2B BE len][data]...` containing enclave + target responses |
+| application/codoh-response | IPC mode (Configs 4, 5): tagged chunks `[1B type][2B BE len][data]...` containing enclave + target responses |
 | application/codoh-cached | Proxy mode only (Config 3): cached response from enclave (AES-GCM under k_r) |
 
 ---
@@ -355,7 +355,7 @@ Max message size: 64 KiB (maxIPCMessageSize)
 
 ## Operating Modes
 
-### IPC Mode (Config 4) — 3-process architecture
+### IPC Mode (Configs 4, 5) — 3-process architecture
 
 ```
 Client → Proxy (codohproxy plugin) → Target (codohtarget plugin) → Upstream DNS
@@ -421,11 +421,12 @@ coredns/
 │       └── metrics.go         # Prometheus metrics
 │
 ├── benchmark/                  # Benchmarking tools
-│   ├── configs/               # Config profiles (sourceable, 4 files)
+│   ├── configs/               # Config profiles (sourceable, 5 files)
 │   │   ├── 1-doh.sh           # DoH baseline
 │   │   ├── 2-odoh.sh          # ODoH baseline
 │   │   ├── 3-codoh-base.sh    # CODoH-base (2-proc proxy mode, worktree)
-│   │   └── 4-codoh-full.sh    # CODoH-full (3-proc IPC, full defense stack)
+│   │   ├── 4-codoh-nosgx.sh   # CODoH-nosgx (3-proc IPC, full defenses, no SGX)
+│   │   └── 5-codoh-full.sh    # CODoH-full (3-proc IPC, full defense stack, SGX)
 │   ├── setup.sh               # Shared setup/teardown helpers
 │   ├── run-all.sh             # Multi-config orchestrator
 │   └── top-1m.csv             # Domain list (+ subsets: top-10, top-1k, etc.)
@@ -448,7 +449,7 @@ coredns/
 All scripts require SGX hardware and EGo SDK.
 
 ```bash
-./scripts/test-stack-simple.sh         # Quick Config 4 smoke test (build + 3 processes + client)
+./scripts/test-stack-simple.sh         # Quick Config 5 smoke test (build + 3 processes + client)
 ./scripts/test-attestation-e2e.sh      # Full attestation flow (quote, provisioning, queries)
 ./scripts/test-codoh-base-e2e.sh       # Config 3 proxy mode (2-process)
 ./scripts/test-provisioning.sh         # Focused provisioning test (enclave + target only)
@@ -459,10 +460,10 @@ All scripts require SGX hardware and EGo SDK.
 ```bash
 ./benchmark/run-all.sh                 # All configs
 ./benchmark/run-all.sh --quick         # 100 iterations, cold only
-./benchmark/run-all.sh --configs 1,3,4
+./benchmark/run-all.sh --configs 1,3,4,5
 ```
 
-### Manual Testing (SGX, Config 4)
+### Manual Testing (SGX, Config 5)
 
 Launch order matters: enclave must serve `/attest` before target starts.
 

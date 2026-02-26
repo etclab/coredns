@@ -67,7 +67,7 @@ cd enclave && ego-go build -tags ego -o enclave ./cmd && ego sign enclave.json
 All scripts require SGX hardware and EGo SDK.
 
 ```bash
-./scripts/test-stack-simple.sh         # Quick Config 4 smoke test (build + run + client)
+./scripts/test-stack-simple.sh         # Quick Config 5 smoke test (build + run + client)
 ./scripts/test-attestation-e2e.sh      # Full attestation flow (quote, provisioning, queries)
 ./scripts/test-codoh-base-e2e.sh       # Config 3 proxy mode (2-process)
 ./scripts/test-provisioning.sh         # Focused provisioning test (enclave + target only)
@@ -294,7 +294,7 @@ For quote verification on the target side, build with `-tags sgxverify` (require
 
 ## What's Implemented
 
-### CODoH IPC Mode (Config 4)
+### CODoH IPC Mode (Configs 4, 5)
 
 Full 3-process architecture with enclave-based caching, HPKE encryption, and Ed25519 signature verification.
 
@@ -411,7 +411,7 @@ Compare protocol configurations with the multi-config orchestrator.
 ### Quick Start
 
 ```bash
-# Run all configs (1-4)
+# Run all configs (1-5)
 ./benchmark/run-all.sh
 
 # Quick mode (100 iterations, cold only)
@@ -431,7 +431,8 @@ Compare protocol configurations with the multi-config orchestrator.
 | 1 | DoH baseline | DoH | Direct |
 | 2 | ODoH baseline | ODoH | 2-process (proxy + target) |
 | 3 | CODoH-base | CODoH | 2-process (enclave-proxy + target) |
-| 4 | CODoH-full | CODoH | 3-process IPC with full defense stack |
+| 4 | CODoH-nosgx | CODoH | 3-process IPC, full defenses, no SGX |
+| 5 | CODoH-full | CODoH | 3-process IPC with full defense stack (SGX) |
 
 ### Output Files
 
@@ -503,12 +504,12 @@ cp benchmark/cloud-env.sh benchmark/cloud-env.local.sh
 
 | Port | Process | VM | Configs |
 |------|---------|-----|---------|
-| 8080 | codohproxy | Proxy | 4 |
-| 8444 | enclave attestation | Proxy | 4 |
+| 8080 | codohproxy | Proxy | 4, 5 |
+| 8444 | enclave attestation | Proxy | 5 |
 | 9080 | odohproxy | Proxy | 2 |
 | 10443 | enclave-proxy (config 3) | Proxy | 3 |
 | 7443 | DoH server | Target | 1 |
-| 8443 | codohtarget | Target | 4-7 |
+| 8443 | codohtarget | Target | 4, 5 |
 | 9443 | odohtarget | Target | 2 |
 | 10444 | codoh-base-target | Target | 3 |
 

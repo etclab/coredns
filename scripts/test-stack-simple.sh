@@ -1,5 +1,5 @@
 #!/bin/bash
-# Quick Config 4 (IPC mode) smoke test — SGX enclave + target + proxy
+# Quick Config 5 (IPC mode) smoke test — SGX enclave + target + proxy
 #
 # Verifies: enclave starts in SGX, attestation provisions signing key,
 # proxy connects to enclave socket, client queries succeed (miss + hit).

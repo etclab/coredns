@@ -34,10 +34,10 @@ SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -i $SSH_KEY"
 # Target inbound: 8443 (codohtarget), 9443 (odohtarget), 10444 (config3 target)
 
 PROXY_PORTS=(8080 8444 9080 10443)
-TARGET_PORTS=(8443 9443 10444)
+TARGET_PORTS=(7443 8443 9443 10444)
 
 PROXY_LABELS=("codohproxy" "enclave-attest" "odohproxy" "config3-proxy")
-TARGET_LABELS=("codohtarget" "odohtarget" "config3-target")
+TARGET_LABELS=("doh" "codohtarget" "odohtarget" "config3-target")
 
 echo "=== CODoH Port Reachability Check ==="
 echo "Proxy:  $PROXY_IP (ports: ${PROXY_PORTS[*]})"

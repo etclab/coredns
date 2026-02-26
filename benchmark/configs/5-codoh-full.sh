@@ -1,11 +1,11 @@
 #!/bin/bash
-# Config 4: CODoH full defense stack
+# Config 5: CODoH full defense stack (SGX)
 # Architecture: 3-process IPC (enclave + proxy + target)
 # Adds: ORAM cache + cover responses + batched insertions + bucketed padding
 # This is the production configuration matching the paper's complete design.
 
 CONFIG_NAME="codoh-full"
-CONFIG_NUM=4
+CONFIG_NUM=5
 CONFIG_PROTOCOL="codoh"
 
 start_config() {

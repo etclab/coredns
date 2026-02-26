@@ -28,7 +28,7 @@ if ! command -v az &>/dev/null; then
 fi
 
 PROXY_PORTS="8080 8444 9080 10443"
-TARGET_PORTS="8443 9443 10444"
+TARGET_PORTS="7443 8443 9443 10444"
 
 echo "=== Opening Benchmark Ports ==="
 echo "Resource group: $RESOURCE_GROUP"

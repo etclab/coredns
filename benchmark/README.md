@@ -71,7 +71,7 @@ Run a quick smoke test to verify all configurations start and respond correctly:
 ./benchmark/run-all.sh --quick
 ```
 
-Phase 1 (smoke): 50 warm queries to all 4 configs. Phase 2 (spot check): 1000 queries across all 3 workloads on Configs 2, 3, 4. Takes ~5-8 minutes. Check the output for any `FAIL` lines.
+Phase 1 (smoke): 50 warm queries to all 5 configs. Phase 2 (spot check): 1000 queries across all 3 workloads on Configs 2, 3, 5, 4. Takes ~8-12 minutes. Check the output for any `FAIL` lines.
 
 ### 5. Run the benchmark
 
@@ -132,7 +132,8 @@ The benchmark incrementally adds privacy defenses to measure their individual ov
 | 1 | **DoH** | Baseline — plain DNS-over-HTTPS |
 | 2 | **ODoH** | + Oblivious proxy (HPKE encryption) |
 | 3 | **CODoH-base** | + Enclave with LRU cache (2-proc proxy mode) |
-| 4 | **CODoH-full** | + All defenses: ORAM + covers + batching + padding (3-proc IPC) |
+| 4 | **CODoH-nosgx** | + All defenses without SGX (3-proc IPC, ORAM + covers + batching + padding) |
+| 5 | **CODoH-full** | + SGX enclave (isolates SGX overhead vs Config 4) |
 
 ### Workloads
 
@@ -164,7 +165,7 @@ Modes (mutually exclusive):
 Options:
   --run-id NAME        Name for results directory (default: auto-generated)
   --no-sgx             Use simulation mode instead of SGX (default: SGX enabled)
-  --configs 1,2,3,4    Run only specified configs
+  --configs 1,2,3,4,5  Run only specified configs
   --workloads cold,zipf,warm  Run only specified workloads (default: all three)
   --iterations N       Queries per workload (default: 10000)
   --warmup N           Warm-up queries to discard (default: 100)
@@ -205,9 +206,9 @@ Increase parallelism: `./benchmark/prewarm-unbound.sh --parallel 100`
 |------|---------|
 | 5353 | Unbound (local resolver) |
 | 7443 | DoH server (Config 1) |
-| 8080 | CODoH proxy (Config 4) |
-| 8443 | CODoH target (Config 4) |
-| 8444 | Enclave attestation |
+| 8080 | CODoH proxy (Configs 4, 5) |
+| 8443 | CODoH target (Configs 4, 5) |
+| 8444 | Enclave attestation (Config 5 only) |
 | 9080 | ODoH proxy (Config 2) |
 | 9443 | ODoH target (Config 2) |
 | 10443 | CODoH-base enclave-proxy (Config 3) |

@@ -4,7 +4,7 @@
 # Runs from the CLIENT VM. SSH into proxy/target to start processes,
 # run benchmarks locally, collect results.
 #
-# Usage: ./benchmark/cloud-run.sh [--configs 2,3,4] [--resolver cloudflare] [--no-sgx] [--quick|--standard]
+# Usage: ./benchmark/cloud-run.sh [--configs 2,3,4] [--resolver cloudflare] [--no-sgx] [--quick|--standard|--full] [--sweep-oram] [--sweep-cover]
 #
 # Prerequisites:
 #   1. Fill in benchmark/cloud-env.local.sh with PROXY_IP, TARGET_IP
@@ -43,6 +43,9 @@ ITERATIONS=10000
 WARMUP_QUERIES=100
 SELECTED_WORKLOADS="cold,zipf,warm"
 ZIPF_S=1.0
+SWEEP_ORAM=false
+SWEEP_COVER=false
+CLEANUP_ONLY=false
 : "${SGX_MODE:=true}"
 : "${UPSTREAM_RESOLVER:=1.1.1.1:53}"
 : "${SSH_USER:=azureuser}"
@@ -60,12 +63,16 @@ while [[ $# -gt 0 ]]; do
         --warmup)       WARMUP_QUERIES="$2"; shift 2 ;;
         --quick)        RUN_MODE="quick"; shift ;;
         --standard)     RUN_MODE="standard"; shift ;;
+        --full)         RUN_MODE="full"; shift ;;
         --no-sgx)       SGX_MODE=false; shift ;;
+        --sweep-oram)   SWEEP_ORAM=true; shift ;;
+        --sweep-cover)  SWEEP_COVER=true; shift ;;
         --zipf-s)       ZIPF_S="$2"; shift 2 ;;
         --resolver)     RESOLVER="$2"; shift 2 ;;
+        --cleanup)      CLEANUP_ONLY=true; shift ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--configs 2,3,4] [--quick|--standard] [--no-sgx] [--resolver cloudflare|google|HOST:PORT]"
+            echo "Usage: $0 [--configs 2,3,4] [--quick|--standard|--full] [--no-sgx] [--sweep-oram] [--sweep-cover] [--cleanup] [--resolver cloudflare|google|HOST:PORT]"
             exit 1
             ;;
     esac
@@ -90,13 +97,18 @@ export SGX_MODE UPSTREAM_RESOLVER
 # Apply mode defaults
 case $RUN_MODE in
     quick)
-        [[ -z "$SELECTED_CONFIGS" ]] && SELECTED_CONFIGS="2,3,4"
+        [[ -z "$SELECTED_CONFIGS" ]] && SELECTED_CONFIGS="2,3,4,5"
         ITERATIONS=50
         WARMUP_QUERIES=10
         SELECTED_WORKLOADS="warm"
         ;;
     standard)
-        [[ -z "$SELECTED_CONFIGS" ]] && SELECTED_CONFIGS="2,3,4"
+        [[ -z "$SELECTED_CONFIGS" ]] && SELECTED_CONFIGS="1,2,3,4,5"
+        ;;
+    full)
+        [[ -z "$SELECTED_CONFIGS" ]] && SELECTED_CONFIGS="1,2,3,4,5"
+        SWEEP_ORAM=true
+        SWEEP_COVER=true
         ;;
 esac
 
@@ -140,6 +152,8 @@ cat > "$OUTPUT_BASE/metadata.json" << METAEOF
     "zipf_s": $ZIPF_S,
     "configs": "$SELECTED_CONFIGS",
     "workloads": "$SELECTED_WORKLOADS",
+    "sweep_oram": $SWEEP_ORAM,
+    "sweep_cover": $SWEEP_COVER,
     "timestamp": "$(date -Iseconds)",
     "client_hostname": "$(hostname)"
 }
@@ -153,6 +167,8 @@ echo "Workloads:  $SELECTED_WORKLOADS"
 echo "Iterations: $ITERATIONS (+ $WARMUP_QUERIES warmup)"
 echo "Resolver:   $RESOLVER ($UPSTREAM_RESOLVER)"
 echo "SGX mode:   $SGX_MODE"
+$SWEEP_ORAM && echo "Sweep ORAM: N=256,512,2048"
+$SWEEP_COVER && echo "Sweep Cover: k=1,5"
 echo "Output:     $OUTPUT_BASE/"
 echo ""
 
@@ -182,6 +198,7 @@ generate_corefiles() {
     # Copy templates and substitute IPs
     for cf in "$SCRIPT_DIR/Corefile.doh" "$SCRIPT_DIR/Corefile.odoh-target" \
               "$SCRIPT_DIR/Corefile.odoh-proxy" "$SCRIPT_DIR/Corefile.codoh-base-target" \
+              "$SCRIPT_DIR/Corefile.target-nosgx" \
               "$ROOT_DIR/Corefile.target" "$ROOT_DIR/Corefile.proxy"; do
         [[ -f "$cf" ]] || continue
         local basename
@@ -250,12 +267,34 @@ distribute_files() {
 #######################################
 remote_cleanup() {
     echo "Cleaning up remote processes..."
-    ssh_proxy "pkill -9 -f coredns-test 2>/dev/null; pkill -9 -f enclave-sim 2>/dev/null; pkill -9 -f 'ego.*enclave' 2>/dev/null; pkill -9 -f erthost 2>/dev/null; rm -f /tmp/codoh-enclave.sock 2>/dev/null" 2>/dev/null || true
-    ssh_target "pkill -9 -f coredns-test 2>/dev/null" 2>/dev/null || true
+    # Kill by port first (most reliable), then by name.
+    # IMPORTANT: avoid pkill -f with patterns that appear in this command string,
+    # otherwise pkill kills the bash shell running this cleanup (self-kill).
+    ssh_proxy 'for port in 8080 8443 8444 10443; do \
+                   lsof -ti :$port 2>/dev/null | xargs -r kill -9 2>/dev/null; \
+               done; \
+               pkill -9 coredns-test 2>/dev/null; \
+               pkill -9 enclave-sim 2>/dev/null; \
+               killall -9 ego-host 2>/dev/null; \
+               rm -f /tmp/codoh-enclave.sock; \
+               sleep 3; \
+               for port in 8444 8080 8443; do \
+                   lsof -ti :$port 2>/dev/null | xargs -r kill -9 2>/dev/null; \
+               done; \
+               true' 2>/dev/null || true
+    ssh_target 'pkill -9 coredns-test 2>/dev/null; true' 2>/dev/null || true
     sleep 2
 }
 
 trap remote_cleanup EXIT
+
+# --cleanup: just clean up and exit
+if $CLEANUP_ONLY; then
+    remote_cleanup
+    echo "Done."
+    trap - EXIT
+    exit 0
+fi
 
 # Wait for a remote port to be reachable from this client
 wait_for_remote() {
@@ -306,6 +345,17 @@ wait_for_remote_socket() {
 # Config-specific startup
 #######################################
 CLOUD_CF="$REMOTE_ROOT/benchmark/cloud-corefiles"
+
+start_config_1() {
+    echo "--- Starting Config 1: DoH ---"
+
+    # Target VM: DoH server (single process, no proxy)
+    echo "  Starting DoH server on $TARGET_IP:7443..."
+    ssh_target "cd $REMOTE_ROOT && (nohup ./coredns-test -conf $CLOUD_CF/Corefile.doh \
+        > /tmp/bench-doh-server.log 2>&1 </dev/null &)"
+
+    wait_for_remote "$TARGET_IP" 7443
+}
 
 start_config_2() {
     echo "--- Starting Config 2: ODoH ---"
@@ -363,39 +413,46 @@ start_config_3() {
     wait_for_remote "$TARGET_IP" 10444
 }
 
-start_config_ipc() {
-    local config_num=$1
-    local enclave_env="$2"   # extra env vars for enclave
-    local target_env="$3"    # extra env vars for target
-    echo "--- Starting Config $config_num (IPC) ---"
+start_config_4() {
+    local enclave_env="$1"
+    local target_env="$2"
+    echo "--- Starting Config 4: CODoH no-SGX ---"
 
-    # Proxy VM: enclave
-    local enclave_cmd
-    if [[ "$SGX_MODE" == "true" ]]; then
-        enclave_cmd="$enclave_env ego run $REMOTE_ROOT/enclave/enclave"
-    else
-        enclave_cmd="$enclave_env $REMOTE_ROOT/enclave-sim"
-    fi
+    # Proxy VM: enclave-sim (always plain binary, no SGX)
+    local enclave_cmd="$enclave_env $REMOTE_ROOT/enclave-sim"
 
-    echo "  Starting enclave on proxy VM..."
+    echo "  Starting enclave-sim on proxy VM..."
     ssh_proxy "cd $REMOTE_ROOT && (nohup bash -c '$enclave_cmd' > /tmp/bench-enclave.log 2>&1 </dev/null &)"
+    wait_for_remote_socket 30
 
-    if [[ "$SGX_MODE" == "true" ]]; then
-        # SGX: attestation server on 8444 starts first, IPC socket created after target provisions
-        wait_for_remote_attest 60
-    else
-        # Simulation: no attestation server, IPC socket created immediately
-        wait_for_remote_socket 30
-    fi
+    # Target VM: codohtarget (no-SGX variant — no attestation)
+    echo "  Starting CODoH target on $TARGET_IP:8443..."
+    ssh_target "cd $REMOTE_ROOT && (nohup bash -c '$target_env ./coredns-test -conf $CLOUD_CF/Corefile.target-nosgx' > /tmp/bench-codoh-target.log 2>&1 </dev/null &)"
+    wait_for_remote "$TARGET_IP" 8443
 
-    # Target VM: codohtarget
+    # Proxy VM: codohproxy
+    echo "  Starting CODoH proxy on $PROXY_IP:8080..."
+    ssh_proxy "cd $REMOTE_ROOT && (nohup ./coredns-test -conf $CLOUD_CF/Corefile.proxy \
+        > /tmp/bench-codoh-proxy.log 2>&1 </dev/null &)"
+    wait_for_remote "$PROXY_IP" 8080
+}
+
+start_config_5() {
+    local enclave_env="$1"
+    local target_env="$2"
+    echo "--- Starting Config 5: CODoH full (SGX) ---"
+
+    # Proxy VM: SGX enclave
+    local enclave_cmd="$enclave_env ego run $REMOTE_ROOT/enclave/enclave"
+
+    echo "  Starting SGX enclave on proxy VM..."
+    ssh_proxy "cd $REMOTE_ROOT && (nohup bash -c '$enclave_cmd' > /tmp/bench-enclave.log 2>&1 </dev/null &)"
+    wait_for_remote_attest 60
+
+    # Target VM: codohtarget (SGX variant — provisions via attestation)
     echo "  Starting CODoH target on $TARGET_IP:8443..."
     ssh_target "cd $REMOTE_ROOT && (nohup bash -c '$target_env ./coredns-test -conf $CLOUD_CF/Corefile.target' > /tmp/bench-codoh-target.log 2>&1 </dev/null &)"
-
-    if [[ "$SGX_MODE" == "true" ]]; then
-        # SGX: IPC socket created after target provisions via 8444
-        wait_for_remote_socket 30
-    fi
+    wait_for_remote_socket 30
     wait_for_remote "$TARGET_IP" 8443
 
     # Proxy VM: codohproxy
@@ -481,7 +538,16 @@ run_cloud_config() {
 
     # Start config-specific processes
     local protocol proxy_arg target_arg
+    local enclave_env="CODOH_USE_ORAM=true CODOH_CACHE_SIZE=${CODOH_CACHE_SIZE:-1024} CODOH_PAD_BUCKETS=16384 CODOH_BATCH_SIZE=${CODOH_BATCH_SIZE:-10} CODOH_BATCH_COMMIT_PROB=${CODOH_BATCH_COMMIT_PROB:-0.1}"
+    local target_env="CODOH_COVER_COUNT=${CODOH_COVER_COUNT:-3} CODOH_COVER_DOMAIN_FILE=$REMOTE_ROOT/benchmark/top-1k-resolvable.csv CODOH_PROXY_CALLBACK_URL=https://$PROXY_IP:8080 CODOH_COVER_RESOLVER=$UPSTREAM_RESOLVER CODOH_COVER_TIMEOUT_MS=2000"
+
     case $config_num in
+        1)
+            start_config_1
+            protocol="doh"
+            proxy_arg=""
+            target_arg="--target $TARGET_IP:7443"
+            ;;
         2)
             start_config_2
             protocol="odoh"
@@ -495,9 +561,13 @@ run_cloud_config() {
             target_arg="--target $TARGET_IP:10444"
             ;;
         4)
-            start_config_ipc 4 \
-                "CODOH_USE_ORAM=true CODOH_CACHE_SIZE=${CODOH_CACHE_SIZE:-1024} CODOH_PAD_BUCKETS=16384 CODOH_BATCH_SIZE=${CODOH_BATCH_SIZE:-10} CODOH_BATCH_COMMIT_PROB=${CODOH_BATCH_COMMIT_PROB:-0.1}" \
-                "CODOH_COVER_COUNT=${CODOH_COVER_COUNT:-3} CODOH_COVER_DOMAIN_FILE=$REMOTE_ROOT/benchmark/top-1k-resolvable.csv CODOH_PROXY_CALLBACK_URL=https://$PROXY_IP:8080 CODOH_COVER_RESOLVER=$UPSTREAM_RESOLVER CODOH_COVER_TIMEOUT_MS=2000"
+            start_config_4 "$enclave_env" "$target_env"
+            protocol="codoh"
+            proxy_arg="--proxy $PROXY_IP:8080"
+            target_arg="--target $TARGET_IP:8443"
+            ;;
+        5)
+            start_config_5 "$enclave_env" "$target_env"
             protocol="codoh"
             proxy_arg="--proxy $PROXY_IP:8080"
             target_arg="--target $TARGET_IP:8443"
@@ -532,7 +602,7 @@ print_summary() {
     printf "%-20s %-8s %10s %10s %10s %10s\n" "Config" "Workload" "Median" "P95" "P99" "QPS"
     printf "%-20s %-8s %10s %10s %10s %10s\n" "------" "--------" "------" "------" "------" "------"
 
-    for json_file in "$OUTPUT_RAW"/*.json; do
+    for json_file in "$OUTPUT_RAW"/*.json "$OUTPUT_RAW"/sweep_*/*.json; do
         [[ -f "$json_file" ]] || continue
         python3 -c "
 import json, os
@@ -556,6 +626,40 @@ echo ""
 for config_num in "${CONFIGS[@]}"; do
     run_cloud_config "$config_num"
 done
+
+# ORAM capacity sweep (re-runs config 5 with different cache sizes)
+if $SWEEP_ORAM; then
+    echo ""
+    echo "=== ORAM Capacity Sweep ==="
+    SAVED_OUTPUT_RAW="$OUTPUT_RAW"
+    for oram_n in 256 512 2048; do  # 1024 already covered in main
+        echo ""
+        echo "--- ORAM N=$oram_n ---"
+        export CODOH_CACHE_SIZE=$oram_n
+        OUTPUT_RAW="$SAVED_OUTPUT_RAW/sweep_oram_${oram_n}"
+        mkdir -p "$OUTPUT_RAW"
+        run_cloud_config 5
+    done
+    unset CODOH_CACHE_SIZE
+    OUTPUT_RAW="$SAVED_OUTPUT_RAW"
+fi
+
+# Cover count sweep (re-runs config 5 with different cover counts)
+if $SWEEP_COVER; then
+    echo ""
+    echo "=== Cover Count Sweep ==="
+    SAVED_OUTPUT_RAW="$OUTPUT_RAW"
+    for cover_k in 1 5; do  # k=3 already covered in main
+        echo ""
+        echo "--- Cover k=$cover_k ---"
+        export CODOH_COVER_COUNT=$cover_k
+        OUTPUT_RAW="$SAVED_OUTPUT_RAW/sweep_cover_${cover_k}"
+        mkdir -p "$OUTPUT_RAW"
+        run_cloud_config 5
+    done
+    unset CODOH_COVER_COUNT
+    OUTPUT_RAW="$SAVED_OUTPUT_RAW"
+fi
 
 # Collect logs
 echo ""

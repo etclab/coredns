@@ -18,8 +18,8 @@
 #   --quick              Quick validation mode
 #   --standard           Standard comparison mode
 #   --no-sgx             Use simulation mode (default: SGX)
-#   --sweep-oram         Run ORAM capacity sweep (N=256,1024,2048 on config 4)
-#   --sweep-cover        Run cover count sweep (k=1,3,5 on config 4)
+#   --sweep-oram         Run ORAM capacity sweep (N=256,1024,2048 on config 5)
+#   --sweep-cover        Run cover count sweep (k=1,3,5 on config 5)
 #   --resolver NAME      Upstream resolver: unbound (default), cloudflare, google, or HOST:PORT
 #   --zipf-s S           Zipf skew parameter (default: 1.0)
 
@@ -64,7 +64,7 @@ while [[ $# -gt 0 ]]; do
         --resolver)     RESOLVER="$2"; shift 2 ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--run-id NAME] [--configs 1,2,3,4] [--quick|--standard] [--no-sgx] [--resolver unbound|cloudflare|google|HOST:PORT] [--sweep-oram] [--sweep-cover]"
+            echo "Usage: $0 [--run-id NAME] [--configs 1,2,3,4,5] [--quick|--standard] [--no-sgx] [--resolver unbound|cloudflare|google|HOST:PORT] [--sweep-oram] [--sweep-cover]"
             exit 1
             ;;
     esac
@@ -73,16 +73,16 @@ done
 # Apply mode defaults
 case $RUN_MODE in
     quick)
-        [[ -z "$SELECTED_CONFIGS" ]] && SELECTED_CONFIGS="1,2,3,4"
+        [[ -z "$SELECTED_CONFIGS" ]] && SELECTED_CONFIGS="1,2,3,4,5"
         ITERATIONS=10         # Phase 1: smoke
         WARMUP_QUERIES=0
         SELECTED_WORKLOADS="warm"
         ;;
     standard)
-        [[ -z "$SELECTED_CONFIGS" ]] && SELECTED_CONFIGS="2,3,4"
+        [[ -z "$SELECTED_CONFIGS" ]] && SELECTED_CONFIGS="2,3,4,5"
         ;;
     full)
-        [[ -z "$SELECTED_CONFIGS" ]] && SELECTED_CONFIGS="1,2,3,4"
+        [[ -z "$SELECTED_CONFIGS" ]] && SELECTED_CONFIGS="1,2,3,4,5"
         ;;
 esac
 
@@ -121,7 +121,8 @@ export COREFILE_DIR
 mkdir -p "$COREFILE_DIR"
 
 for cf in "$SCRIPT_DIR/Corefile.doh" "$SCRIPT_DIR/Corefile.odoh-target" "$SCRIPT_DIR/Corefile.odoh-proxy" \
-          "$SCRIPT_DIR/Corefile.codoh-base-target" "$ROOT_DIR/Corefile.target" "$ROOT_DIR/Corefile.proxy"; do
+          "$SCRIPT_DIR/Corefile.codoh-base-target" "$SCRIPT_DIR/Corefile.target-nosgx" \
+          "$ROOT_DIR/Corefile.target" "$ROOT_DIR/Corefile.proxy"; do
     if [[ -f "$cf" ]]; then
         sed "s|127\.0\.0\.1:5353|$UPSTREAM_RESOLVER|g" "$cf" > "$COREFILE_DIR/$(basename "$cf")"
     fi
@@ -428,8 +429,8 @@ run_quick() {
 
     # Phase 2: Spot check — 1000 queries, all 3 workloads, configs 2, 3, 4
     echo ""
-    echo "=== Phase 2: Spot Check (1000 queries, all workloads, configs 2+3+4) ==="
-    for config_num in 2 3 4; do
+    echo "=== Phase 2: Spot Check (1000 queries, all workloads, configs 2+3+4+5) ==="
+    for config_num in 2 3 4 5; do
         run_config "$config_num" 1000 50 "$OUTPUT_RAW" "cold" "zipf" "warm"
     done
 }
@@ -465,7 +466,7 @@ run_full() {
             export CODOH_CACHE_SIZE=$oram_n
             local sweep_dir="$OUTPUT_RAW/sweep_oram_${oram_n}"
             mkdir -p "$sweep_dir"
-            run_config 4 "$ITERATIONS" "$WARMUP_QUERIES" "$sweep_dir" "${WORKLOADS[@]}"
+            run_config 5 "$ITERATIONS" "$WARMUP_QUERIES" "$sweep_dir" "${WORKLOADS[@]}"
             unset CODOH_CACHE_SIZE
         done
     fi
@@ -478,7 +479,7 @@ run_full() {
             export CODOH_COVER_COUNT=$cover_k
             local sweep_dir="$OUTPUT_RAW/sweep_cover_${cover_k}"
             mkdir -p "$sweep_dir"
-            run_config 4 "$ITERATIONS" "$WARMUP_QUERIES" "$sweep_dir" "${WORKLOADS[@]}"
+            run_config 5 "$ITERATIONS" "$WARMUP_QUERIES" "$sweep_dir" "${WORKLOADS[@]}"
             unset CODOH_COVER_COUNT
         done
     fi
