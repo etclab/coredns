@@ -178,7 +178,7 @@ The proxy auto-registers `POST /cache-insert` when `enclave_enabled` is set.
 
 | Header | Direction | Description |
 |--------|-----------|-------------|
-| `X-CoDOH-Query` | Client -> Proxy | Base64-encoded Q_E (HPKE-encrypted query) |
+| `X-CoDOH-Query` | Client -> Proxy | Base64-encoded Q_E (padded HPKE-encrypted query, fixed 512B) |
 | `X-Enclave-PubKey` | Proxy -> Target | Base64-encoded enclave HPKE public key |
 | `X-CoDOH-Key-Rotated` | Proxy -> Client | `true` when enclave pk_E has rotated (restart). Client should re-fetch pk_E from `/enclave-keys` |
 | `X-CoDOH-Enclave-Error` | Proxy -> Client | Error code when enclave leg fails (e.g., `key_rotated`, `enclave_unavailable`) |
@@ -313,8 +313,8 @@ Client → Proxy (codohproxy plugin) → Target (codohtarget plugin) → Upstrea
 
 **Flow (miss):**
 1. Client fetches enclave public key from proxy `/enclave-keys`
-2. Client encrypts Q_E (query under enclave's HPKE public key)
-3. Client sends ODoH request to proxy `/proxy` with `X-CoDOH-Query` header
+2. Client encrypts Q_E (query under enclave's HPKE public key), pads Q_E and Q_T to 512-byte bucket
+3. Client sends ODoH request to proxy `/proxy` with `X-CoDOH-Query` header (padded Q_E) and padded Q_T body
 4. Proxy fans out: sends Q_E to enclave (IPC) and Q_T to target (HTTPS) in parallel
 5. Enclave decrypts Q_E, cache miss → returns dummy (indistinguishable from hit)
 6. Target resolves DNS, builds cache-insert bundle (real + k covers), encrypts each under enclave pubkey, signs with Ed25519

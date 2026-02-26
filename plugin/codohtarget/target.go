@@ -248,6 +248,14 @@ func (t *odohTarget) odohQueryHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
+	// Unpad Q_T (CODoH clients pad queries to fixed bucket size for G3)
+	body, err = enclave.UnpadFromBucket(body)
+	if err != nil {
+		http.Error(w, "Invalid padded query", http.StatusBadRequest)
+		targetRequestsTotal.WithLabelValues("error").Inc()
+		return
+	}
+
 	// Parse ODoH message
 	odohMessage, err := odoh.UnmarshalDNSMessage(body)
 	if err != nil {

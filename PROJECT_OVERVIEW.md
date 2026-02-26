@@ -60,7 +60,7 @@ Client ──► Proxy ──► Target ──► Upstream DNS
 
 | Component | Location | Technology | Role |
 |-----------|----------|------------|------|
-| **Client** | codoh-client/ | Go CLI | Query originator, Q_E + Q_T encryption |
+| **Client** | codoh-client/ | Go CLI | Query originator, Q_E + Q_T encryption, query padding |
 | **Proxy** | plugin/codohproxy | CoreDNS plugin | Network I/O, enclave IPC, parallel fan-out |
 | **Enclave** | enclave/ | Go (EGo for SGX) | Cache, HPKE decryption, signature verification |
 | **Target** | plugin/codohtarget | CoreDNS plugin | DNS resolution, cache-insert encryption + signing |
@@ -81,14 +81,15 @@ Client ──► Proxy ──► Target ──► Upstream DNS
 ```
 Client              Proxy                 Enclave              Target
    |                   |                     |                    |
-   |  Q_E = HPKE.Seal(pk_E, query)          |                    |
-   |  Q_T = ODoH envelope (standard)        |                    |
+   |  Q_E = Pad(HPKE.Seal(pk_E, query))      |                    |
+   |  Q_T = Pad(ODoH envelope)              |                    |
+   |  (both padded to 512B bucket)          |                    |
    |                   |                     |                    |
    |-- Q_T + Q_E ----->|                     |                    |
    |  (X-CoDOH-Query)  |                     |                    |
    |                   |== parallel fan-out ==|                    |
    |                   |-- process(Q_E) ---->|                    |
-   |                   |                     | Decrypt Q_E        |
+   |                   |                     | Unpad + Decrypt Q_E|
    |                   |                     | Derive k_r (Export)|
    |                   |                     | Check cache        |
    |                   |                     |                    |
@@ -113,6 +114,7 @@ Client              Proxy                 Enclave              Target
 ```
 
 **Key properties:**
+- Q_E and Q_T are padded to a fixed 512-byte bucket before transmission (G3: all queries are identical size on the wire)
 - Proxy fans out Q_E to enclave and Q_T to target in parallel
 - On cache miss, enclave returns a dummy response indistinguishable from a hit (same size)
 - Proxy streams both results as tagged chunks (`application/codoh-response`): `[1B type][2B BE len][data]...` — whichever leg (enclave or target) finishes first is flushed immediately
@@ -172,6 +174,7 @@ SGX has no trusted clock. The enclave maintains `t_latest` (highest timestamp se
 | Ed25519 signature verification | enclave/cmd/main.go | On cache-insert bundles |
 | Timestamp replay protection | enclave/cmd/main.go | Monotonic t_latest + δ-window |
 | Dummy response generation | enclave/crypto.go | crypto/rand, same size as real |
+| Query-path padding (Q_E unpad) | enclave/cmd/main.go | UnpadFromBucket before DecryptQueryE |
 | Query canonicalization | enclave/bundle.go | domain:qtype format (CanonicalizeQuery) |
 | Configuration loading | enclave/config.go | Env vars + defaults |
 | SGX attestation server | enclave/attestation.go | /attest, /provision, /health |
@@ -199,7 +202,7 @@ SGX has no trusted clock. The enclave maintains `t_latest` (highest timestamp se
 | Config options | plugin/codohproxy/setup.go | Corefile parsing |
 | | | |
 | **Target Plugin** | | |
-| ODoH DNS resolution | plugin/codohtarget/target.go | /dns-query endpoint |
+| ODoH DNS resolution | plugin/codohtarget/target.go | /dns-query endpoint (unpads Q_T before processing) |
 | Cache-insert HPKE encryption | plugin/codohtarget/enclave_encrypt.go | Encrypts bundle to pk_E |
 | Ed25519 response signing | plugin/codohtarget/signing.go | Signs H(plaintext bundle) |
 | SGX quote verification | plugin/codohtarget/attestation_verify_sgx.go | DCAP verification |
@@ -221,7 +224,8 @@ SGX has no trusted clock. The enclave maintains `t_latest` (highest timestamp se
 | Cache omission detection | G2 | Done | Outstanding query tracking, enters defensive mode at OmissionThreshold |
 | Cover responses | G2 | Done | Target samples k random domains (codohtarget/cover/), delivered via POST /cache-insert |
 | Batched cache insertions | G2 | Done | InsertionQueue + pseudorandom commit via crypto/rand coin flip on query path |
-| Wire-layer padding | G2, G3 | Done | Bucketed padding (default single 16384-byte bucket); hits and misses identical size to proxy |
+| Wire-layer padding (responses) | G2, G3 | Done | Bucketed padding (default single 16384-byte bucket); hits and misses identical size to proxy |
+| Wire-layer padding (queries) | G3 | Done | Q_E and Q_T padded to fixed 512-byte bucket; all queries identical size to proxy/network observer |
 | Session ID (sid) binding | G3 | Not yet | Explicit sid in AAD to prevent cross-use |
 | Dual HPKE key wrapping | G3 | Not yet | Symmetric key k encrypted separately to target and enclave |
 
@@ -332,7 +336,7 @@ Wire format: [4 bytes: total length (big-endian)][1 byte: type/status][payload]
 All payloads are binary (no JSON).
 
 Request types (1-byte opcodes):
-  0x01 = process          (payload: HPKE ciphertext)
+  0x01 = process          (payload: padded HPKE ciphertext; enclave unpads before decrypt)
   0x02 = store_encrypted  (payload: [4B blob_len][blob][signature])
   0x03 = get_pubkey       (no payload)
   0x04 = health           (no payload)
@@ -433,7 +437,7 @@ coredns/
 │
 └── codoh-client/              # Client (separate repo)
     └── commands/
-        ├── blob.go            # Q_E encryption (HPKE)
+        ├── blob.go            # Q_E encryption (HPKE), PadToBucket/UnpadFromBucket
         ├── commands.go        # CLI flags (--protocol codoh)
         ├── enclave_state.go   # pk_E caching + refresh on key rotation
         ├── request.go         # HTTP request construction

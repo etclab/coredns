@@ -306,8 +306,15 @@ type EnclaveHandler struct {
 }
 
 // HandleProcess decrypts Q_E, looks up cache, returns encrypted response or dummy.
-// qe is raw HPKE-encrypted bytes (no base64).
+// qe is padded HPKE-encrypted bytes (PadToBucket wire format, no base64).
 func (h *EnclaveHandler) HandleProcess(qe []byte) *enclave.BinaryResponse {
+	// Unpad Q_E (client pads to fixed bucket size for G3)
+	qe, err := enclave.UnpadFromBucket(qe)
+	if err != nil {
+		log.Printf("UnpadFromBucket(Q_E) failed: %v", err)
+		return &enclave.BinaryResponse{Status: enclave.BinStatusError}
+	}
+
 	// Decrypt Q_E and derive session key k_r
 	// Key rotation takes priority: if HPKE decryption fails (wrong key or corrupted),
 	// return key_rotated so the client re-attests.

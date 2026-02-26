@@ -292,7 +292,13 @@ func makeProcessReq(t *testing.T, h *EnclaveHandler, query string) []byte {
 	if err != nil {
 		t.Fatalf("EncryptQueryE: %v", err)
 	}
-	return qe
+
+	// Pad Q_E to match client behavior (enclave now expects padded input)
+	padded, err := enclave.PadToBucket(qe, []int{512})
+	if err != nil {
+		t.Fatalf("PadToBucket(Q_E): %v", err)
+	}
+	return padded
 }
 
 func TestDefensiveMode_BootReturnsDummy(t *testing.T) {
@@ -476,6 +482,7 @@ func TestKeyRotation_ReturnedOnHPKEFailure(t *testing.T) {
 	otherPubBytes, _ := otherKeypair.PublicKeyBytes()
 	otherPub, _ := enclave.ParsePublicKeyBytes(otherPubBytes)
 	qe, _, _ := enclave.EncryptQueryE(otherPub, []byte("example.com.:1"))
+	qe, _ = enclave.PadToBucket(qe, []int{512})
 
 	resp := h.HandleProcess(qe)
 	if resp.Status != enclave.BinStatusKeyRotated {
@@ -491,6 +498,7 @@ func TestKeyRotation_DuringDefensiveMode(t *testing.T) {
 	otherPubBytes, _ := otherKeypair.PublicKeyBytes()
 	otherPub, _ := enclave.ParsePublicKeyBytes(otherPubBytes)
 	qe, _, _ := enclave.EncryptQueryE(otherPub, []byte("example.com.:1"))
+	qe, _ = enclave.PadToBucket(qe, []int{512})
 
 	// Key rotation takes priority over defensive mode
 	resp := h.HandleProcess(qe)
@@ -1159,7 +1167,13 @@ func TestHandleProcess_HitDecryptableAfterUnpad(t *testing.T) {
 		t.Fatalf("EncryptQueryE: %v", err)
 	}
 
-	resp := h.HandleProcess(qeRaw)
+	// Pad Q_E to match client behavior
+	qePadded, err := enclave.PadToBucket(qeRaw, []int{512})
+	if err != nil {
+		t.Fatalf("PadToBucket(Q_E): %v", err)
+	}
+
+	resp := h.HandleProcess(qePadded)
 	if resp.Status != enclave.BinStatusProcessed {
 		t.Fatalf("expected processed, got 0x%02x", resp.Status)
 	}
