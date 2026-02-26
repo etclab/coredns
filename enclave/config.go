@@ -6,7 +6,7 @@ type Config struct {
 	CacheSize      int     // Default: 10000 entries
 	UseORAMCache  bool    // Use ORAM-backed cache (default: false)
 	ORAMBlockSize int     // ORAM block size in bytes (default: 4096)
-	PadBuckets    []int   // Padding bucket sizes in bytes (default: [16384])
+	PadBuckets    []int   // Padding bucket sizes in bytes (default: [2048])
 	ReplayDelta   float64 // δ in seconds for replay protection (default: 3.0)
 
 	// Defensive mode configuration
@@ -27,7 +27,7 @@ func DefaultConfig() *Config {
 		CacheSize:          10000,
 		UseORAMCache:       false,
 		ORAMBlockSize:      4096,
-		PadBuckets:         []int{16384},
+		PadBuckets:         []int{2048},
 		ReplayDelta:        3.0,
 		WarmupThreshold:    100,
 		OmissionThreshold:  50,

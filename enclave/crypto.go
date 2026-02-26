@@ -204,9 +204,10 @@ func GenerateDummyResponse(size int) []byte {
 }
 
 // DefaultPadBuckets is the default padding bucket set.
-// A single bucket forces all responses (hits and misses) to exactly 16384 bytes,
+// A single bucket forces all responses (hits and misses) to exactly 2048 bytes,
 // achieving complete size indistinguishability.
-var DefaultPadBuckets = []int{16384}
+// Empirically: max HPKE-encrypted response ≈ 1616B (top-10k Umbrella domains).
+var DefaultPadBuckets = []int{2048}
 
 // PadToBucket pads data to the next bucket boundary.
 // Wire format: [2-byte LE length prefix][data][random padding]

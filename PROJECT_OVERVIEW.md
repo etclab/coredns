@@ -224,8 +224,8 @@ SGX has no trusted clock. The enclave maintains `t_latest` (highest timestamp se
 | Cache omission detection | G2 | Done | Outstanding query tracking, enters defensive mode at OmissionThreshold |
 | Cover responses | G2 | Done | Target samples k random domains (codohtarget/cover/), delivered via POST /cache-insert |
 | Batched cache insertions | G2 | Done | InsertionQueue + pseudorandom commit via crypto/rand coin flip on query path |
-| Wire-layer padding (responses) | G2, G3 | Done | Bucketed padding (default single 16384-byte bucket); hits and misses identical size to proxy |
-| Wire-layer padding (queries) | G3 | Done | Q_E and Q_T padded to fixed 512-byte bucket; all queries identical size to proxy/network observer |
+| Wire-layer padding (responses) | G2, G3 | Done | Bucketed padding (default single 2048-byte bucket); hits and misses identical size to proxy |
+| Wire-layer padding (queries) | G3 | Done | Q_E and Q_T padded to fixed 256-byte bucket; all queries identical size to proxy/network observer |
 | Session ID (sid) binding | G3 | Not yet | Explicit sid in AAD to prevent cross-use |
 | Dual HPKE key wrapping | G3 | Not yet | Symmetric key k encrypted separately to target and enclave |
 

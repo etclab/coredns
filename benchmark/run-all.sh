@@ -208,6 +208,27 @@ build_binaries() {
         (cd "$(dirname "$ROOT_DIR")/codoh-client" && go build -o odoh-client ./cmd 2>/dev/null)
     fi
 
+    # Config 3 client worktree (pre-padding version)
+    local client_dir="$(dirname "$ROOT_DIR")/codoh-client"
+    local client_wt="$client_dir/worktrees/config3"
+    if [[ ! -d "$client_wt" ]]; then
+        echo "Setting up Config 3 client worktree..."
+        mkdir -p "$client_dir/worktrees"
+        git -C "$client_dir" worktree add "$client_wt" 010e7fe9bae41ec2b0405d3fd78d109afd9f18e6 2>&1 | tail -3
+        # Patch HPKE info string to match server worktree
+        if grep -q 'codoh-enclave-v2' "$client_wt/commands/blob.go"; then
+            sed -i 's/codoh-enclave-v2/codoh transport key/' "$client_wt/commands/blob.go"
+        fi
+        # Patch response content-type (server returns codoh-cached, not codoh-response)
+        if grep -q 'codoh-response' "$client_wt/commands/request.go"; then
+            "$SCRIPT_DIR/patch-config3-client.sh" "$client_wt/commands/request.go"
+        fi
+    fi
+    if [[ ! -f "$client_wt/odoh-client" ]] || [[ "$RUN_MODE" != "quick" ]]; then
+        echo "Building Config 3 odoh-client..."
+        (cd "$client_wt" && go build -o odoh-client ./cmd 2>/dev/null)
+    fi
+
     echo "Build complete."
     echo ""
 }

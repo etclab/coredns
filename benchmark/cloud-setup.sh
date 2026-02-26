@@ -391,6 +391,26 @@ setup_client() {
     echo "  Domain lists: ready"
     ((step++))
 
+    # Config 3 client worktree (matching pre-padding codoh-client)
+    echo "[$step/N] Setting up Config 3 client worktree..."
+    local client_wt="$CLIENT_DIR/worktrees/config3"
+    if [[ ! -d "$client_wt" ]]; then
+        mkdir -p "$CLIENT_DIR/worktrees"
+        git -C "$CLIENT_DIR" worktree add "$client_wt" 010e7fe9bae41ec2b0405d3fd78d109afd9f18e6 2>&1 | tail -3
+
+        # Patch HPKE info string to match server worktree
+        if grep -q 'codoh-enclave-v2' "$client_wt/commands/blob.go"; then
+            sed -i 's/codoh-enclave-v2/codoh transport key/' "$client_wt/commands/blob.go"
+        fi
+        # Patch response content-type (server returns codoh-cached, not codoh-response)
+        if grep -q 'codoh-response' "$client_wt/commands/request.go"; then
+            "$SCRIPT_DIR/patch-config3-client.sh" "$client_wt/commands/request.go"
+        fi
+    fi
+    (cd "$client_wt" && go build -o odoh-client ./cmd)
+    echo "  Config 3 client worktree: $client_wt"
+    ((step++))
+
     # Copy certs from proxy VM (user must do this manually or via cloud-run.sh)
     echo "[$step/N] TLS certificates..."
     if [[ -f "$ROOT_DIR/localhost.pem" ]]; then

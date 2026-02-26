@@ -130,6 +130,7 @@ scp_from_proxy()  { scp $SSH_OPTS "$SSH_USER@$PROXY_IP:$1" "$2"; }
 scp_from_target() { scp $SSH_OPTS "$SSH_USER@$TARGET_IP:$1" "$2"; }
 
 CLIENT_PATH="$(dirname "$ROOT_DIR")/codoh-client/odoh-client"
+CLIENT_PATH_CONFIG3="$(dirname "$ROOT_DIR")/codoh-client/worktrees/config3/odoh-client"
 CERT_PATH="$ROOT_DIR/localhost.pem"
 DOMAINS_1M="$SCRIPT_DIR/top-10k-resolvable.csv"
 DOMAINS_1K="$SCRIPT_DIR/top-1k-resolvable.csv"
@@ -467,7 +468,7 @@ start_config_5() {
 #######################################
 run_cloud_workload() {
     local config_name=$1 workload=$2 protocol=$3 proxy_arg=$4 target_arg=$5
-    local iterations=$6 warmup=$7 output_dir=$8
+    local iterations=$6 warmup=$7 output_dir=$8 client_bin=${9:-$CLIENT_PATH}
 
     local distribution domains_path zipf_args=""
     case $workload in
@@ -492,7 +493,7 @@ run_cloud_workload() {
     # Warm-up pass
     if [[ $warmup -gt 0 ]]; then
         echo "  Warm-up: $warmup queries..."
-        $CLIENT_PATH latency \
+        $client_bin latency \
             --protocol "$protocol" \
             $proxy_arg $target_arg \
             --distribution "$distribution" \
@@ -507,7 +508,7 @@ run_cloud_workload() {
 
     # Measured run
     echo "  Running $workload ($distribution, $iterations queries)..."
-    if ! $CLIENT_PATH latency \
+    if ! $client_bin latency \
         --protocol "$protocol" \
         $proxy_arg $target_arg \
         --distribution "$distribution" \
@@ -537,7 +538,7 @@ run_cloud_config() {
     remote_cleanup
 
     # Start config-specific processes
-    local config_name protocol proxy_arg target_arg
+    local config_name protocol proxy_arg target_arg client_bin="$CLIENT_PATH"
     local enclave_env="CODOH_USE_ORAM=true CODOH_CACHE_SIZE=${CODOH_CACHE_SIZE:-1024} CODOH_PAD_BUCKETS=16384 CODOH_BATCH_SIZE=${CODOH_BATCH_SIZE:-10} CODOH_BATCH_COMMIT_PROB=${CODOH_BATCH_COMMIT_PROB:-0.1}"
     local target_env="CODOH_COVER_COUNT=${CODOH_COVER_COUNT:-3} CODOH_COVER_DOMAIN_FILE=$REMOTE_ROOT/benchmark/top-1k-resolvable.csv CODOH_PROXY_CALLBACK_URL=https://$PROXY_IP:8080 CODOH_COVER_RESOLVER=$UPSTREAM_RESOLVER CODOH_COVER_TIMEOUT_MS=2000"
 
@@ -562,6 +563,7 @@ run_cloud_config() {
             protocol="codoh-base"
             proxy_arg="--proxy $PROXY_IP:10443"
             target_arg="--target $TARGET_IP:10444"
+            client_bin="$CLIENT_PATH_CONFIG3"
             ;;
         4)
             start_config_4 "$enclave_env" "$target_env"
@@ -587,7 +589,7 @@ run_cloud_config() {
     local success=0 fail=0
     for workload in "${WORKLOADS[@]}"; do
         if run_cloud_workload "$config_name" "$workload" "$protocol" \
-            "$proxy_arg" "$target_arg" "$ITERATIONS" "$WARMUP_QUERIES" "$OUTPUT_RAW"; then
+            "$proxy_arg" "$target_arg" "$ITERATIONS" "$WARMUP_QUERIES" "$OUTPUT_RAW" "$client_bin"; then
             ((success++)) || true
         else
             ((fail++)) || true

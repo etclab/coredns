@@ -178,7 +178,7 @@ The proxy auto-registers `POST /cache-insert` when `enclave_enabled` is set.
 
 | Header | Direction | Description |
 |--------|-----------|-------------|
-| `X-CoDOH-Query` | Client -> Proxy | Base64-encoded Q_E (padded HPKE-encrypted query, fixed 512B) |
+| `X-CoDOH-Query` | Client -> Proxy | Base64-encoded Q_E (padded HPKE-encrypted query, fixed 256B) |
 | `X-Enclave-PubKey` | Proxy -> Target | Base64-encoded enclave HPKE public key |
 | `X-CoDOH-Key-Rotated` | Proxy -> Client | `true` when enclave pk_E has rotated (restart). Client should re-fetch pk_E from `/enclave-keys` |
 | `X-CoDOH-Enclave-Error` | Proxy -> Client | Error code when enclave leg fails (e.g., `key_rotated`, `enclave_unavailable`) |
@@ -268,7 +268,7 @@ For quote verification on the target side, build with `-tags sgxverify` (require
 | `CODOH_CACHE_SIZE` | int | 10000 | N | Max cache entries |
 | `CODOH_USE_ORAM` | bool | false | — | ORAM-backed cache (required for G2) |
 | `CODOH_ORAM_BLOCK_SIZE` | int | 4096 | — | ORAM block size (bytes) |
-| `CODOH_PAD_BUCKETS` | string | "16384" | — | Comma-separated padding bucket sizes (bytes) |
+| `CODOH_PAD_BUCKETS` | string | "2048" | — | Comma-separated padding bucket sizes (bytes) |
 | `CODOH_REPLAY_DELTA_SECS` | float | 3.0 | δ | Replay protection window (seconds) |
 | `CODOH_WARMUP_THRESHOLD` | int | 100 | — | Cache entries needed to exit defensive mode |
 | `CODOH_OMISSION_THRESHOLD` | int | 50 | — | Outstanding queries to trigger defensive mode |
@@ -313,7 +313,7 @@ Client → Proxy (codohproxy plugin) → Target (codohtarget plugin) → Upstrea
 
 **Flow (miss):**
 1. Client fetches enclave public key from proxy `/enclave-keys`
-2. Client encrypts Q_E (query under enclave's HPKE public key), pads Q_E and Q_T to 512-byte bucket
+2. Client encrypts Q_E (query under enclave's HPKE public key), pads Q_E and Q_T to 256-byte bucket
 3. Client sends ODoH request to proxy `/proxy` with `X-CoDOH-Query` header (padded Q_E) and padded Q_T body
 4. Proxy fans out: sends Q_E to enclave (IPC) and Q_T to target (HTTPS) in parallel
 5. Enclave decrypts Q_E, cache miss → returns dummy (indistinguishable from hit)
@@ -472,6 +472,34 @@ Requires: `python3`, `gnuplot`, `epstopdf` or `ps2pdf`. No pip dependencies.
 - `../codoh-client/odoh-client` built
 - `localhost.pem` and `localhost-key.pem` in project root
 - `benchmark/top-1m.csv` domain list (and optionally `top-1k.csv`)
+
+### Unbound (Local Recursive Resolver)
+
+Eliminates upstream DNS variance from benchmarks. All lookups hit a local cache with 24h TTL. Config: `benchmark/unbound.conf` (port 5353, 128MB msg-cache, 256MB rrset-cache, prefetch disabled).
+
+```bash
+# Install and configure
+sudo apt install unbound
+sudo cp benchmark/unbound.conf /etc/unbound/unbound.conf.d/benchmark.conf
+sudo systemctl restart unbound
+
+# Verify
+dig +short @127.0.0.1 -p 5353 google.com
+
+# Prewarm cache (resolves all benchmark domains)
+./benchmark/prewarm-unbound.sh          # default 50 parallel queries
+./benchmark/prewarm-unbound.sh --parallel 100
+
+# Check cache stats
+sudo unbound-control stats_noreset | grep 'total.num'
+```
+
+`run-all.sh` defaults to `--resolver unbound` (`127.0.0.1:5353`). For cloud benchmarks, unbound must run on the **target VM** since that's where DNS resolution happens:
+
+```bash
+# From client VM (cloud mode defaults to cloudflare)
+./benchmark/cloud-run.sh --resolver unbound --standard
+```
 
 ### Cloud Benchmarks (Multi-VM)
 

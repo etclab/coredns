@@ -30,15 +30,20 @@ if [[ "${1:-}" == "--clean" ]]; then
     rm -f "$ROOT_DIR/enclave/enclave"
     rm -f "$CLIENT_DIR/odoh-client" 2>/dev/null
 
-    # Remove Config 3 worktree
+    # Remove Config 3 server worktree
     if [[ -d "$SCRIPT_DIR/worktrees/config3-proxy" ]]; then
         git -C "$ROOT_DIR" worktree remove "$SCRIPT_DIR/worktrees/config3-proxy" --force 2>/dev/null || true
     fi
-
     rm -rf "$SCRIPT_DIR/worktrees"
 
+    # Remove Config 3 client worktree
+    if [[ -d "$CLIENT_DIR/worktrees/config3" ]]; then
+        git -C "$CLIENT_DIR" worktree remove "$CLIENT_DIR/worktrees/config3" --force 2>/dev/null || true
+    fi
+    rm -rf "$CLIENT_DIR/worktrees" 2>/dev/null
+
     echo "  Removed: coredns-test, enclave-sim, enclave/enclave, odoh-client"
-    echo "  Removed: Config 3 worktree"
+    echo "  Removed: Config 3 server + client worktrees"
     echo "  Clean complete. Run ./benchmark/setup.sh to rebuild."
     exit 0
 fi
@@ -218,6 +223,38 @@ if [[ "${SGX_MODE:-true}" == "true" ]]; then
 fi
 
 #######################################
+# Config 3 client worktree
+#######################################
+echo ""
+echo "=== Config 3 Client Worktree ==="
+CLIENT_WORKTREE="$CLIENT_DIR/worktrees/config3"
+if [[ -d "$CLIENT_WORKTREE" ]]; then
+    echo "  Worktree: already exists at $CLIENT_WORKTREE"
+else
+    echo "  Creating client worktree for Config 3 (pinned to 010e7fe)..."
+    mkdir -p "$CLIENT_DIR/worktrees"
+    git -C "$CLIENT_DIR" worktree add "$CLIENT_WORKTREE" 010e7fe9bae41ec2b0405d3fd78d109afd9f18e6 2>&1 | tail -3
+    echo "  Worktree: $CLIENT_WORKTREE"
+fi
+
+# Patch HPKE info string to match server worktree
+if grep -q 'codoh-enclave-v2' "$CLIENT_WORKTREE/commands/blob.go"; then
+    echo "  Patching HPKE info string for server compatibility..."
+    sed -i 's/codoh-enclave-v2/codoh transport key/' "$CLIENT_WORKTREE/commands/blob.go"
+fi
+
+# Patch response content-type: server worktree returns application/codoh-cached
+# (raw kc-encrypted), but 010e7fe expects application/codoh-response (two-chunk).
+# Replace the two-chunk handler with direct codoh-cached decryption.
+if grep -q 'codoh-response' "$CLIENT_WORKTREE/commands/request.go"; then
+    echo "  Patching response handler for codoh-cached compatibility..."
+    "$SCRIPT_DIR/patch-config3-client.sh" "$CLIENT_WORKTREE/commands/request.go"
+fi
+
+echo "  Building Config 3 client from worktree..."
+(cd "$CLIENT_WORKTREE" && go build -o odoh-client ./cmd 2>&1 | tail -5)
+
+#######################################
 # Unbound check
 #######################################
 echo ""
@@ -246,6 +283,7 @@ echo "  Enclave SGX: $ROOT_DIR/enclave/enclave"
 echo "  Enclave Sim: $ROOT_DIR/enclave-sim"
 echo "  Client:      $CLIENT_DIR/odoh-client"
 echo "  Config 3 WT: $WORKTREE_DIR/"
+echo "  Config 3 CL: $CLIENT_WORKTREE/"
 echo ""
 echo "Next steps:"
 echo "  1. Ensure Unbound is running: dig @127.0.0.1 -p 5353 google.com"

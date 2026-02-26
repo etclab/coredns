@@ -17,6 +17,12 @@ CONFIG_PROTOCOL="codoh-base"
 # Worktree path for Config 3 binaries
 WORKTREE_DIR="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/worktrees/config3-proxy"
 
+# Use matching pre-padding client for Config 3
+CLIENT_WORKTREE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/../codoh-client/worktrees/config3"
+if [[ -f "$CLIENT_WORKTREE_DIR/odoh-client" ]]; then
+    CONFIG_CLIENT_PATH="$CLIENT_WORKTREE_DIR/odoh-client"
+fi
+
 start_config() {
     local root_dir=$1 cert_path=$2 output_dir=$3
 
