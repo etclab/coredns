@@ -265,10 +265,8 @@ else
     echo "  Unbound: NOT running on port 5353"
     echo "  To set up:"
     echo "    sudo apt install unbound"
-    echo "    sudo cp $SCRIPT_DIR/unbound.conf /etc/unbound/unbound.conf.d/benchmark.conf"
+    echo "    # Configure Unbound to listen on port 5353 (avoid systemd-resolved conflict)"
     echo "    sudo systemctl restart unbound"
-    echo ""
-    echo "  Then run: ./benchmark/prewarm-unbound.sh"
 fi
 
 #######################################

@@ -22,7 +22,7 @@ done
 # Check Unbound is running
 if ! dig +short @${RESOLVER} -p ${PORT} google.com > /dev/null 2>&1; then
     echo "ERROR: Unbound not responding on ${RESOLVER}:${PORT}"
-    echo "Install and start: sudo apt install unbound && sudo cp benchmark/unbound.conf /etc/unbound/unbound.conf.d/benchmark.conf && sudo systemctl restart unbound"
+    echo "Install and start: sudo apt install unbound && sudo systemctl restart unbound"
     exit 1
 fi
 

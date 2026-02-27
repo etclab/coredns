@@ -39,11 +39,11 @@ Expected output ends with a "Setup Complete" summary listing all binary paths.
 
 ### 2. Set up the local DNS resolver
 
-We use a local [Unbound](https://nlnetlabs.nl/projects/unbound/about/) resolver to eliminate upstream DNS latency variance from measurements.
+We use a local [Unbound](https://nlnetlabs.nl/projects/unbound/about/) as a standard recursive resolver. No pre-warming — Unbound starts cold and warms naturally during the run, matching real-world deployment. The orchestrator flushes Unbound's cache between workloads (`unbound-control flush_zone .`) so cold/zipf/warm measurements are independent.
 
 ```bash
 sudo apt install unbound -y
-sudo cp benchmark/unbound.conf /etc/unbound/unbound.conf.d/benchmark.conf
+# Configure to listen on port 5353 (avoid systemd-resolved conflict)
 sudo systemctl restart unbound
 ```
 
@@ -55,15 +55,7 @@ dig @127.0.0.1 -p 5353 google.com +short
 
 You should see an IP address. If not, check `sudo systemctl status unbound`.
 
-### 3. Prewarm the resolver cache
-
-Prewarms Unbound with all domains used in the workloads. Takes ~2 minutes. Only needs to run once per session (cache persists for 24 hours).
-
-```bash
-./benchmark/prewarm-unbound.sh
-```
-
-### 4. Validate the setup
+### 3. Validate the setup
 
 Run a quick smoke test to verify all configurations start and respond correctly:
 
@@ -73,7 +65,7 @@ Run a quick smoke test to verify all configurations start and respond correctly:
 
 Phase 1 (smoke): 50 warm queries to all 5 configs. Phase 2 (spot check): 1000 queries across all 3 workloads on Configs 2, 3, 5, 4. Takes ~8-12 minutes. Check the output for any `FAIL` lines.
 
-### 5. Run the benchmark
+### 4. Run the benchmark
 
 Choose a run mode:
 
@@ -89,7 +81,7 @@ Choose a run mode:
 
 SGX mode is the default. Use `--no-sgx` for simulation mode (development only).
 
-### 6. Find the results
+### 5. Find the results
 
 Results are in `benchmark/results/<run-id>/`:
 
@@ -125,7 +117,7 @@ Each `.json` file contains:
 
 A summary table is printed to stdout when the run completes.
 
-### 7. Generate plots and tables
+### 6. Generate plots and tables
 
 ```bash
 ./benchmark/plot.sh benchmark/results/<run-id>
@@ -248,5 +240,5 @@ Increase parallelism: `./benchmark/prewarm-unbound.sh --parallel 100`
 - All paper numbers use SGX mode (the default). Simulation mode (`--no-sgx` / `enclave-sim`) is for development only.
 - Config 3 runs from a pinned git worktree (`e81a315`) because the proxy-mode architecture diverged from the current IPC-based codebase. The crypto primitives are identical.
 - ORAM sweep sizes (256/1024/2048) are chosen to fit within the SGX EPC (~93MB). Larger ORAM trees cause EPC paging and unrepresentative results.
-- Unbound's `cache-min-ttl: 86400` ensures cached entries survive the entire benchmark session. Prewarm once before running.
+- Unbound runs as a cold recursive resolver (no pre-warming, natural TTLs). Cache is flushed between workloads for independent measurements.
 - `metadata.json` in each results directory records all run parameters for reproducibility.

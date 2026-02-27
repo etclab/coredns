@@ -475,30 +475,28 @@ Requires: `python3`, `gnuplot`, `epstopdf` or `ps2pdf`. No pip dependencies.
 
 ### Unbound (Local Recursive Resolver)
 
-Eliminates upstream DNS variance from benchmarks. All lookups hit a local cache with 24h TTL. Config: `benchmark/unbound.conf` (port 5353, 128MB msg-cache, 256MB rrset-cache, prefetch disabled).
+Standard recursive resolver, no pre-warming. Unbound starts cold and warms naturally during the run. Cache is flushed between workloads via `unbound-control flush_zone .` for clean measurements. Default Unbound config, listening on default port 53.
 
 ```bash
-# Install and configure
+# Install (configure default port 53)
 sudo apt install unbound
-sudo cp benchmark/unbound.conf /etc/unbound/unbound.conf.d/benchmark.conf
 sudo systemctl restart unbound
 
 # Verify
 dig +short @127.0.0.1 -p 5353 google.com
 
-# Prewarm cache (resolves all benchmark domains)
-./benchmark/prewarm-unbound.sh          # default 50 parallel queries
-./benchmark/prewarm-unbound.sh --parallel 100
+# Flush cache (done automatically between workloads by cloud-run.sh)
+sudo unbound-control flush_zone .
 
 # Check cache stats
 sudo unbound-control stats_noreset | grep 'total.num'
 ```
 
-`run-all.sh` defaults to `--resolver unbound` (`127.0.0.1:5353`). For cloud benchmarks, unbound must run on the **target VM** since that's where DNS resolution happens:
+Both `run-all.sh` and `cloud-run.sh` default to `--resolver unbound` (`127.0.0.1:53`). Unbound must run on the **target VM** since that's where DNS resolution happens.
 
 ```bash
-# From client VM (cloud mode defaults to cloudflare)
-./benchmark/cloud-run.sh --resolver unbound --standard
+# From client VM
+./benchmark/cloud-run.sh --standard
 ```
 
 ### Cloud Benchmarks (Multi-VM)
@@ -547,7 +545,7 @@ cp benchmark/cloud-env.sh benchmark/cloud-env.local.sh
 | `--quick` | 50 queries, warm workload, configs 2,3,4 |
 | `--standard` | 10K queries, all workloads, configs 2,3,4 |
 | `--no-sgx` | Use enclave-sim instead of SGX |
-| `--resolver cloudflare` | Upstream resolver (cloudflare/google/HOST:PORT) |
+| `--resolver unbound` | Upstream resolver: unbound (default), cloudflare, google, or HOST:PORT |
 | `--run-id NAME` | Name for results directory |
 
 **Port/VM Matrix:**

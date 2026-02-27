@@ -51,7 +51,7 @@ CLEANUP_ONLY=false
 : "${SSH_USER:=azureuser}"
 : "${SSH_KEY:=$HOME/.ssh/id_rsa}"
 : "${REMOTE_ROOT:=/home/$SSH_USER/Projects/codoh/coredns}"
-RESOLVER="cloudflare"
+RESOLVER="unbound"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -80,7 +80,7 @@ done
 
 # Map resolver
 case $RESOLVER in
-    unbound)    UPSTREAM_RESOLVER="127.0.0.1:5353" ;;
+    unbound)    UPSTREAM_RESOLVER="127.0.0.1:53" ;;
     cloudflare) UPSTREAM_RESOLVER="1.1.1.1:53" ;;
     google)     UPSTREAM_RESOLVER="8.8.8.8:53" ;;
     *)
@@ -296,6 +296,16 @@ if $CLEANUP_ONLY; then
     trap - EXIT
     exit 0
 fi
+
+# Flush Unbound cache on target VM (between workloads for clean measurements)
+flush_unbound_cache() {
+    if [[ "$RESOLVER" == "unbound" ]]; then
+        echo "  Flushing Unbound cache on target..."
+        if ! ssh_target "sudo unbound-control flush_zone . 2>/dev/null"; then
+            echo "  WARNING: Failed to flush Unbound cache (unbound-control not available?)"
+        fi
+    fi
+}
 
 # Wait for a remote port to be reachable from this client
 wait_for_remote() {
@@ -588,6 +598,7 @@ run_cloud_config() {
     # Run workloads
     local success=0 fail=0
     for workload in "${WORKLOADS[@]}"; do
+        flush_unbound_cache
         if run_cloud_workload "$config_name" "$workload" "$protocol" \
             "$proxy_arg" "$target_arg" "$ITERATIONS" "$WARMUP_QUERIES" "$OUTPUT_RAW" "$client_bin"; then
             ((success++)) || true

@@ -26,7 +26,7 @@ fi
 shift
 
 # Parse extra flags
-RESOLVER_MODE="cloudflare"
+RESOLVER_MODE="unbound"
 while [[ $# -gt 0 ]]; do
     case $1 in
         --resolver) RESOLVER_MODE="$2"; shift 2 ;;
@@ -288,7 +288,7 @@ setup_target() {
     case "$RESOLVER_MODE" in
         cloudflare) resolver_addr="1.1.1.1" ; resolver_port="53" ;;
         google)     resolver_addr="8.8.8.8" ; resolver_port="53" ;;
-        unbound)    resolver_addr="127.0.0.1" ; resolver_port="5353" ;;
+        unbound)    resolver_addr="127.0.0.1" ; resolver_port="53" ;;
         *)          resolver_addr="${RESOLVER_MODE%%:*}" ; resolver_port="${RESOLVER_MODE##*:}" ;;
     esac
 
@@ -352,7 +352,7 @@ setup_target() {
         if ! dig +short @127.0.0.1 -p 5353 google.com > /dev/null 2>&1; then
             echo "  Unbound not running. Install with:"
             echo "    sudo apt install -y unbound"
-            echo "    sudo cp $SCRIPT_DIR/unbound.conf /etc/unbound/unbound.conf.d/benchmark.conf"
+            echo "    # Configure to listen on port 5353 (avoid systemd-resolved conflict)"
             echo "    sudo systemctl restart unbound"
         else
             echo "  Unbound: running on 127.0.0.1:5353"
