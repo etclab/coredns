@@ -41,8 +41,6 @@ var Directives = []string{
 	"cache",
 	"odohproxy",
 	"odohtarget",
-	"codohproxy",
-	"codohtarget",
 	"rewrite",
 	"header",
 	"dnssec",

@@ -1,0 +1,16 @@
+.:25357 {
+    odohproxy {
+        target https://127.0.0.1:8443/dns-query
+        port 8080
+        tls_cert .signing/proxy.pem
+        tls_key .signing/proxy-key.pem
+    }
+    odohtarget {
+        port 8443
+        tls_cert .signing/target.pem
+        tls_key .signing/target-key.pem
+        upstream 1.1.1.1:53
+    }
+    prometheus
+    log
+}
