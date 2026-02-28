@@ -282,24 +282,17 @@ setup_target() {
     fi
     ((step++))
 
-    # Filter resolvable domains
+    # Filter resolvable domains (always use public resolver — Unbound may not be ready yet)
     echo "[$step/N] Filtering resolvable domains..."
-    local resolver_addr
-    case "$RESOLVER_MODE" in
-        cloudflare) resolver_addr="1.1.1.1" ; resolver_port="53" ;;
-        google)     resolver_addr="8.8.8.8" ; resolver_port="53" ;;
-        unbound)    resolver_addr="127.0.0.1" ; resolver_port="53" ;;
-        *)          resolver_addr="${RESOLVER_MODE%%:*}" ; resolver_port="${RESOLVER_MODE##*:}" ;;
-    esac
 
     if [[ ! -f "$SCRIPT_DIR/top-1k-resolvable.csv" ]]; then
-        "$SCRIPT_DIR/filter-resolvable.sh" --count 1000 --resolver "$resolver_addr:$resolver_port"
+        "$SCRIPT_DIR/filter-resolvable.sh" --count 1000 --resolver "1.1.1.1:53"
     else
         echo "  top-1k-resolvable.csv: exists ($(wc -l < "$SCRIPT_DIR/top-1k-resolvable.csv") domains)"
     fi
 
     if [[ ! -f "$SCRIPT_DIR/top-10k-resolvable.csv" ]]; then
-        "$SCRIPT_DIR/filter-resolvable.sh" --count 10000 --resolver "$resolver_addr:$resolver_port"
+        "$SCRIPT_DIR/filter-resolvable.sh" --count 10000 --resolver "1.1.1.1:53"
     else
         echo "  top-10k-resolvable.csv: exists ($(wc -l < "$SCRIPT_DIR/top-10k-resolvable.csv") domains)"
     fi
@@ -346,16 +339,36 @@ setup_target() {
     echo "  Cert SANs: $san"
     ((step++))
 
-    # Optionally install Unbound
+    # Install and configure Unbound on port 5353
     if [[ "$RESOLVER_MODE" == "unbound" ]]; then
-        echo "[$step/N] Checking Unbound..."
-        if ! dig +short @127.0.0.1 -p 5353 google.com > /dev/null 2>&1; then
-            echo "  Unbound not running. Install with:"
-            echo "    sudo apt install -y unbound"
-            echo "    # Configure to listen on port 5353 (avoid systemd-resolved conflict)"
-            echo "    sudo systemctl restart unbound"
+        echo "[$step/N] Setting up Unbound..."
+        if ! command -v unbound &>/dev/null; then
+            echo "  Installing Unbound..."
+            sudo apt-get install -y unbound || { echo "  ERROR: Failed to install Unbound"; exit 1; }
         else
+            echo "  Unbound: already installed"
+        fi
+
+        # Configure to listen on port 5353 (avoids systemd-resolved on 53)
+        local unbound_conf="/etc/unbound/unbound.conf.d/codoh.conf"
+        if [[ ! -f "$unbound_conf" ]]; then
+            echo "  Configuring Unbound on port 5353..."
+            sudo tee "$unbound_conf" >/dev/null <<'UBEOF'
+server:
+    interface: 127.0.0.1
+    port: 5353
+    access-control: 127.0.0.0/8 allow
+UBEOF
+            sudo systemctl restart unbound
+        fi
+
+        # Verify it responds
+        if dig +short @127.0.0.1 -p 5353 google.com > /dev/null 2>&1; then
             echo "  Unbound: running on 127.0.0.1:5353"
+        else
+            echo "  ERROR: Unbound not responding on 127.0.0.1:5353"
+            echo "  Check: sudo systemctl status unbound"
+            exit 1
         fi
     else
         echo "[$step/N] Using upstream resolver: $RESOLVER_MODE (skipping Unbound)"
