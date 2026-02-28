@@ -15,3 +15,5 @@ enclave/enclave
 enclave/enclave-sim
 enclave/*.pembench-logs.txt
 benchmark/cloud-env.local.sh
+
+.signing
