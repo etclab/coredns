@@ -1,0 +1,8 @@
+https://.:8443 {
+    tls .signing/target.pem .signing/target-key.pem
+
+    forward . 1.1.1.1:53
+
+    prometheus
+    log
+}

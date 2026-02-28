@@ -4,6 +4,7 @@
         port 8080
         tls_cert .signing/proxy.pem
         tls_key .signing/proxy-key.pem
+        insecure_skip_verify true
     }
     odohtarget {
         port 8443
