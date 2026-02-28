@@ -475,11 +475,17 @@ Requires: `python3`, `gnuplot`, `epstopdf` or `ps2pdf`. No pip dependencies.
 
 ### Unbound (Local Recursive Resolver)
 
-Standard recursive resolver, no pre-warming. Unbound starts cold and warms naturally during the run. Cache is flushed between workloads via `unbound-control flush_zone .` for clean measurements. Default Unbound config, listening on default port 53.
+Standard recursive resolver, no pre-warming. Unbound starts cold and warms naturally during the run. Cache is flushed between workloads via `unbound-control flush_zone .` for clean measurements. Listens on port 5353 (avoids systemd-resolved conflict on port 53).
 
 ```bash
-# Install (configure default port 53)
-sudo apt install unbound
+# Install and configure for port 5353
+sudo apt install unbound -y
+sudo tee /etc/unbound/unbound.conf.d/codoh.conf >/dev/null <<'EOF'
+server:
+    interface: 127.0.0.1
+    port: 5353
+    access-control: 127.0.0.0/8 allow
+EOF
 sudo systemctl restart unbound
 
 # Verify
@@ -492,7 +498,7 @@ sudo unbound-control flush_zone .
 sudo unbound-control stats_noreset | grep 'total.num'
 ```
 
-Both `run-all.sh` and `cloud-run.sh` default to `--resolver unbound` (`127.0.0.1:53`). Unbound must run on the **target VM** since that's where DNS resolution happens.
+Both `run-all.sh` and `cloud-run.sh` default to `--resolver unbound` (`127.0.0.1:5353`). Unbound must run on the **target VM** since that's where DNS resolution happens. `cloud-setup.sh target` auto-installs and configures Unbound on port 5353.
 
 ```bash
 # From client VM

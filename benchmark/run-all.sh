@@ -308,6 +308,42 @@ wait_for_health() {
 }
 
 #######################################
+# Validate workload result — catch broken caches early
+#######################################
+validate_workload_result() {
+    local config_name=$1 workload=$2 json_file=$3
+
+    [[ -f "$json_file" ]] || return 0
+
+    # Only validate cache-capable configs on warm/zipf workloads
+    case "$config_name" in
+        codoh-base|codoh-nosgx|codoh-full|codoh) ;;
+        *) return 0 ;;
+    esac
+    [[ "$workload" == "cold" ]] && return 0
+
+    local cache_misses cache_hits iterations
+    cache_misses=$(python3 -c "import json; d=json.load(open('$json_file')); print(d.get('cache_misses', -1))" 2>/dev/null)
+    cache_hits=$(python3 -c "import json; d=json.load(open('$json_file')); print(d.get('cache_hits', -1))" 2>/dev/null)
+    iterations=$(python3 -c "import json; d=json.load(open('$json_file')); print(d.get('iterations', 0))" 2>/dev/null)
+
+    # Flag zero cache hits on warm workload — cache is broken
+    if [[ "$workload" == "warm" && "$cache_hits" =~ ^[0-9]+$ && "$cache_hits" -eq 0 && "$iterations" -gt 0 ]]; then
+        echo "  ERROR: $config_name/$workload has 0 cache hits out of $iterations queries!"
+        echo "         Cache is not working — check HPKE info string, enclave logs for decrypt errors."
+        return 1
+    fi
+
+    # Flag 100% misses on zipf (very unlikely with 1k domain list)
+    if [[ "$workload" == "zipf" && "$cache_misses" =~ ^[0-9]+$ && "$cache_misses" -eq "$iterations" && "$iterations" -gt 10 ]]; then
+        echo "  WARNING: $config_name/$workload has 100% cache misses — cache may be broken."
+        return 1
+    fi
+
+    return 0
+}
+
+#######################################
 # Run a single workload
 #######################################
 run_workload() {
@@ -358,6 +394,10 @@ run_workload() {
         echo "  WARNING: $config_name/$workload had issues"
         return 1
     fi
+
+    # Validate cache behavior
+    validate_workload_result "$config_name" "$workload" "${output_prefix}.json" || return 1
+
     echo ""
 }
 

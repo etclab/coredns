@@ -44,8 +44,16 @@ We use a local [Unbound](https://nlnetlabs.nl/projects/unbound/about/) as a stan
 ```bash
 sudo apt install unbound -y
 # Configure to listen on port 5353 (avoid systemd-resolved conflict)
+sudo tee /etc/unbound/unbound.conf.d/codoh.conf >/dev/null <<'EOF'
+server:
+    interface: 127.0.0.1
+    port: 5353
+    access-control: 127.0.0.0/8 allow
+EOF
 sudo systemctl restart unbound
 ```
+
+On cloud VMs, `cloud-setup.sh target` handles this automatically.
 
 Verify it's working:
 
