@@ -16,7 +16,6 @@ start_config() {
     if [[ "${SGX_MODE:-false}" == "true" ]]; then
         CODOH_USE_ORAM=true \
         CODOH_CACHE_SIZE="${CODOH_CACHE_SIZE:-1024}" \
-        CODOH_PAD_BUCKETS=16384 \
         CODOH_BATCH_SIZE="${CODOH_BATCH_SIZE:-10}" \
         CODOH_BATCH_COMMIT_PROB="${CODOH_BATCH_COMMIT_PROB:-0.1}" \
             ego run "$root_dir/enclave/enclave" \
@@ -24,7 +23,6 @@ start_config() {
     else
         CODOH_USE_ORAM=true \
         CODOH_CACHE_SIZE="${CODOH_CACHE_SIZE:-1024}" \
-        CODOH_PAD_BUCKETS=16384 \
         CODOH_BATCH_SIZE="${CODOH_BATCH_SIZE:-10}" \
         CODOH_BATCH_COMMIT_PROB="${CODOH_BATCH_COMMIT_PROB:-0.1}" \
             "$root_dir/enclave-sim" \
@@ -34,7 +32,8 @@ start_config() {
 
     echo "Starting CODoH target on port 8443 (covers k=${CODOH_COVER_COUNT:-3})..."
     CODOH_COVER_COUNT="${CODOH_COVER_COUNT:-3}" \
-    CODOH_COVER_DOMAIN_FILE="$root_dir/benchmark/top-1k-resolvable.csv" \
+    CODOH_COVER_DOMAIN_FILE="$root_dir/benchmark/top-10k-resolvable.csv" \
+    CODOH_COVER_POPULAR_CUTOFF=1000 \
     CODOH_PROXY_CALLBACK_URL="https://${PROXY_IP:-127.0.0.1}:8080" \
     CODOH_COVER_RESOLVER="$UPSTREAM_RESOLVER" \
     CODOH_COVER_TIMEOUT_MS=2000 \

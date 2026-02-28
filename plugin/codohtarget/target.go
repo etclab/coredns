@@ -347,6 +347,16 @@ func (t *odohTarget) prepareCacheInsert(pubKeyBytes []byte, dnsQuery *dns.Msg, p
 	canonicalQuery := enclave.CanonicalizeQuery(q.Name, q.Qtype)
 	now := time.Now().Unix()
 
+	maxDNS := enclave.MaxCacheableDNSSize(enclave.DefaultPadBuckets)
+
+	// Skip caching oversized responses — they would overflow the pad bucket
+	// and leak size class to the proxy (G3 violation). The client still gets
+	// the answer via the normal ODoH miss path.
+	if len(packedResponse) > maxDNS {
+		log.Debugf("Skipping cache-insert: DNS response %dB exceeds max cacheable %dB", len(packedResponse), maxDNS)
+		return
+	}
+
 	// Real entry
 	realEntry := enclave.CacheInsertBundle{
 		TTL:            ttl,
@@ -369,6 +379,10 @@ func (t *odohTarget) prepareCacheInsert(pubKeyBytes []byte, dnsQuery *dns.Msg, p
 		}
 
 		for _, rc := range resolved {
+			// Skip oversized cover responses
+			if len(rc.DNSResponse) > maxDNS {
+				continue
+			}
 			coverCanonical := enclave.CanonicalizeQuery(rc.Domain, dns.TypeA)
 			entries = append(entries, enclave.CacheInsertBundle{
 				TTL:            rc.TTL,

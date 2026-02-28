@@ -91,7 +91,7 @@ export SGX_MODE
 
 # Map resolver name to address
 case $RESOLVER in
-    unbound)    UPSTREAM_RESOLVER="127.0.0.1:53" ;;
+    unbound)    UPSTREAM_RESOLVER="127.0.0.1:5353" ;;
     cloudflare) UPSTREAM_RESOLVER="1.1.1.1:53" ;;
     google)     UPSTREAM_RESOLVER="8.8.8.8:53" ;;
     *)

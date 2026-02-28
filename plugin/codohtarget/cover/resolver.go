@@ -2,18 +2,20 @@ package cover
 
 import (
 	"context"
-	"math"
 	"sync"
 	"time"
 
 	"github.com/miekg/dns"
 )
 
+// MaxNegativeTTL caps negative-cache TTLs for cover responses (enclave-defined upper bound).
+const MaxNegativeTTL uint32 = 3600 // 1 hour
+
 // ResolvedCover holds a successfully resolved cover domain.
 type ResolvedCover struct {
 	Domain      string
 	DNSResponse []byte // wire-format DNS response
-	TTL         uint32 // from DNS response, or MaxUint32 for NXDOMAIN/SERVFAIL
+	TTL         uint32 // from DNS response; RFC 2308 SOA-derived for NXDOMAIN
 }
 
 // Resolver performs parallel DNS resolution for cover domains.
@@ -60,18 +62,7 @@ func (r *Resolver) Resolve(ctx context.Context, domains []string) []ResolvedCove
 				return
 			}
 
-			var ttl uint32
-			for _, rr := range resp.Answer {
-				if rr.Header().Ttl > 0 {
-					ttl = rr.Header().Ttl
-					break
-				}
-			}
-			// Covers with no TTL (NXDOMAIN/SERVFAIL) persist until LRU eviction.
-			// They exist purely for G2 (cache-state indistinguishability).
-			if ttl == 0 {
-				ttl = math.MaxUint32
-			}
+			ttl := extractCoverTTL(resp)
 
 			mu.Lock()
 			results = append(results, ResolvedCover{
@@ -85,4 +76,37 @@ func (r *Resolver) Resolve(ctx context.Context, domains []string) []ResolvedCove
 
 	wg.Wait()
 	return results
+}
+
+// extractCoverTTL derives the TTL for a cover response.
+// For positive responses: uses the first Answer RR's TTL.
+// For NXDOMAIN/NODATA: applies RFC 2308 negative caching — min(SOA.Ttl, SOA.Minttl),
+// capped by MaxNegativeTTL (enclave-defined upper bound per paper spec).
+// For SERVFAIL or other errors: uses MaxNegativeTTL as a reasonable default.
+func extractCoverTTL(resp *dns.Msg) uint32 {
+	// Positive response — use first answer TTL
+	for _, rr := range resp.Answer {
+		if rr.Header().Ttl > 0 {
+			return rr.Header().Ttl
+		}
+	}
+
+	// Negative response (NXDOMAIN or NODATA) — derive from SOA per RFC 2308
+	if resp.Rcode == dns.RcodeNameError || (resp.Rcode == dns.RcodeSuccess && len(resp.Answer) == 0) {
+		for _, rr := range resp.Ns {
+			if soa, ok := rr.(*dns.SOA); ok {
+				ttl := soa.Hdr.Ttl
+				if soa.Minttl < ttl {
+					ttl = soa.Minttl
+				}
+				if ttl > MaxNegativeTTL {
+					ttl = MaxNegativeTTL
+				}
+				return ttl
+			}
+		}
+	}
+
+	// No SOA found or SERVFAIL — use upper bound
+	return MaxNegativeTTL
 }

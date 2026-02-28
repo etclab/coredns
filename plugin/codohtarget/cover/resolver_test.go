@@ -2,7 +2,6 @@ package cover
 
 import (
 	"context"
-	"math"
 	"net"
 	"testing"
 	"time"
@@ -104,9 +103,9 @@ func TestResolver_NXDOMAINIncluded(t *testing.T) {
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result (NXDOMAIN included), got %d", len(results))
 	}
-	// NXDOMAIN covers get MaxUint32 TTL — persist until LRU eviction (G2).
-	if results[0].TTL != math.MaxUint32 {
-		t.Errorf("TTL for NXDOMAIN: got %d, want MaxUint32", results[0].TTL)
+	// NXDOMAIN covers without SOA get MaxNegativeTTL (RFC 2308 + upper bound cap).
+	if results[0].TTL != MaxNegativeTTL {
+		t.Errorf("TTL for NXDOMAIN: got %d, want MaxNegativeTTL (%d)", results[0].TTL, MaxNegativeTTL)
 	}
 }
 

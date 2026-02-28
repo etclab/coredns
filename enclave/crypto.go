@@ -209,6 +209,21 @@ func GenerateDummyResponse(size int) []byte {
 // Empirically: max HPKE-encrypted response ≈ 1616B (top-10k Umbrella domains).
 var DefaultPadBuckets = []int{2048}
 
+// CachedResponseOverhead is the byte overhead added by EncryptCachedResponse
+// (12B nonce + 16B GCM tag) plus PadToBucket's 2B length prefix.
+const CachedResponseOverhead = 12 + 16 + 2 // = 30
+
+// MaxCacheableDNSSize returns the maximum DNS wire-format response that fits
+// within the largest response pad bucket. Responses exceeding this must not
+// be cached, otherwise PadToBucket would produce a multi-bucket output that
+// leaks size class (G3 violation).
+func MaxCacheableDNSSize(buckets []int) int {
+	if len(buckets) == 0 {
+		return 0
+	}
+	return buckets[len(buckets)-1] - CachedResponseOverhead
+}
+
 // PadToBucket pads data to the next bucket boundary.
 // Wire format: [2-byte LE length prefix][data][random padding]
 // Total output length equals the smallest bucket >= len(data)+2.
