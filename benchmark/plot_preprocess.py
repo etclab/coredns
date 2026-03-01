@@ -40,7 +40,7 @@ CONFIGS = OrderedDict([
     ("codoh-base", {
         "aliases": ["config3"],
         "num": 3,
-        "label": r"CODoH (LRU, SGX)",
+        "label": r"ODoH Cached",
         "ls": 3,
         "dt": 3,
         "color": "#228833",   # Tol bright green
@@ -48,7 +48,7 @@ CONFIGS = OrderedDict([
     ("codoh-nosgx", {
         "aliases": ["config4"],
         "num": 4,
-        "label": r"CODoH (ORAM, sim)",
+        "label": r"CODoH-noTEE",
         "ls": 4,
         "dt": 4,
         "color": "#CCBB44",   # Tol bright yellow
@@ -56,7 +56,7 @@ CONFIGS = OrderedDict([
     ("codoh-full", {
         "aliases": ["config5"],
         "num": 5,
-        "label": r"CODoH (ORAM, SGX)",
+        "label": r"CODoH",
         "ls": 5,
         "dt": 5,
         "color": "#AA3377",   # Tol bright purple
@@ -187,7 +187,7 @@ def _fmt_lat(val):
     """Format a latency value for LaTeX."""
     if val is None:
         return "--"
-    return f"{val:.1f}"
+    return f"{val:.2f}"
 
 
 def _fmt_overhead(val, baseline):
@@ -197,7 +197,7 @@ def _fmt_overhead(val, baseline):
     if baseline == 0:
         return _fmt_lat(val)
     ratio = val / baseline
-    return f"{val:.1f} ({ratio:.1f}$\\times$)"
+    return f"{val:.2f} ({ratio:.2f}$\\times$)"
 
 
 def generate_comparison_table(files, plots_dir):

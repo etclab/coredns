@@ -5,140 +5,112 @@ import (
 	"testing"
 )
 
-func BenchmarkLRUCache_Put(b *testing.B) {
-	cache := NewLRUCache(10000)
-	data := []byte("benchmark response data")
-	insertedAt := int64(1000000)
-	ttlSecs := uint32(300)
+var cacheSizes = []int{256, 512, 1024, 2048}
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		query := fmt.Sprintf("query%d.com.", i%10000)
-		cache.Put(query, data, insertedAt, ttlSecs)
+func BenchmarkLRUCache_Put(b *testing.B) {
+	for _, n := range cacheSizes {
+		b.Run(fmt.Sprintf("N=%d", n), func(b *testing.B) {
+			cache := NewLRUCache(n)
+			data := []byte("benchmark response data")
+			insertedAt := int64(1000000)
+			ttlSecs := uint32(300)
+
+			// Pre-populate with N/2 entries
+			for i := 0; i < n/2; i++ {
+				cache.Put(fmt.Sprintf("pre%d.com.", i), data, insertedAt, ttlSecs)
+			}
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				query := fmt.Sprintf("query%d.com.", i%n)
+				cache.Put(query, data, insertedAt, ttlSecs)
+			}
+		})
 	}
 }
 
 func BenchmarkLRUCache_Get(b *testing.B) {
-	cache := NewLRUCache(10000)
-	data := []byte("benchmark response data")
-	insertedAt := int64(1000000)
-	ttlSecs := uint32(300)
+	for _, n := range cacheSizes {
+		b.Run(fmt.Sprintf("N=%d", n), func(b *testing.B) {
+			cache := NewLRUCache(n)
+			data := []byte("benchmark response data")
+			insertedAt := int64(1000000)
+			ttlSecs := uint32(300)
 
-	// Pre-populate
-	for i := 0; i < 10000; i++ {
-		query := fmt.Sprintf("query%d.com.", i)
-		cache.Put(query, data, insertedAt, ttlSecs)
-	}
+			// Pre-populate with N/2 entries
+			for i := 0; i < n/2; i++ {
+				cache.Put(fmt.Sprintf("query%d.com.", i), data, insertedAt, ttlSecs)
+			}
 
-	tLatest := int64(1000100) // within TTL
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		query := fmt.Sprintf("query%d.com.", i%10000)
-		cache.Get(query, tLatest)
+			tLatest := int64(1000100)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				query := fmt.Sprintf("query%d.com.", i%(n/2))
+				cache.Get(query, tLatest)
+			}
+		})
 	}
 }
 
 func BenchmarkORAMCache_Put(b *testing.B) {
-	cfg := ORAMCacheConfig{
-		Capacity:     10000,
-		BlockSize:    4096,
-		BucketSize:   4,
-		ConstantTime: false,
-	}
-	cache, err := NewORAMCache(cfg)
-	if err != nil {
-		b.Fatalf("NewORAMCache failed: %v", err)
-	}
-	data := []byte("benchmark response data")
-	insertedAt := int64(1000000)
-	ttlSecs := uint32(300)
+	for _, n := range cacheSizes {
+		b.Run(fmt.Sprintf("N=%d", n), func(b *testing.B) {
+			cfg := ORAMCacheConfig{
+				Capacity:     n,
+				BlockSize:    4096,
+				BucketSize:   4,
+				ConstantTime: false,
+			}
+			cache, err := NewORAMCache(cfg)
+			if err != nil {
+				b.Fatalf("NewORAMCache failed: %v", err)
+			}
+			data := []byte("benchmark response data")
+			insertedAt := int64(1000000)
+			ttlSecs := uint32(300)
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		query := fmt.Sprintf("query%d.com.", i%10000)
-		cache.Put(query, data, insertedAt, ttlSecs)
+			// Pre-populate with N/2 entries
+			for i := 0; i < n/2; i++ {
+				cache.Put(fmt.Sprintf("pre%d.com.", i), data, insertedAt, ttlSecs)
+			}
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				query := fmt.Sprintf("query%d.com.", i%n)
+				cache.Put(query, data, insertedAt, ttlSecs)
+			}
+		})
 	}
 }
 
 func BenchmarkORAMCache_Get(b *testing.B) {
-	cfg := ORAMCacheConfig{
-		Capacity:     10000,
-		BlockSize:    4096,
-		BucketSize:   4,
-		ConstantTime: false,
-	}
-	cache, err := NewORAMCache(cfg)
-	if err != nil {
-		b.Fatalf("NewORAMCache failed: %v", err)
-	}
-	data := []byte("benchmark response data")
-	insertedAt := int64(1000000)
-	ttlSecs := uint32(300)
+	for _, n := range cacheSizes {
+		b.Run(fmt.Sprintf("N=%d", n), func(b *testing.B) {
+			cfg := ORAMCacheConfig{
+				Capacity:     n,
+				BlockSize:    4096,
+				BucketSize:   4,
+				ConstantTime: false,
+			}
+			cache, err := NewORAMCache(cfg)
+			if err != nil {
+				b.Fatalf("NewORAMCache failed: %v", err)
+			}
+			data := []byte("benchmark response data")
+			insertedAt := int64(1000000)
+			ttlSecs := uint32(300)
 
-	// Pre-populate
-	for i := 0; i < 1000; i++ {
-		query := fmt.Sprintf("query%d.com.", i)
-		cache.Put(query, data, insertedAt, ttlSecs)
-	}
+			// Pre-populate with N/2 entries
+			for i := 0; i < n/2; i++ {
+				cache.Put(fmt.Sprintf("query%d.com.", i), data, insertedAt, ttlSecs)
+			}
 
-	tLatest := int64(1000100)
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		query := fmt.Sprintf("query%d.com.", i%1000)
-		cache.Get(query, tLatest)
-	}
-}
-
-func BenchmarkORAMCache_ConstantTime_Put(b *testing.B) {
-	cfg := ORAMCacheConfig{
-		Capacity:     10000,
-		BlockSize:    4096,
-		BucketSize:   4,
-		ConstantTime: true,
-	}
-	cache, err := NewORAMCache(cfg)
-	if err != nil {
-		b.Fatalf("NewORAMCache failed: %v", err)
-	}
-	data := []byte("benchmark response data")
-	insertedAt := int64(1000000)
-	ttlSecs := uint32(300)
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		query := fmt.Sprintf("query%d.com.", i%10000)
-		cache.Put(query, data, insertedAt, ttlSecs)
-	}
-}
-
-func BenchmarkORAMCache_ConstantTime_Get(b *testing.B) {
-	cfg := ORAMCacheConfig{
-		Capacity:     10000,
-		BlockSize:    4096,
-		BucketSize:   4,
-		ConstantTime: true,
-	}
-	cache, err := NewORAMCache(cfg)
-	if err != nil {
-		b.Fatalf("NewORAMCache failed: %v", err)
-	}
-	data := []byte("benchmark response data")
-	insertedAt := int64(1000000)
-	ttlSecs := uint32(300)
-
-	// Pre-populate
-	for i := 0; i < 1000; i++ {
-		query := fmt.Sprintf("query%d.com.", i)
-		cache.Put(query, data, insertedAt, ttlSecs)
-	}
-
-	tLatest := int64(1000100)
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		query := fmt.Sprintf("query%d.com.", i%1000)
-		cache.Get(query, tLatest)
+			tLatest := int64(1000100)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				query := fmt.Sprintf("query%d.com.", i%(n/2))
+				cache.Get(query, tLatest)
+			}
+		})
 	}
 }

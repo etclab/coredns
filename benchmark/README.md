@@ -243,6 +243,63 @@ Increase parallelism: `./benchmark/prewarm-unbound.sh --parallel 100`
 | 10443 | CODoH-base enclave-proxy (Config 3) |
 | 10444 | CODoH-base target (Config 3) |
 
+## Microbenchmarks
+
+Microbenchmarks measure individual operations on the critical path (§ microbenchmarks in the paper). All use Go's `testing.B` harness.
+
+### Quick run
+
+```bash
+./benchmark/run-microbench.sh
+```
+
+Results go to `benchmark/results/micro_<timestamp>/microbench/`. Use `--iterations N` to change iteration count (default: 10000).
+
+### What's measured
+
+| Category | Benchmarks | File |
+|----------|-----------|------|
+| **Crypto ops** | HPKE Seal/Open, AES-GCM Seal/Open, Ed25519 Sign/Verify | `enclave/crypto_benchmark_test.go` |
+| **Cache access** | LRU and ORAM Get/Put at N ∈ {256, 512, 1024, 2048} | `enclave/cache_benchmark_test.go` |
+| **IPC round-trip** | Health check (pure IPC overhead), cache-hit lookup (decrypt + cache read + encrypt) | `enclave/cmd/ipc_benchmark_test.go` |
+| **Padding overhead** | Query/response padding waste from bucketed padding | `benchmark/analyze-padding.go` |
+
+### Running individually
+
+```bash
+# Crypto only
+go test -bench='^Benchmark(HPKE|AESGCM|Ed25519)' -benchtime=10000x -count=3 ./enclave/
+
+# Cache only
+go test -bench='^Benchmark(LRU|ORAM)Cache' -benchtime=10000x -count=3 ./enclave/
+
+# IPC only
+go test -bench='^BenchmarkIPC' -benchtime=10000x -count=3 ./enclave/cmd/
+
+# Padding analysis
+go run benchmark/analyze-padding.go -domains benchmark/top-10k-resolvable.csv
+```
+
+### Plain vs SGX
+
+The same benchmarks produce both columns of the paper's tables:
+
+- **Plain**: Run as shown above (standard `go test`)
+- **SGX**: Build with `ego-go test` and run under `ego run` on an SGX-capable machine. The crypto and cache benchmarks are self-contained and work inside the enclave. The IPC benchmark requires the full enclave process.
+
+### Payload sizes
+
+Benchmarks use representative sizes matching real workloads:
+
+| Parameter | Size | Source |
+|-----------|------|--------|
+| Query (Q_E) | 193 B | Max Q_E ciphertext before padding (top-10k Umbrella) |
+| Response | 512 B | Median DNS response |
+| Signature input | 32 B | SHA-256 hash of cache-insert bundle |
+| Cache entries | 22 B | Representative response data |
+
+---
+
 ## Notes for Artifact Reviewers
 
 - All paper numbers use SGX mode (the default). Simulation mode (`--no-sgx` / `enclave-sim`) is for development only.
