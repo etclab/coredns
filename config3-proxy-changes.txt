@@ -1,0 +1,95 @@
+diff --git a/enclave/cmd/proxy_mode.go b/enclave/cmd/proxy_mode.go
+index f6afff238..645633eba 100644
+--- a/enclave/cmd/proxy_mode.go
++++ b/enclave/cmd/proxy_mode.go
+@@ -116,7 +116,7 @@ func (s *ProxyServer) handleODoHConfigs(w http.ResponseWriter, r *http.Request)
+ 
+ // handleProxy is the main request handler.
+ // Flow:
+-//  1. Read X-ODoH-Blob header, base64-decode
++//  1. Read X-CoDOH-Query header, base64-decode
+ //  2. Decrypt with enclave private key → plaintext
+ //  3. Parse simplified blob: kc = plaintext[:32], query = string(plaintext[32:])
+ //  4. Cache lookup by query
+@@ -129,9 +129,9 @@ func (s *ProxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 
+ 	// Read blob header
+-	blobB64 := r.Header.Get("X-ODoH-Blob")
++	blobB64 := r.Header.Get("X-CoDOH-Query")
+ 	if blobB64 == "" {
+-		http.Error(w, "missing X-ODoH-Blob header", http.StatusBadRequest)
++		http.Error(w, "missing X-CoDOH-Query header", http.StatusBadRequest)
+ 		return
+ 	}
+ 
+diff --git a/enclave/crypto.go b/enclave/crypto.go
+index e16aae051..6bc388fb8 100644
+--- a/enclave/crypto.go
++++ b/enclave/crypto.go
+@@ -15,7 +15,7 @@ var (
+ 	kdfID  = hpke.KDF_HKDF_SHA256
+ 	aeadID = hpke.AEAD_AES128GCM
+ 	suite  = hpke.NewSuite(kemID, kdfID, aeadID)
+-	info   = []byte("codoh-enclave-v1")
++	info   = []byte("codoh transport key")
+ )
+ 
+ // EnclaveKeypair holds the HPKE keypair for the enclave.
+diff --git a/go.mod b/go.mod
+index 12842d344..8825ad48d 100644
+--- a/go.mod
++++ b/go.mod
+@@ -2,7 +2,7 @@ module github.com/coredns/coredns
+ 
+ // Note this minimum version requirement. CoreDNS supports the last two
+ // Go versions. This follows the upstream Go project support.
+-go 1.25.5
++go 1.25.1
+ 
+ require (
+ 	github.com/Azure/azure-sdk-for-go v68.0.0+incompatible
+@@ -53,6 +53,7 @@ require (
+ 	github.com/cloudflare/circl v1.3.7
+ 	github.com/cloudflare/odoh-go v1.0.0
+ 	github.com/edgelesssys/ego v1.8.1
++	github.com/etclab/pathoram-go v0.1.2
+ 	github.com/stretchr/testify v1.11.1
+ )
+ 
+@@ -108,7 +109,6 @@ require (
+ 	github.com/dustin/go-humanize v1.0.1 // indirect
+ 	github.com/ebitengine/purego v0.8.3 // indirect
+ 	github.com/emicklei/go-restful/v3 v3.12.2 // indirect
+-	github.com/etclab/pathoram-go v0.1.0 // indirect
+ 	github.com/felixge/httpsnoop v1.0.4 // indirect
+ 	github.com/flynn/go-shlex v0.0.0-20150515145356-3f9db97f8568 // indirect
+ 	github.com/fxamacker/cbor/v2 v2.9.0 // indirect
+diff --git a/go.sum b/go.sum
+index 2c81043e2..63607bf0b 100644
+--- a/go.sum
++++ b/go.sum
+@@ -151,8 +151,8 @@ github.com/edgelesssys/ego v1.8.1 h1:cpc9PfxLbADg+ZelHz3g02JBr/89N9zXpsEQCq0IIH4
+ github.com/edgelesssys/ego v1.8.1/go.mod h1:fg0M/xfLWnrkoD2OZpY9xmltGlAPFsIiUmyHTuCS7zo=
+ github.com/emicklei/go-restful/v3 v3.12.2 h1:DhwDP0vY3k8ZzE0RunuJy8GhNpPL6zqLkDf9B/a0/xU=
+ github.com/emicklei/go-restful/v3 v3.12.2/go.mod h1:6n3XBCmQQb25CM2LCACGz8ukIrRry+4bhvbpWn3mrbc=
+-github.com/etclab/pathoram-go v0.1.0 h1:388V1pO32m7eE1k/jHOtm3IIFP/hOZ7oPjgXC+PGF3M=
+-github.com/etclab/pathoram-go v0.1.0/go.mod h1:Up6xDiYcF4DdHWTINIoy+iimgJK0bMSeAybODU+KGMs=
++github.com/etclab/pathoram-go v0.1.2 h1:vfoIXvEfOb9L49nO/x5DWYDqmvePY53aMx5kanLskPI=
++github.com/etclab/pathoram-go v0.1.2/go.mod h1:xLHJIdCkDiw8rbdwtCGMAWwG3EMqGlctrL3WSfW9fpw=
+ github.com/expr-lang/expr v1.17.6 h1:1h6i8ONk9cexhDmowO/A64VPxHScu7qfSl2k8OlINec=
+ github.com/expr-lang/expr v1.17.6/go.mod h1:8/vRC7+7HBzESEqt5kKpYXxrxkr31SaO8r40VO/1IT4=
+ github.com/farsightsec/golang-framestream v0.3.0 h1:/spFQHucTle/ZIPkYqrfshQqPe2VQEzesH243TjIwqA=
+diff --git a/plugin/codohtarget/enclave_encrypt.go b/plugin/codohtarget/enclave_encrypt.go
+index 71440f71c..396874bd0 100644
+--- a/plugin/codohtarget/enclave_encrypt.go
++++ b/plugin/codohtarget/enclave_encrypt.go
+@@ -13,7 +13,7 @@ var (
+ 	enclaveKdfID  = hpke.KDF_HKDF_SHA256
+ 	enclaveAeadID = hpke.AEAD_AES128GCM
+ 	enclaveSuite  = hpke.NewSuite(enclaveKemID, enclaveKdfID, enclaveAeadID)
+-	enclaveInfo   = []byte("codoh-enclave-v1")
++	enclaveInfo   = []byte("codoh transport key")
+ )
+ 
+ // EncryptForEnclave encrypts data using the enclave's HPKE public key.
