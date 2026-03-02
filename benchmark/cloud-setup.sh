@@ -242,6 +242,7 @@ setup_proxy() {
     local own_ip
     own_ip=$(hostname -I | awk '{print $1}')
     local san="DNS:localhost,IP:127.0.0.1,IP:${own_ip}"
+    [[ -n "${PROXY_IP:-}" ]] && san="${san},IP:${PROXY_IP}"
     [[ -n "${TARGET_IP:-}" ]] && san="${san},IP:${TARGET_IP}"
 
     # Always regenerate in cloud mode (SANs may differ from previous run)
@@ -331,6 +332,7 @@ setup_target() {
     own_ip=$(hostname -I | awk '{print $1}')
     local san="DNS:localhost,IP:127.0.0.1,IP:${own_ip}"
     [[ -n "${PROXY_IP:-}" ]] && san="${san},IP:${PROXY_IP}"
+    [[ -n "${TARGET_IP:-}" ]] && san="${san},IP:${TARGET_IP}"
 
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
         -keyout "$ROOT_DIR/localhost-key.pem" -out "$ROOT_DIR/localhost.pem" \
