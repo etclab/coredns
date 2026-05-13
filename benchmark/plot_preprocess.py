@@ -65,7 +65,13 @@ CONFIGS = OrderedDict([
 
 WORKLOADS = ["cold", "zipf", "warm"]
 
-CDF_XRANGE = {"cold": 150, "zipf": 100, "warm": 20}
+CDF_XRANGE = {"cold": 150, "zipf": 100, "warm": 60}
+
+# Skip the first WARMUP_SKIP queries to exclude the batched-insertion warmup
+# transient; the cache populates probabilistically (commit_prob=0.1, batch=10),
+# so it takes ~hundreds of queries before the steady-state hit rate kicks in.
+# Applied uniformly across all configs/workloads for methodological consistency.
+WARMUP_SKIP = 1000
 
 # Reverse alias map: "config1" -> "doh", etc.
 _ALIAS_MAP = {}
@@ -152,17 +158,26 @@ def discover_sweep(raw_dir, sweep_type):
 # CDF computation
 # ---------------------------------------------------------------------------
 
-def compute_cdf(csv_path, output_path):
-    """Read CSV, extract latency_ms, write sorted CDF file."""
-    latencies = []
+def _read_latencies(csv_path):
+    """Read CSV, extract (query_num, latency_ms, cache_status) tuples."""
+    rows = []
     with open(csv_path, "r") as f:
         reader = csv.DictReader(f)
         for row in reader:
             try:
+                qn = int(row["query_num"])
                 lat = float(row["latency_ms"])
-                latencies.append(lat)
+                cs = row.get("cache_status", "")
+                rows.append((qn, lat, cs))
             except (ValueError, KeyError):
                 continue
+    return rows
+
+
+def compute_cdf(csv_path, output_path):
+    """Read CSV, skip warmup, write sorted CDF file."""
+    rows = _read_latencies(csv_path)
+    latencies = [lat for qn, lat, _ in rows if qn > WARMUP_SKIP]
 
     if not latencies:
         print(f"  WARN: no latency data in {csv_path}", file=sys.stderr)
@@ -177,6 +192,28 @@ def compute_cdf(csv_path, output_path):
             f.write(f"{lat:.3f} {i / n:.6f}\n")
 
     return True
+
+
+def compute_percentiles(csv_path):
+    """Return {n, p50, p95, p99, hit_rate} from rows with query_num > WARMUP_SKIP."""
+    rows = _read_latencies(csv_path)
+    rows = [(qn, lat, cs) for qn, lat, cs in rows if qn > WARMUP_SKIP]
+    if not rows:
+        return None
+    lats = sorted(lat for _, lat, _ in rows)
+    n = len(lats)
+    hits = sum(1 for _, _, cs in rows if cs == "hit")
+    misses = sum(1 for _, _, cs in rows if cs == "miss")
+    classified = hits + misses
+    hit_rate = hits / classified if classified else None
+    return {
+        "n": n,
+        "p50": lats[int(n * 0.50)],
+        "p95": lats[int(n * 0.95)],
+        "p99": lats[int(n * 0.99)],
+        "hit_rate": hit_rate,
+        "warmup_skip": WARMUP_SKIP,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -201,15 +238,33 @@ def _fmt_overhead(val, baseline):
 
 
 def generate_comparison_table(files, plots_dir):
-    """Generate the main comparison LaTeX table."""
-    # Load all JSON data
-    data = {}  # (config_name, workload) -> latency_ms dict
+    """Generate the main comparison LaTeX table from warmup-trimmed CSV data."""
+    # Compute percentiles from CSVs, skipping warmup
+    data = {}    # (config_name, workload) -> {p50, p95, p99}
+    hit_rates = {}  # (config_name, workload) -> hit fraction
     for (cfg, wl), paths in files.items():
-        if "json" not in paths:
+        if "csv" not in paths:
             continue
-        with open(paths["json"]) as f:
-            j = json.load(f)
-        data[(cfg, wl)] = j.get("latency_ms", {})
+        pct = compute_percentiles(paths["csv"])
+        if pct is None:
+            continue
+        data[(cfg, wl)] = pct
+        if pct.get("hit_rate") is not None:
+            hit_rates[(cfg, wl)] = pct["hit_rate"]
+
+    # Dump trimmed percentiles for paper integration
+    summary = {
+        f"{cfg}_{wl}": {
+            "p50": d["p50"], "p95": d["p95"], "p99": d["p99"],
+            "n": d["n"], "hit_rate": d.get("hit_rate"),
+            "warmup_skip": d.get("warmup_skip"),
+        }
+        for (cfg, wl), d in data.items()
+    }
+    summary_path = os.path.join(plots_dir, "percentiles_trimmed.json")
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"  Generated {summary_path}")
 
     # Get ODoH baseline
     odoh_data = {}
