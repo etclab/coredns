@@ -2,44 +2,45 @@
 
 ## Goal
 
-**CODoH (Cached Oblivious DNS over HTTPS)** extends ODoH (RFC 9230) with privacy-preserving proxy-side caching. The cache lives inside an SGX enclave co-located with the proxy, using ORAM for access-pattern hiding and cover responses + batched insertions to resist set-difference attacks.
+**CODoH (Cached Oblivious DNS over HTTPS)** extends ODoH (RFC 9230) with
+privacy-preserving, proxy-side caching inside an SGX enclave. ODoH's per-query
+ephemeral keys make a proxy cache useless — every query hits the target. CODoH
+has the client encrypt each query to *both* the target and the enclave, so the
+enclave serves cache hits directly, while ORAM, cover responses, and batched
+insertions hide which entry was touched.
 
-**Problem**: Standard ODoH uses per-query ephemeral keys, preventing caching at the proxy. Every query hits the target, negating the latency benefits of caching.
-
-**Solution**: The client encrypts the query under both the target's and enclave's HPKE public keys. The enclave decrypts its copy to check the cache. On a miss, the target resolves the query, signs the response, and returns an HPKE-encrypted cache-insert blob for the enclave to store. On subsequent queries for the same domain, the enclave serves the cached response directly.
+This document orients you to the implementation; see the paper for the full
+design, security goals, and threat model.
 
 ---
 
-## Security Goals (from paper)
+## Security Goals
 
-**G1 — Authorized and fresh cached answers**: A malicious proxy must not cause clients to accept DNS answers that the target did not authorize, or that are stale. Prevents cache poisoning, tampering, and stale-answer replay.
+CODoH targets three properties (formal definitions in the paper):
 
-**G2 — Cache-state indistinguishability under active probing and scheduling**: The proxy must not learn meaningful information about a client's query by manipulating or comparing cache state across time. Prevents set-difference/bracketing attacks, cache priming, selective withholding, and restart-based reset windows.
+- **G1 — Authorized & fresh answers:** a malicious proxy cannot make clients
+  accept unauthorized or stale answers (no poisoning, tampering, replay).
+- **G2 — Cache-state indistinguishability:** the proxy learns nothing by
+  manipulating or comparing cache state over time (resists set-difference,
+  priming, withholding, restart-reset).
+- **G3 — Query-equality & profiling resistance:** the proxy cannot tell whether
+  two requests are the same query, or profile clients from cache behavior.
 
-**G3 — Query equality and profiling resistance**: The proxy must not determine whether two client requests correspond to the same DNS query, or build per-client/per-group query profiles from cache behavior.
+The driving attack is **set-difference (bracketing)** — snapshot cache state,
+admit one victim query, re-snapshot, diff to isolate the touched entry; the
+G2/G3 defenses close it.
 
-### Primary Attack: Set-Difference (Bracketing)
+---
 
-1. Adversary learns current cache state
-2. Allows exactly one victim query while queuing all other traffic
-3. Re-learns cache state
-4. Computes difference to isolate which entry was added or accessed
+## Threat Model
 
-### Threat Model
-
-In-scope adversary capabilities (beyond ODoH baseline):
-- Network control at proxy: observe/delay/drop/replay/inject
-- Active proxy deviation: arbitrary protocol deviation to bias cache behavior
-- Scheduling control: manipulate concurrency and queuing to isolate victims
-- Cache lifecycle control: restart enclave to reset cache state
-- Proxy-as-client probing: send probe queries to enumerate cache contents
-- Architectural leakage: page-level access patterns, gross timing differences, message size differences
-
-Out-of-scope:
-- Traffic correlation by a global adversary
-- Website fingerprinting from client behavior patterns
-- Microarchitectural attacks against TEE (Spectre/Meltdown class)
-- Malicious target or proxy-target collusion
+A malicious proxy with full control of its position: the network-facing relay
+(observe/delay/drop/replay/inject), request scheduling, the enclave's cache
+lifecycle (restart-to-reset), and probing the cache as a client. Architectural
+leakage (page-level access patterns, gross timing, message sizes) is in scope.
+Out of scope: global traffic correlation, website fingerprinting,
+microarchitectural TEE attacks (Spectre/Meltdown), and a malicious target or
+proxy–target collusion. See the paper for the precise model.
 
 ---
 
@@ -154,86 +155,6 @@ SGX has no trusted clock. The enclave maintains `t_latest` (highest timestamp se
 | Response signing | Ed25519 | Go stdlib crypto/ed25519 |
 | SGX attestation | DCAP | edgelesssys/ego |
 | Access-pattern hiding | Path ORAM | etclab/pathoram-go |
-
----
-
-## Implementation Status
-
-### Implemented
-
-| Feature | Files | Notes |
-|---------|-------|-------|
-| **Enclave Core** | | |
-| HPKE keypair + decrypt/encrypt | enclave/crypto.go | Suite: X25519/HKDF-SHA256/AES-128-GCM |
-| HPKE Export key derivation (k_r) | enclave/crypto.go | Label: "codoh response" |
-| IPC server (Unix socket) | enclave/ipc.go | Binary wire protocol: [4B len][1B type/status][payload] |
-| LRU cache with logical-time TTL | enclave/cache.go | container/list, sync.RWMutex |
-| ORAM cache (Path ORAM) | enclave/oram_cache.go | FNV hash mapping, lazy expiry |
-| Cache interface | enclave/cache_interface.go | Get/Put/Size/Clear/CleanExpired |
-| Cache-insert bundle format | enclave/bundle.go | ttl + timestamp + query + response; also CanonicalizeQuery |
-| Ed25519 signature verification | enclave/cmd/main.go | On cache-insert bundles |
-| Timestamp replay protection | enclave/cmd/main.go | Monotonic t_latest + δ-window |
-| Dummy response generation | enclave/crypto.go | crypto/rand, same size as real |
-| Query-path padding (Q_E unpad) | enclave/cmd/main.go | UnpadFromBucket before DecryptQueryE |
-| Query canonicalization | enclave/bundle.go | domain:qtype format (CanonicalizeQuery) |
-| Configuration loading | enclave/config.go | Env vars + defaults |
-| SGX attestation server | enclave/attestation.go | /attest, /provision, /health |
-| SGX quote generation | enclave/attestation_sgx.go | EGo DCAP |
-| Simulation fallbacks | enclave/attestation_sim.go | Self-signed TLS, skip quote |
-| IPC message types | enclave/types.go | process, store_encrypted, get_pubkey, health |
-| Proxy mode (CODoH-base) | enclave/cmd/proxy_mode.go | 2-process HTTPS server with LRU cache |
-| Client-side HPKE helpers | enclave/client_crypto.go | EncryptQueryE, DecryptCachedResponse |
-| Defensive mode (restart warm-up) | enclave/cmd/main.go | Starts in defensive mode, exits at WarmupThreshold |
-| Cache omission detection | enclave/cmd/main.go | Outstanding query tracking, enters defensive mode at OmissionThreshold |
-| Outstanding query TTL cleanup | enclave/cmd/main.go | Inline eviction using logical time (tLatest - OutstandingTTLSecs) |
-| Key rotation signaling | enclave/cmd/main.go, enclave/types.go | HPKE failure returns `key_rotated` status |
-| Health with restart metadata | enclave/cmd/main.go | `started_at` (RFC3339) in health response |
-| Batched cache updates | enclave/insertion_queue.go, enclave/cmd/main.go | Bounded FIFO queue, signal-coalescing batchWorker goroutine, PutBatch on Cache interface |
-| | | |
-| **Proxy Plugin** | | |
-| Parallel fan-out (enclave + target) | plugin/codohproxy/proxy.go | Concurrent goroutines |
-| Tagged chunk streaming | plugin/codohproxy/proxy.go | `application/codoh-response`: [1B type][2B len][data] per chunk |
-| /enclave-keys endpoint | plugin/codohproxy/proxy.go | Serves pk_E (cached in-memory) |
-| /proxy endpoint | plugin/codohproxy/proxy.go | Main CODoH relay |
-| Enclave IPC client | plugin/codohproxy/enclave_client.go | Unix socket client, connection pool (cap 4) |
-| Key rotation header forwarding | plugin/codohproxy/proxy.go | Sets X-CoDOH-Key-Rotated header on key_rotated status |
-| Bypass mode | plugin/codohproxy/proxy.go | Falls back to plain ODoH |
-| Prometheus metrics | plugin/codohproxy/metrics.go | |
-| Config options | plugin/codohproxy/setup.go | Corefile parsing |
-| | | |
-| **Target Plugin** | | |
-| ODoH DNS resolution | plugin/codohtarget/target.go | /dns-query endpoint (unpads Q_T before processing) |
-| Cache-insert HPKE encryption | plugin/codohtarget/enclave_encrypt.go | Encrypts bundle to pk_E |
-| Ed25519 response signing | plugin/codohtarget/signing.go | Signs H(plaintext bundle) |
-| SGX quote verification | plugin/codohtarget/attestation_verify_sgx.go | DCAP verification |
-| Signing key provisioning | plugin/codohtarget/attestation.go | POST to /provision |
-| Prometheus metrics | plugin/codohtarget/metrics.go | |
-| Config options | plugin/codohtarget/setup.go | Corefile parsing |
-
-### Paper Defenses Status
-
-| Defense | Goal | Status | Notes |
-|---------|------|--------|-------|
-| HPKE query encryption (pk_E) | G3 | Done | Query privacy from proxy |
-| Ed25519 cache-insert signing | G1 | Done | Prevents cache poisoning/tampering |
-| Timestamp replay protection | G1 | Done | Monotonic t_latest + δ-window |
-| Hit/miss dummy responses | G2, G3 | Done | Indistinguishable to proxy |
-| ORAM cache | G2 | Done | Path ORAM, optional via config |
-| SGX attestation + provisioning | G1 | Done | DCAP quote, signing key delivery |
-| Restart warm-up mode | G2 | Done | Defensive mode on boot, exits at WarmupThreshold |
-| Cache omission detection | G2 | Done | Outstanding query tracking, enters defensive mode at OmissionThreshold |
-| Cover responses | G2 | Done | Target samples k random domains (codohtarget/cover/), delivered via POST /cache-insert |
-| Batched cache insertions | G2 | Done | InsertionQueue + pseudorandom commit via crypto/rand coin flip on query path |
-| Wire-layer padding (responses) | G2, G3 | Done | Bucketed padding (default single 2048-byte bucket); hits and misses identical size to proxy |
-| Wire-layer padding (queries) | G3 | Done | Q_E and Q_T padded to fixed 256-byte bucket; all queries identical size to proxy/network observer |
-| Session ID (sid) binding | G3 | Not yet | Explicit sid in AAD to prevent cross-use |
-| Dual HPKE key wrapping | G3 | Not yet | Symmetric key k encrypted separately to target and enclave |
-
-### Implementation-Only Features (not in paper)
-
-| Feature | Notes |
-|---------|-------|
-| Key rotation signaling | `key_rotated` IPC status + `X-CoDOH-Key-Rotated` header. Paper says enclave "returns a key error" on restart but specifies no protocol for it. Key distribution is explicitly out of scope in the paper. |
 
 ---
 

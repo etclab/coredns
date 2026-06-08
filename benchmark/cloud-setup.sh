@@ -85,7 +85,7 @@ check_repo() {
         exit 1
     fi
 
-    local branch="${GIT_BRANCH:-codoh-design-v2}"
+    local branch="${GIT_BRANCH:-codoh-main}"
     local current_branch
     current_branch=$(git -C "$ROOT_DIR" rev-parse --abbrev-ref HEAD)
     if [[ "$current_branch" != "$branch" ]]; then

@@ -35,7 +35,7 @@ fi
 : "${SSH_USER:=azureuser}"
 : "${SSH_KEY:=$HOME/.ssh/id_rsa}"
 : "${REMOTE_ROOT:=/home/$SSH_USER/Projects/codoh/coredns}"
-: "${GIT_BRANCH:=codoh-design-v2}"
+: "${GIT_BRANCH:=codoh-main}"
 : "${RESOLVER:=unbound}"
 
 SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -i $SSH_KEY"

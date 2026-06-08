@@ -24,7 +24,7 @@ UPSTREAM_RESOLVER="${UPSTREAM_RESOLVER:-1.1.1.1:53}"
 SGX_MODE="${SGX_MODE:-true}"
 
 # Git branch to checkout on remote VMs
-GIT_BRANCH="${GIT_BRANCH:-codoh-design-v2}"
+GIT_BRANCH="${GIT_BRANCH:-codoh-main}"
 
 # Azure NSG settings (for cloud-open-ports.sh)
 RESOURCE_GROUP=       # Azure resource group name
