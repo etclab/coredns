@@ -6,14 +6,31 @@ build/
 release/
 vendor/
 benchmark/results/
-benchmark/top-*-resolvable.csv
 coredns-test
 enclave-test
 
 # Enclave binaries and keys
 enclave/enclave
 enclave/enclave-sim
-enclave/*.pembench-logs.txt
+enclave/enclave-dev
+enclave/cmd/enclave
+enclave/*.pem
+bench-logs.txt
 benchmark/cloud-env.local.sh
-
 .signing
+
+# Root-level build artifacts (microbench / e2e)
+/cmd
+/enclave-sim
+
+# Deployment certs & keys — regenerate locally, never share
+/localhost*.pem
+/proxy*.pem
+/target*.pem
+
+# Generated / downloaded benchmark data (setup.sh refetches from Umbrella)
+benchmark/top-*.csv
+benchmark/umbrella/
+benchmark/worktrees/
+combined_results_*.csv
+combined_results_*.csv.stats

@@ -255,6 +255,11 @@ Microbenchmarks measure individual operations on the critical path (§ microbenc
 
 Results go to `benchmark/results/micro_<timestamp>/microbench/`. Use `--iterations N` to change iteration count (default: 10000).
 
+> **Cache-capacity sweep (Table 4).** The cross-backend capacity sweep that
+> compares LRU / LinearScan / ORAM / PathORAM, both Plain and SGX, is a separate
+> heavier benchmark (needs the `pathoram-go` sibling repo). See
+> [`README-microbench.md`](README-microbench.md).
+
 ### What's measured
 
 | Category | Benchmarks | File |

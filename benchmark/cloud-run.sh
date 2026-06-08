@@ -534,6 +534,10 @@ run_cloud_workload() {
             ;;
     esac
 
+    # Cold workload: skip warmup pass — it would prime Unbound with the first
+    # $warmup domains, then the measured run hits those same domains warm.
+    [[ "$workload" == "cold" ]] && warmup=0
+
     local output_prefix="$output_dir/${config_name}_${workload}"
 
     # Warm-up pass
